@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hurdle Race</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="progress">
+    <div class="progress-track">
+      <div class="progress-dot p1" id="dot1"></div>
+      <div class="progress-dot p2" id="dot2"></div>
+      <div class="progress-flag">🏁</div>
+    </div>
+  </div>
+
+  <main class="arena">
+    <section class="pane p1">
+      <canvas id="canvas1"></canvas>
+      <div class="hud">
+        <span class="name">Player 1</span>
+        <span>Time <b id="time1">0.00</b>s</span>
+        <span class="penalty">Penalty <b id="pen1">+0</b>s</span>
+        <span>Hits <b id="hits1">0</b></span>
+      </div>
+      <div class="keys">A / D move · W jump · S slide</div>
+      <div class="banner" id="banner1" hidden></div>
+    </section>
+
+    <section class="pane p2">
+      <canvas id="canvas2"></canvas>
+      <div class="hud">
+        <span class="name">Player 2</span>
+        <span>Time <b id="time2">0.00</b>s</span>
+        <span class="penalty">Penalty <b id="pen2">+0</b>s</span>
+        <span>Hits <b id="hits2">0</b></span>
+      </div>
+      <div class="keys">← / → move · ↑ jump · ↓ slide</div>
+      <div class="banner" id="banner2" hidden></div>
+    </section>
+  </main>
+
+  <div class="countdown" id="countdown" hidden></div>
+
+  <div class="overlay" id="menu">
+    <div class="card">
+      <h1>Hurdle Race</h1>
+      <p class="lead">Two players, one keyboard, the same random track.</p>
+      <div class="controls">
+        <div class="control-col p1">
+          <h2>Player 1</h2>
+          <p><kbd>W</kbd> Jump</p>
+          <p><kbd>S</kbd> Slide (hold)</p>
+          <p><kbd>A</kbd> <kbd>D</kbd> Move left / right</p>
+        </div>
+        <div class="control-col p2">
+          <h2>Player 2</h2>
+          <p><kbd>↑</kbd> Jump</p>
+          <p><kbd>↓</kbd> Slide (hold)</p>
+          <p><kbd>←</kbd> <kbd>→</kbd> Move left / right</p>
+        </div>
+      </div>
+      <ul class="rules">
+        <li>Jump over low hurdles and crates, slide under the hanging bars.</li>
+        <li>Hitting a hurdle stops you and adds <b>2 seconds</b> to your time.</li>
+        <li>Final score = finish time + penalties. Lowest score wins.</li>
+      </ul>
+      <button id="startBtn">Start race</button>
+      <p class="hint">or press Enter</p>
+    </div>
+  </div>
+
+  <div class="overlay" id="results" hidden>
+    <div class="card">
+      <h1 id="winnerText"></h1>
+      <p class="lead" id="winnerSub"></p>
+      <table>
+        <thead>
+          <tr><th></th><th class="p1">Player 1</th><th class="p2">Player 2</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Finish time</td><td id="rTime1"></td><td id="rTime2"></td></tr>
+          <tr><td>Hurdles hit</td><td id="rHits1"></td><td id="rHits2"></td></tr>
+          <tr><td>Penalty</td><td id="rPen1"></td><td id="rPen2"></td></tr>
+          <tr class="total"><td>Final score</td><td id="rFinal1"></td><td id="rFinal2"></td></tr>
+        </tbody>
+      </table>
+      <button id="againBtn">Race again (new track)</button>
+      <p class="hint">or press Enter</p>
+    </div>
+  </div>
+
+  <script src="game.js"></script>
+</body>
+</html>
