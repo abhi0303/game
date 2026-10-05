@@ -4,41 +4,62 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Car Drive</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&display=swap" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <canvas id="scene"></canvas>
 
-  <div class="hud top-left">
-    <div class="target">
-      <span class="arrow" id="arrow">↑</span>
-      <div>
-        <div class="label">Target bay</div>
-        <div><b id="distance">0</b> m</div>
-      </div>
-    </div>
-    <div class="parked">Parked <b id="parked">0</b></div>
-    <div class="parked">Weapon <b id="weapon">Fist</b></div>
+  <!-- top left: the job at hand, and the controls -->
+  <div class="hud objective">
+    <span class="arrow" id="arrow"><svg viewBox="0 0 24 24"><path d="M12 2.5 19.5 20 12 15.6 4.5 20Z" /></svg></span>
+    <div class="stat"><small>Target bay</small><b><span id="distance">0</span><em>m</em></b></div>
+    <div class="stat"><small>Parked</small><b id="parked">0</b></div>
   </div>
+  <button class="gear-button" id="gear-button" title="Controls (P)">
+    <svg viewBox="0 0 24 24"><path d="M19.4 13a7.6 7.6 0 0 0 0-2l2.1-1.6-2-3.4-2.5 1a7.5 7.5 0 0 0-1.7-1L15 3.3h-4l-.3 2.7a7.5 7.5 0 0 0-1.7 1l-2.5-1-2 3.4L6.6 11a7.6 7.6 0 0 0 0 2l-2.1 1.6 2 3.4 2.5-1a7.5 7.5 0 0 0 1.7 1l.3 2.7h4l.3-2.7a7.5 7.5 0 0 0 1.7-1l2.5 1 2-3.4ZM13 15.2A3.2 3.2 0 1 1 13 8.8a3.2 3.2 0 0 1 0 6.4Z" transform="translate(-1 0)" /></svg>
+  </button>
 
-  <canvas id="map" class="map"></canvas>
-  <div class="map-hint"><b id="clock">08:00</b> &nbsp; <kbd>M</kbd> map &nbsp; <kbd>P</kbd> controls</div>
-  <div class="bigmap-wrap" id="bigmap-wrap" hidden>
-    <canvas id="bigmap"></canvas>
-    <p>Click anywhere to set a waypoint and get a route. Click the waypoint again to remove it. <kbd>M</kbd> or <kbd>Esc</kbd> closes the map.</p>
-  </div>
+  <!-- top right: what is in hand (on foot) -->
+  <div class="hud chip weapon-chip" data-kind="fist"><i class="icon"></i><b id="weapon">Fist</b></div>
+
+  <!-- top centre: wanted level -->
   <div class="stars" id="stars" hidden></div>
 
-  <div class="hud bottom-right">
-    <div class="speed"><b id="speed">0</b><span>km/h</span></div>
-    <div class="gear" id="gear">N</div>
+  <!-- bottom left: radar, clock, health and stamina -->
+  <div class="radar">
+    <div class="radar-frame">
+      <canvas id="map" class="map" title="Open the map (M)"></canvas>
+      <span class="north">N</span>
+      <span class="clock" id="clock">08:00</span>
+    </div>
+    <div class="vitals">
+      <div class="vital health" title="Health"><i id="health-bar"></i></div>
+      <div class="vital stamina" title="Stamina"><i id="stamina-bar"></i></div>
+    </div>
+    <div class="keys"><kbd>M</kbd> map <kbd>P</kbd> controls</div>
+  </div>
+
+  <!-- bottom right: the dial, in a vehicle -->
+  <div class="hud dash" id="dash">
+    <div class="gauge" id="gauge">
+      <b id="speed">0</b>
+      <span>km/h</span>
+      <em class="gear" id="gear">N</em>
+    </div>
     <div class="nitro">
-      <span>NITRO</span>
+      <span>NOS</span>
       <div class="bar"><div class="fill" id="nitro"></div></div>
     </div>
   </div>
 
-  <button class="gear-button" id="gear-button" title="Controls (P)">&#9881;</button>
+  <div class="pain" id="pain"></div>
+  <div class="wasted" id="wasted" hidden><b>WASTED</b><span id="wasted-cause"></span></div>
+  <div class="bigmap-wrap" id="bigmap-wrap" hidden>
+    <canvas id="bigmap"></canvas>
+    <p>Click anywhere to set a waypoint and get a route. Click the waypoint again to remove it. <kbd>M</kbd> or <kbd>Esc</kbd> closes the map.</p>
+  </div>
 
   <div class="settings" id="settings" hidden>
     <div class="settings-card">
@@ -58,6 +79,8 @@
           <p><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> walk &middot; <kbd>Shift</kbd> run</p>
           <p><kbd>Space</kbd> jump, or climb what is in front</p>
           <p>Click the game to aim with the mouse; click to punch or shoot</p>
+          <p>Fists: look at someone and keep clicking for jab, cross, hook, uppercut (he steps in to reach); someone on the ground gets a kick; <kbd>Shift</kbd> breaks off and runs</p>
+          <p>Running uses stamina (the yellow bar); falls from high up hurt (the green bar is health)</p>
           <p><kbd>0</kbd> fist &middot; <kbd>1</kbd> gun &middot; <kbd>2</kbd> bow</p>
           <p><kbd>F</kbd> get into the vehicle, horse or bike beside you</p>
           <p><kbd>Esc</kbd> free the mouse pointer</p>
@@ -68,6 +91,10 @@
           <p><kbd>A</kbd><kbd>D</kbd> steer &middot; <kbd>Space</kbd> handbrake</p>
           <p><kbd>Shift</kbd> nitro &middot; <kbd>C</kbd> view from the driver's seat</p>
           <p><kbd>R</kbd> repair the vehicle and its tyres &middot; <kbd>F</kbd> get out (stopped)</p>
+          <h3>Vehicle lights</h3>
+          <p><kbd>L</kbd> headlights: auto, on, full beam, off</p>
+          <p><kbd>Z</kbd> left indicator &middot; <kbd>X</kbd> right indicator &middot; <kbd>H</kbd> hazards</p>
+          <p><kbd>K</kbd> emergency lights and siren</p>
         </section>
         <section>
           <h3>Horse and bike</h3>
@@ -82,9 +109,14 @@
           <p><kbd>M</kbd> map: click it to set a waypoint</p>
           <p><kbd>`</kbd> cheat console &middot; <kbd>Backspace</kbd> back to the start</p>
           <h3>Cheats</h3>
-          <p>Vehicles: <i>car, sedan, hatchback, suv, truck, bus, motorbike, bike, horse, heli, rocketman</i></p>
-          <p>Weather: <i>clear, cloudy, rain, storm</i> &middot; Time: <i>morning, noon, afternoon, evening, night</i></p>
+          <p>Vehicles: <i>car, sedan, hatchback, suv, pickup, truck, bus, police, motorbike, bike, horse, heli, rocketman</i></p>
+          <p>Weather: <i>clear, cloudy, rain, storm, snow, deepsnow</i> &middot; Time: <i>morning, noon, afternoon, evening, night</i></p>
+          <p>Lights: <i>lights on, lights off, lights auto, highbeam, left, right, hazard, siren, brakelights</i></p>
           <p><i>nocops</i> clears your wanted level</p>
+        </section>
+        <section>
+          <h3>Credits</h3>
+          <p>Bus: <i>Generic Town Bus</i> by own.guest &middot; Truck: <i>Truck DAF CF 75.310</i> by Max (Max-7215), both from Sketchfab under CC BY 4.0</p>
         </section>
       </div>
     </div>
@@ -92,7 +124,7 @@
 
   <div class="cheat" id="cheat" hidden>
     <label for="cheat-input">Cheat</label>
-    <input id="cheat-input" type="text" autocomplete="off" spellcheck="false" placeholder="car · bus · motorbike · rain · night · nocops" />
+    <input id="cheat-input" type="text" autocomplete="off" spellcheck="false" placeholder="car · bus · police · snow · night · lights on · hazard · siren" />
     <span>Enter to run, Esc to cancel</span>
   </div>
 
@@ -109,7 +141,9 @@
   <script src="road-textures.js"></script>
   <script src="street-models.js"></script>
   <script src="npc-models.js"></script>
+  <script src="city-textures.js"></script>
   <script src="car-model.js"></script>
+  <script src="vehicle-models.js"></script>
   <script src="ride-models.js"></script>
   <script src="game.js"></script>
 </body>

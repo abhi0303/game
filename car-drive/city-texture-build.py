@@ -1,0 +1,124 @@
+# Packs the photo textures the city is built from into city-textures.js, so the game still
+# runs straight from the file system.
+#   python3 city-texture-build.py <folder of unzipped ambientCG 1K-JPG sets>
+#
+# Every set is CC0 from ambientCG (https://ambientcg.com). Facades come with a picture of
+# the building by day, a mask of its glass (from the set's metalness or roughness map), a
+# normal map, and one or two night pictures of which windows are lit. Two of the glass
+# towers have no night picture, so one is made from the glass mask: each pane is found as
+# a separate patch of glass and some of them are lit, in a warm or a cool white.
+import base64, glob, io, json, os, random, sys
+from PIL import Image
+
+SRC = sys.argv[1]
+random.seed(7)
+
+
+def path(asset, kind):
+    found = glob.glob(os.path.join(SRC, asset, f'*_{kind}.jpg'))
+    return found[0] if found else None
+
+
+def uri(image, size, quality=82):
+    image = image.convert('RGB') if image.mode not in ('RGB', 'L') else image
+    image = image.resize((size, size), Image.LANCZOS)
+    out = io.BytesIO()
+    image.save(out, 'JPEG', quality=quality, optimize=True)
+    return 'data:image/jpeg;base64,' + base64.b64encode(out.getvalue()).decode()
+
+
+def glass_mask(asset):
+    metal = path(asset, 'Metalness')
+    if metal:
+        return Image.open(metal).convert('L')
+    rough = Image.open(path(asset, 'Roughness')).convert('L')
+    return rough.point(lambda v: 255 - v)  # smooth means glass
+
+
+def lit_windows(mask, share):
+    """A night picture: every separate patch of glass is a pane, and `share` of them are lit."""
+    small = mask.resize((512, 512)).point(lambda v: 255 if v > 128 else 0)
+    w, h = small.size
+    px = small.load()
+    seen = [[False] * w for _ in range(h)]
+    out = Image.new('RGB', (w, h))
+    po = out.load()
+    for y0 in range(h):
+        for x0 in range(w):
+            if seen[y0][x0] or not px[x0, y0]:
+                continue
+            stack = [(x0, y0)]
+            seen[y0][x0] = True
+            cells = []
+            while stack:
+                x, y = stack.pop()
+                cells.append((x, y))
+                for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                    nx %= w
+                    ny %= h
+                    if not seen[ny][nx] and px[nx, ny]:
+                        seen[ny][nx] = True
+                        stack.append((nx, ny))
+            if len(cells) < 12 or random.random() > share:
+                continue
+            warm = random.random() < 0.65
+            k = random.uniform(0.55, 1.0)
+            color = (255, 214, 150) if warm else (215, 232, 255)
+            ys = [c[1] for c in cells]
+            top, bottom = min(ys), max(ys) + 1
+            for x, y in cells:
+                fade = 0.75 + 0.25 * (y - top) / max(1, bottom - top)  # lamps light the lower part more
+                po[x, y] = tuple(int(c * k * fade) for c in color)
+    return out
+
+
+FACADES = {
+    # name: (asset, night pictures from other variants or None to make one, metres across one tile)
+    'brick': ('Facade018A', ['Facade018B', 'Facade018C'], 19.2),
+    'office': ('Facade019A', ['Facade019B', 'Facade019C'], 21.6),
+    'loft': ('Facade020A', ['Facade020B', 'Facade020C'], 20.4),
+    'tower': ('Facade017', ['Facade017'], 43.2),
+    'highrise': ('Facade015', ['Facade015'], 102.4),
+    'block': ('Facade012', ['Facade012'], 102.4),
+    'glass': ('Facade001', None, 34),
+    'ribbon': ('Facade006', None, 28.8),
+}
+
+out = {'facades': {}}
+for name, (asset, nights, tile) in FACADES.items():
+    mask = glass_mask(asset)
+    if nights:
+        night = [uri(Image.open(path(n, 'Emission')), 512, 78) for n in nights]
+    else:
+        night = [uri(lit_windows(mask, share), 512, 78) for share in (0.3, 0.55)]
+    out['facades'][name] = {
+        'color': uri(Image.open(path(asset, 'Color')), 1024),
+        'normal': uri(Image.open(path(asset, 'NormalGL')), 512, 80),
+        'glass': uri(mask, 256, 85),
+        'night': night,
+        'tile': tile,
+    }
+
+MATERIALS = {
+    # name: (asset, metres across one tile, with normal map)
+    'roofTiles': ('RoofingTiles014A', 3, True),
+    'roofSlate': ('RoofingTiles013A', 3, True),
+    'concrete': ('Concrete034', 4, False),
+    'steel': ('CorrugatedSteel005', 3, True),
+    'sand': ('Ground054', 4, False),
+    'plaster': ('Plaster001', 3, False),
+    'brickWall': ('Bricks059', 2, True),
+    'gravel': ('Gravel022', 2, False),
+    'snow': ('Snow006', 3, True),
+}
+out['materials'] = {}
+for name, (asset, tile, normal) in MATERIALS.items():
+    entry = {'color': uri(Image.open(path(asset, 'Color')), 512), 'tile': tile}
+    if normal:
+        entry['normal'] = uri(Image.open(path(asset, 'NormalGL')), 512, 80)
+    out['materials'][name] = entry
+
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'city-textures.js'), 'w') as f:
+    f.write('// Generated by city-texture-build.py from CC0 textures by ambientCG (ambientcg.com).\n')
+    f.write('window.CITY_TEXTURES = ' + json.dumps(out) + ';\n')
+print('ok', sum(len(v) for v in json.dumps(out)) // 1024, 'KB')

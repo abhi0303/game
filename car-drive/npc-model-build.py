@@ -4,7 +4,7 @@
 
 Each avatar folder holds `raw.glb` (its FBX run through FBX2glTF) and its *_color.tga
 textures. For every avatar this:
-  * retargets the idle and walk clips of the three.js "Xbot" model (Mixamo motion capture)
+  * retargets the idle, walk and run clips of the three.js "Xbot" model (Mixamo motion capture)
     onto the avatar's 3ds Max Biped skeleton. The two rigs rest differently (T-pose against
     A-pose, different bone axes), so each bone's rotation away from rest is measured in world
     space on the source and re-applied to the avatar's rest pose, after first swinging that
@@ -111,7 +111,7 @@ def retarget(rig):
 
     clips = {}
     for anim in src_gltf['animations']:
-        if anim['name'] not in ('idle', 'walk'): continue
+        if anim['name'] not in ('idle', 'walk', 'run'): continue
         rotation, hips, times = {}, None, None
         for ch in anim['channels']:
             sampler = anim['samplers'][ch['sampler']]
@@ -184,7 +184,7 @@ for name in AVATARS:
 
 with open(out_path, 'w') as f:
     f.write('// Pedestrians: six avatars from the Microsoft Rocketbox library (MIT licence), each\n'
-            '// with its model, shrunken textures, and idle and walk clips retargeted onto its\n'
+            '// with its model, shrunken textures, and idle, walk and run clips retargeted onto its\n'
             '// skeleton. Built by npc-model-build.py; embedded so the game opens straight from disk.\n'
             'window.NPC_MODELS = ' + json.dumps(models, separators=(',', ':')) + ';\n')
 print(out_path, os.path.getsize(out_path) // 1024, 'KB')

@@ -9,7 +9,7 @@
   const CELL = BLOCK_SIZE + ROAD_WIDTH;
   const WORLD = BLOCKS * CELL + ROAD_WIDTH;
   const HALF = WORLD / 2;
-  const PARKING_LOTS = [[3, 3], [5, 1], [1, 5]]; // block coordinates
+  const PARKING_LOTS = [[5, 1], [1, 5]]; // block coordinates
 
   const BAY_W = 3;
   const BAY_L = 6;
@@ -55,7 +55,7 @@
   const ESCAPE_SECONDS = 10; // ...for this long to lose the wanted level
   const BUST_SECONDS = 2.5;
   const KNOCKED_SECONDS = 12;
-  const MAP_SIZE = 190;
+  const MAP_SIZE = 150;
 
   const GRAVITY = 25;
   const STEP_UP = 0.7; // tallest ledge that still counts as the same surface
@@ -224,7 +224,7 @@
     material.reflectivity = amount;
     material.userData.reflect = amount; // its strength in full daylight
     material.combine = THREE.MixOperation;
-    if (reflection) material.envMap = reflection;
+    if (reflection) material.envMap = reflectionNow || reflection;
     reflective.push(material);
     return material;
   }
@@ -357,113 +357,724 @@
     return new THREE.MeshLambertMaterial({ map });
   }
 
-  // Shop fronts: one tile is 6 m wide and the full podium height.
-  function shopMaterial(wall, awning) {
-    const map = canvasTexture(128, 128, (g, w, h) => {
-      g.fillStyle = wall;
-      g.fillRect(0, 0, w, h);
-      speckle(g, w, h, 500, 0.05);
-      g.fillStyle = '#f3efe4'; // sign board
-      g.fillRect(6, 6, w - 12, 16);
-      const grad = g.createLinearGradient(0, 44, 0, 108);
-      grad.addColorStop(0, '#7f9db5');
-      grad.addColorStop(1, '#1d2a36');
-      g.fillStyle = grad;
-      g.fillRect(8, 44, 74, 64); // display window
-      g.fillRect(90, 44, 30, 78); // door
-      g.fillStyle = 'rgba(255,255,255,0.12)';
-      g.beginPath();
-      g.moveTo(14, 108);
-      g.lineTo(40, 44);
-      g.lineTo(54, 44);
-      g.lineTo(28, 108);
-      g.fill();
-      for (let x = 0; x < w; x += 16) {
-        g.fillStyle = (x / 16) % 2 ? '#f3efe4' : awning; // striped awning
-        g.fillRect(x, 26, 16, 16);
-      }
-      g.fillStyle = 'rgba(0,0,0,0.35)';
-      g.fillRect(0, 42, w, 2);
-      g.fillRect(0, 122, w, 6);
-    });
-    return new THREE.MeshLambertMaterial({ map });
+  // --- building materials ---
+
+  // Facades are photographs of real buildings (city-textures.js): the wall by day, which
+  // parts are glass (those reflect the sky), the relief, and pictures of which windows are
+  // lit at night. A tile is square, `tile` metres across, with `floors` floors and `bays`
+  // windows across, so heights and widths can be whole floors and bays.
+  const cityTex = window.CITY_TEXTURES || null;
+  const litMaterials = []; // materials that glow after dark, each with userData.glow
+  const FACADE_GRID = {
+    brick: [6, 6], office: [6, 6], loft: [6, 6], tower: [12, 12], highrise: [32, 32], block: [32, 32],
+    glass: [10, 16], ribbon: [8, 14],
+  };
+
+  function loadedTexture(uri, repeat = true) {
+    const tex = photoTexture(uri);
+    if (repeat) tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    return tex;
   }
 
-  const roofMaterial = new THREE.MeshLambertMaterial({ color: 0x5c6470, map: grainTex });
-  const trimMaterial = new THREE.MeshLambertMaterial({ color: 0xcfd2d6 });
-  const unitMaterial = new THREE.MeshLambertMaterial({ color: 0x9a9fa6 });
-  const facadeMaterials = [
-    ['brick', '#9c4a36'], ['brick', '#7d5a48'], ['brick', '#b56548'],
-    ['plaster', '#e6d5b8'], ['plaster', '#c9d6df'], ['plaster', '#e8c9b0'],
-    ['glass', '#2f4f6f'], ['glass', '#3a6b7c'],
-    ['ribbon', '#b9bcc0'], ['ribbon', '#a7a39b'],
-  ].map(([style, wall]) => facadeMaterial(style, wall));
-  const shopMaterials = [
-    ['#6b6f76', '#c0392b'], ['#8a7f72', '#1f7a5c'], ['#5b6470', '#2c5fa8'], ['#7a6a5c', '#d98e04'],
-  ].map(([wall, awning]) => shopMaterial(wall, awning));
-
-  // Box whose side faces repeat a texture every tileU x tileV metres.
-  // Box faces come in the order +x -x +y -y +z -z.
-  function tiledBox(w, h, d, tileU, tileV) {
-    const geo = new THREE.BoxGeometry(w, h, d);
-    const uv = geo.attributes.uv;
-    for (let i = 0; i < uv.count; i++) {
-      const span = Math.floor(i / 4) < 2 ? d : w;
-      uv.setXY(i, (uv.getX(i) * span) / tileU, (uv.getY(i) * h) / tileV);
+  const FACADES = {};
+  if (cityTex) {
+    for (const [name, f] of Object.entries(cityTex.facades)) {
+      const [floors, bays] = FACADE_GRID[name];
+      const color = loadedTexture(f.color);
+      const normal = loadedTexture(f.normal);
+      const glass = loadedTexture(f.glass);
+      FACADES[name] = {
+        tile: f.tile, floor: f.tile / floors, bay: f.tile / bays, floors, bays,
+        // one material per night picture, so neighbouring buildings light different windows
+        materials: f.night.map((night) => {
+          const material = reflect(new THREE.MeshPhongMaterial({
+            map: color, normalMap: normal, normalScale: new THREE.Vector2(0.7, 0.7), specularMap: glass,
+            specular: 0x8a9098, shininess: 70, emissiveMap: loadedTexture(night), emissive: 0x000000,
+          }), 0.55);
+          material.userData.glow = name === 'highrise' || name === 'block' ? 0.62 : name === 'office' || name === 'ribbon' ? 0.7 : 0.8;
+          litMaterials.push(material);
+          return material;
+        }),
+      };
     }
-    return geo;
+  } else {
+    // without the photographs: the drawn facades, one tile per 4 floors by 4 bays
+    const drawn = { brick: ['brick', '#9c4a36'], office: ['ribbon', '#b9bcc0'], loft: ['plaster', '#e6d5b8'],
+      tower: ['glass', '#2f4f6f'], highrise: ['glass', '#3a6b7c'], block: ['ribbon', '#a7a39b'],
+      glass: ['glass', '#2f4f6f'], ribbon: ['ribbon', '#b9bcc0'] };
+    for (const [name, [style, wall]] of Object.entries(drawn)) {
+      FACADES[name] = { tile: 12, floor: 3, bay: 3, floors: 4, bays: 4, materials: [facadeMaterial(style, wall)] };
+    }
   }
 
-  const tankGeo = new THREE.CylinderGeometry(1.2, 1.2, 2.2, 12);
-  const mastGeo = new THREE.CylinderGeometry(0.06, 0.06, 7, 5);
+  const cityMaterial = (name, color = 0xffffff, extra = {}) => {
+    const m = cityTex && cityTex.materials[name];
+    if (!m) return new THREE.MeshLambertMaterial({ color, map: grainTex, ...extra });
+    const material = new THREE.MeshPhongMaterial({
+      color, map: loadedTexture(m.color), shininess: 12, specular: 0x1a1a1a, ...extra,
+    });
+    if (m.normal) material.normalMap = loadedTexture(m.normal);
+    material.userData.tile = m.tile;
+    return material;
+  };
+  const tileOf = (material) => material.userData.tile || 4;
 
-  // A shop-front podium, the main block, a roof ledge, sometimes a set-back upper tier,
-  // and plant on the roof. Widths and heights are whole window bays and floors.
-  function addBuilding(x, z, w, d, h) {
-    const part = (geo, material, px, py, pz) => {
+  const roofGravel = cityMaterial('gravel', 0x8c8f94);
+  const roofConcrete = cityMaterial('concrete', 0xb5b8bc);
+  const parapetMat = cityMaterial('concrete', 0xd5d6d8);
+  const plantMat = cityMaterial('concrete', 0x9da2a8);
+  const roofTileMats = [cityMaterial('roofTiles', 0xffffff), cityMaterial('roofTiles', 0xd9b8a8), cityMaterial('roofSlate', 0xffffff)];
+  const steelSheets = [cityMaterial('steel', 0xc9ced3), cityMaterial('steel', 0x9fb3c4), cityMaterial('steel', 0xd8d2c4)];
+  const brickWall = cityMaterial('brickWall', 0xffffff);
+  const glassBalustrade = reflect(new THREE.MeshPhongMaterial({
+    color: 0x6d8394, transparent: true, opacity: 0.45, shininess: 90, specular: 0x99aabb, depthWrite: false,
+  }), 0.4);
+  const darkMetal = new THREE.MeshLambertMaterial({ color: 0x34383e });
+  const beaconMat = new THREE.MeshBasicMaterial({ color: 0x400808 }); // aircraft warning lamps, blinking at night
+
+  // --- shop fronts ---
+
+  // The ground floor of most buildings is shops: 16 different fronts, each 6 m wide and
+  // 4.5 m high, drawn into one picture with a matching night picture of the lit windows
+  // and signs.
+  const SHOPS = ['CAFÉ', 'BAKERY', 'PHARMACY', 'BOOKS', 'MARKET', 'FLOWERS', 'DELI', 'SALON',
+    'BANK', 'SHOES', 'OPTICIAN', 'PIZZA', 'NOODLES', 'HARDWARE', 'GALLERY', 'FITNESS'];
+  const SHOP_STOREY = 4.5;
+  const shopFronts = (() => {
+    const cw = 256;
+    const ch = 192;
+    const fronts = [];
+    const palette = ['#2f3a45', '#5a2e2a', '#24453a', '#3b3550', '#6b5a3a', '#2c4a63', '#4a4a4a', '#6e3b2f'];
+    for (let n = 0; n < 16; n++) {
+      fronts.push({ name: SHOPS[n], sign: palette[n % palette.length], awning: Math.random() < 0.45, tone: rand(0.7, 1) });
+    }
+    const draw = (night) => canvasTexture(cw * 4, ch * 4, (g) => {
+      fronts.forEach((f, n) => {
+        const x0 = (n % 4) * cw;
+        const y0 = Math.floor(n / 4) * ch;
+        const wall = night ? '#000' : ['#d9d4c8', '#bfb8ab', '#8f8a84', '#e8e2d6'][n % 4];
+        g.fillStyle = wall;
+        g.fillRect(x0, y0, cw, ch);
+        if (!night) speckle(g, cw, ch, 300, 0.04);
+        // sign band
+        g.fillStyle = night ? '#000' : f.sign;
+        g.fillRect(x0 + 10, y0 + 10, cw - 20, 34);
+        g.font = 'bold 24px Georgia, serif';
+        g.textAlign = 'center';
+        g.textBaseline = 'middle';
+        g.fillStyle = night ? 'rgba(255,236,200,0.95)' : '#f2ede2';
+        g.fillText(f.name, x0 + cw / 2, y0 + 28);
+        // the window and door, with a hint of the shop inside
+        const winTop = y0 + 58;
+        const winBottom = y0 + ch - 14;
+        const inside = g.createLinearGradient(0, winTop, 0, winBottom);
+        if (night) {
+          inside.addColorStop(0, `rgba(255,226,180,${0.6 * f.tone})`);
+          inside.addColorStop(1, `rgba(220,170,120,${0.35 * f.tone})`);
+        } else {
+          inside.addColorStop(0, '#5d6e7c');
+          inside.addColorStop(0.55, '#2c3640');
+          inside.addColorStop(1, '#1c232a');
+        }
+        g.fillStyle = inside;
+        g.fillRect(x0 + 14, winTop, 150, winBottom - winTop);
+        g.fillRect(x0 + 178, winTop, 64, ch - 58);
+        if (!night) {
+          // shelves and goods behind the glass, and the sky caught in it
+          for (let s = 0; s < 3; s++) {
+            g.fillStyle = 'rgba(0,0,0,0.25)';
+            g.fillRect(x0 + 18, winTop + 22 + s * 30, 142, 3);
+            for (let k = 0; k < 9; k++) {
+              g.fillStyle = `hsla(${rand(20, 60)}, 18%, ${rand(30, 60)}%, 0.4)`;
+              g.fillRect(x0 + 22 + k * 15, winTop + 8 + s * 30, 10, 13);
+            }
+          }
+          g.fillStyle = 'rgba(255,255,255,0.13)';
+          g.beginPath();
+          g.moveTo(x0 + 30, winBottom);
+          g.lineTo(x0 + 80, winTop);
+          g.lineTo(x0 + 105, winTop);
+          g.lineTo(x0 + 55, winBottom);
+          g.fill();
+          g.fillStyle = '#2a2d31';
+          g.fillRect(x0 + 12, winTop - 2, 154, 3); // frame
+          g.fillRect(x0 + 176, winTop - 2, 68, 3);
+          g.fillRect(x0 + 208, winTop, 2, ch - 58); // the door's two leaves
+        }
+        if (f.awning && !night) {
+          for (let k = 0; k < 10; k++) {
+            g.fillStyle = k % 2 ? '#efe9dc' : f.sign;
+            g.fillRect(x0 + 10 + k * 15.6, y0 + 46, 15.6, 12);
+          }
+        }
+        // pilasters between shops
+        g.fillStyle = night ? '#000' : 'rgba(0,0,0,0.2)';
+        g.fillRect(x0, y0, 4, ch);
+        g.fillRect(x0 + cw - 4, y0, 4, ch);
+      });
+    });
+    const day = draw(false);
+    const glow = draw(true);
+    const material = new THREE.MeshPhongMaterial({ map: day, emissiveMap: glow, emissive: 0x000000, shininess: 30, specular: 0x333333 });
+    material.userData.glow = 1;
+    litMaterials.push(material);
+    return material;
+  })();
+
+  // --- houses ---
+
+  // A house wall is one storey of plaster round a window, 4 m wide by 3 m; the picture has
+  // the same wall twice, the second with its curtains drawn and the lamp on at night.
+  const houseWall = (() => {
+    const draw = (night) => canvasTexture(256, 96, (g, w, h) => {
+      for (const half of [0, 1]) {
+        const x0 = half * 128;
+        g.fillStyle = night ? '#000' : '#f4f1ea';
+        g.fillRect(x0, 0, 128, h);
+        if (!night) speckle(g, 128, h, 200, 0.05);
+        // window with a stone sill and a frame
+        if (night) {
+          if (half === 1) {
+            const lamp = g.createRadialGradient(x0 + 64, 44, 4, x0 + 64, 44, 34);
+            lamp.addColorStop(0, 'rgba(255,214,150,1)');
+            lamp.addColorStop(1, 'rgba(230,160,90,0.55)');
+            g.fillStyle = lamp;
+            g.fillRect(x0 + 42, 22, 44, 46);
+          }
+        } else {
+          g.fillStyle = '#ffffff';
+          g.fillRect(x0 + 38, 18, 52, 54);
+          const pane = g.createLinearGradient(0, 22, 0, 68);
+          pane.addColorStop(0, '#8fa5b6');
+          pane.addColorStop(1, '#2f3c48');
+          g.fillStyle = pane;
+          g.fillRect(x0 + 42, 22, 44, 46);
+          g.fillStyle = '#ffffff';
+          g.fillRect(x0 + 63, 22, 2, 46);
+          g.fillRect(x0 + 42, 42, 44, 2);
+          if (half === 1) {
+            g.fillStyle = 'rgba(214,196,160,0.85)'; // curtains
+            g.fillRect(x0 + 42, 22, 9, 46);
+            g.fillRect(x0 + 77, 22, 9, 46);
+          }
+          g.fillStyle = '#c9c4ba';
+          g.fillRect(x0 + 34, 72, 60, 5);
+        }
+      }
+    });
+    return { day: draw(false), night: draw(true) };
+  })();
+  const houseColors = [0xffffff, 0xf3e6c8, 0xe6ece9, 0xf1d9c2, 0xdfe6ef, 0xe9e4da];
+  const houseMats = houseColors.map((color) => {
+    const material = new THREE.MeshPhongMaterial({ color, map: houseWall.day, emissiveMap: houseWall.night, emissive: 0x000000, shininess: 8, specular: 0x111111 });
+    material.userData.glow = 0.75;
+    litMaterials.push(material);
+    return material;
+  });
+  const doorMat = new THREE.MeshLambertMaterial({
+    map: canvasTexture(64, 128, (g, w, h) => {
+      g.fillStyle = '#5b3a24';
+      g.fillRect(0, 0, w, h);
+      g.fillStyle = 'rgba(0,0,0,0.25)';
+      g.fillRect(8, 10, w - 16, 48);
+      g.fillRect(8, 68, w - 16, 50);
+      g.fillStyle = '#c9a65a';
+      g.fillRect(w - 16, 64, 5, 5);
+    }),
+  });
+  const garageMat = new THREE.MeshLambertMaterial({
+    map: canvasTexture(128, 64, (g, w, h) => {
+      g.fillStyle = '#e4e4e0';
+      g.fillRect(0, 0, w, h);
+      g.fillStyle = 'rgba(0,0,0,0.16)';
+      for (let y = 6; y < h; y += 8) g.fillRect(0, y, w, 2);
+    }),
+  });
+  const rollerMat = new THREE.MeshLambertMaterial({
+    map: canvasTexture(128, 128, (g, w, h) => {
+      g.fillStyle = '#9aa1a8';
+      g.fillRect(0, 0, w, h);
+      g.fillStyle = 'rgba(0,0,0,0.2)';
+      for (let y = 0; y < h; y += 6) g.fillRect(0, y, w, 1.5);
+    }),
+  });
+  const hedgeMat = new THREE.MeshLambertMaterial({ color: 0x3f6b35, map: grainTex });
+  const fenceMat = new THREE.MeshLambertMaterial({ color: 0xece9e2 });
+
+  // --- merged geometry ---
+
+  // A building is many small parts. Each city block gathers its parts by material and
+  // merges them, so the whole city draws in a few hundred calls instead of thousands.
+  function makeBatch() {
+    return new Map(); // material -> { positions, normals, uvs, index }
+  }
+
+  function batchPart(batch, material) {
+    let part = batch.get(material);
+    if (!part) batch.set(material, (part = { positions: [], normals: [], uvs: [], index: [] }));
+    return part;
+  }
+
+  // A flat four-cornered face; corners go round anticlockwise seen from the front.
+  function batchQuad(batch, material, corners, uvs) {
+    const part = batchPart(batch, material);
+    const base = part.positions.length / 3;
+    const [a, b, c] = corners;
+    const n = new THREE.Vector3(b[0] - a[0], b[1] - a[1], b[2] - a[2])
+      .cross(new THREE.Vector3(c[0] - a[0], c[1] - a[1], c[2] - a[2])).normalize();
+    corners.forEach((p, i) => {
+      part.positions.push(p[0], p[1], p[2]);
+      part.normals.push(n.x, n.y, n.z);
+      part.uvs.push(uvs[i][0], uvs[i][1]);
+    });
+    part.index.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  }
+
+  // A triangle, for gable ends.
+  function batchTriangle(batch, material, corners, uvs) {
+    const part = batchPart(batch, material);
+    const base = part.positions.length / 3;
+    const [a, b, c] = corners;
+    const n = new THREE.Vector3(b[0] - a[0], b[1] - a[1], b[2] - a[2])
+      .cross(new THREE.Vector3(c[0] - a[0], c[1] - a[1], c[2] - a[2])).normalize();
+    corners.forEach((p, i) => {
+      part.positions.push(p[0], p[1], p[2]);
+      part.normals.push(n.x, n.y, n.z);
+      part.uvs.push(uvs[i][0], uvs[i][1]);
+    });
+    part.index.push(base, base + 1, base + 2);
+  }
+
+  const batchMatrix = new THREE.Matrix4();
+  const batchNormal = new THREE.Matrix3();
+  const batchVec = new THREE.Vector3();
+  // Any geometry, placed by `matrix`.
+  function batchGeometry(batch, material, geo, matrix) {
+    const part = batchPart(batch, material);
+    const base = part.positions.length / 3;
+    const pos = geo.attributes.position;
+    const nor = geo.attributes.normal;
+    const uv = geo.attributes.uv;
+    batchNormal.getNormalMatrix(matrix);
+    for (let i = 0; i < pos.count; i++) {
+      batchVec.fromBufferAttribute(pos, i).applyMatrix4(matrix);
+      part.positions.push(batchVec.x, batchVec.y, batchVec.z);
+      batchVec.fromBufferAttribute(nor, i).applyMatrix3(batchNormal).normalize();
+      part.normals.push(batchVec.x, batchVec.y, batchVec.z);
+      part.uvs.push(uv ? uv.getX(i) : 0, uv ? uv.getY(i) : 0);
+    }
+    if (geo.index) for (let i = 0; i < geo.index.count; i++) part.index.push(base + geo.index.getX(i));
+    else for (let i = 0; i < pos.count; i++) part.index.push(base + i);
+  }
+
+  // A box from its centre and size, its faces textured `tile` metres per repeat.
+  function batchBox(batch, material, x, y, z, w, h, d, turn = 0, tile = tileOf(material)) {
+    const geo = tileBoxFaces(new THREE.BoxGeometry(w, h, d), w, h, d, tile);
+    batchMatrix.makeRotationY(turn).setPosition(x, y, z);
+    batchGeometry(batch, material, geo, batchMatrix);
+  }
+
+  function flushBatch(batch, shadows = true) {
+    for (const [material, part] of batch) {
+      if (!part.index.length) continue;
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(part.positions, 3));
+      geo.setAttribute('normal', new THREE.Float32BufferAttribute(part.normals, 3));
+      geo.setAttribute('uv', new THREE.Float32BufferAttribute(part.uvs, 2));
+      geo.setIndex(part.index);
+      if (material.normalMap) computeTangentsSafe(geo);
       const mesh = new THREE.Mesh(geo, material);
-      mesh.position.set(px, py, pz);
-      mesh.castShadow = mesh.receiveShadow = true;
+      mesh.castShadow = shadows;
+      mesh.receiveShadow = true;
       scene.add(mesh);
-    };
-    const sides = (m) => [m, m, roofMaterial, roofMaterial, m, m];
-    const wall = pick(facadeMaterials);
+    }
+    batch.clear();
+  }
+  // (normal maps in three.js work from the uv layout alone; nothing more is needed)
+  const computeTangentsSafe = () => {};
 
-    part(tiledBox(w + 0.5, PODIUM, d + 0.5, 6, PODIUM), sides(pick(shopMaterials)), x, PODIUM / 2, z);
-    part(tiledBox(w, h - PODIUM, d, 12, 12), sides(wall), x, (h + PODIUM) / 2, z);
-    part(new THREE.BoxGeometry(w + 0.6, 0.6, d + 0.6), trimMaterial, x, h + 0.1, z);
+  // --- walls ---
 
-    let top = h + 0.4;
+  // Walls round a footprint polygon (corners anticlockwise from above) from y0 to y1, the
+  // facade picture running continuously round the corners. `u0`, `v0` shift the picture by
+  // whole bays and floors, so no two buildings show the same lit windows.
+  function batchWalls(batch, material, corners, y0, y1, tile, u0 = 0, v0 = 0) {
+    let run = 0;
+    corners.forEach(([ax, az], i) => {
+      const [bx, bz] = corners[(i + 1) % corners.length];
+      const len = Math.hypot(bx - ax, bz - az);
+      const ua = u0 + run / tile;
+      const ub = u0 + (run + len) / tile;
+      batchQuad(batch, material,
+        [[ax, y0, az], [bx, y0, bz], [bx, y1, bz], [ax, y1, az]],
+        [[ua, v0], [ub, v0], [ub, v0 + (y1 - y0) / tile], [ua, v0 + (y1 - y0) / tile]]);
+      run += len;
+    });
+  }
+
+  // A flat lid over a footprint polygon at height y (a fan from its first corner).
+  function batchLid(batch, material, corners, y, tile = tileOf(material)) {
+    for (let i = 1; i < corners.length - 1; i++) {
+      const [a, b, c] = [corners[0], corners[i], corners[i + 1]];
+      batchTriangle(batch, material, [[a[0], y, a[1]], [b[0], y, b[1]], [c[0], y, c[1]]],
+        [[a[0] / tile, a[1] / tile], [b[0] / tile, b[1] / tile], [c[0] / tile, c[1] / tile]]);
+    }
+  }
+
+  // Footprint corners of a w x d rectangle round (x, z), anticlockwise from above
+  // (+x left on the map, so this runs -x,-z → -x,+z → +x,+z → +x,-z ... in world terms
+  // the order that makes the walls face outward). `cut` chamfers the corners.
+  function footprintCorners(x, z, w, d, cut = 0) {
+    const hw = w / 2;
+    const hd = d / 2;
+    if (!cut) return [[x - hw, z - hd], [x - hw, z + hd], [x + hw, z + hd], [x + hw, z - hd]];
+    return [
+      [x - hw, z - hd + cut], [x - hw, z + hd - cut], [x - hw + cut, z + hd], [x + hw - cut, z + hd],
+      [x + hw, z + hd - cut], [x + hw, z - hd + cut], [x + hw - cut, z - hd], [x - hw + cut, z - hd],
+    ];
+  }
+
+  const shrink = (corners, by) => {
+    const cx = corners.reduce((s, c) => s + c[0], 0) / corners.length;
+    const cz = corners.reduce((s, c) => s + c[1], 0) / corners.length;
+    return corners.map(([x, z]) => [x + Math.sign(cx - x) * by, z + Math.sign(cz - z) * by]);
+  };
+
+  // A low wall round the roof's edge.
+  function batchParapet(batch, corners, y, height = 1) {
+    batchWalls(batch, parapetMat, corners, y, y + height, 4);
+    const inner = shrink(corners, 0.3);
+    batchWalls(batch, parapetMat, [...inner].reverse(), y, y + height, 4);
+    // the coping along its top
+    corners.forEach((a, i) => {
+      const b = corners[(i + 1) % corners.length];
+      const ia = inner[i];
+      const ib = inner[(i + 1) % corners.length];
+      batchQuad(batch, parapetMat, [[a[0], y + height, a[1]], [b[0], y + height, b[1]], [ib[0], y + height, ib[1]], [ia[0], y + height, ia[1]]],
+        [[0, 0], [0, 1], [0.1, 1], [0.1, 0]]);
+    });
+  }
+
+  // Air-conditioning plant, water tanks, a stair house and perhaps a mast on a flat roof.
+  function batchRoofPlant(batch, x, z, w, d, y, tall) {
+    const spot = (m) => [x + rand(-w / 2 + m, w / 2 - m), z + rand(-d / 2 + m, d / 2 - m)];
+    if (w > 10 && d > 10) {
+      const [sx, sz] = spot(5);
+      batchBox(batch, plantMat, sx, y + 1.6, sz, 4.5, 3.2, 4.5);
+    }
+    for (let n = Math.floor(rand(2, 5)); n > 0; n--) {
+      const [ux, uz] = spot(3);
+      batchBox(batch, darkMetal, ux, y + 0.6, uz, rand(1.6, 3), 1.2, rand(1.4, 2.4));
+    }
+    if (Math.random() < 0.4) {
+      const [tx, tz] = spot(4);
+      batchMatrix.makeTranslation(tx, y + 1.3, tz);
+      batchGeometry(batch, plantMat, new THREE.CylinderGeometry(1.3, 1.3, 2.6, 14), batchMatrix);
+    }
+    if (tall) {
+      batchMatrix.makeTranslation(x, y + 6, z);
+      batchGeometry(batch, darkMetal, new THREE.CylinderGeometry(0.12, 0.2, 12, 6), batchMatrix);
+      batchMatrix.makeTranslation(x, y + 12.2, z);
+      batchGeometry(batch, beaconMat, new THREE.SphereGeometry(0.35, 8, 6), batchMatrix);
+    }
+  }
+
+  let standY = 0; // the ground the buildings being made stand on (the pavement, in the city)
+
+  const facadeFor = (name) => {
+    const f = FACADES[name];
+    return { f, material: pick(f.materials), u0: Math.floor(rand(0, f.bays)) / f.bays, v0: Math.floor(rand(0, f.floors)) / f.floors };
+  };
+  // a length rounded to whole bays of the facade
+  const toBays = (f, length) => Math.max(2, Math.round(length / f.bay)) * f.bay;
+
+  // Shop fronts all round the foot of a building: each 6 m stretch is a different shop.
+  function batchShops(batch, corners, height = SHOP_STOREY) {
+    corners.forEach(([ax, az], i) => {
+      const [bx, bz] = corners[(i + 1) % corners.length];
+      const len = Math.hypot(bx - ax, bz - az);
+      const count = Math.max(1, Math.round(len / 6));
+      for (let k = 0; k < count; k++) {
+        const t0 = k / count;
+        const t1 = (k + 1) / count;
+        const shop = Math.floor(Math.random() * 16);
+        const u = (shop % 4) / 4;
+        const v = 1 - (Math.floor(shop / 4) + 1) / 4;
+        batchQuad(batch, shopFronts,
+          [[ax + (bx - ax) * t0, 0, az + (bz - az) * t0], [ax + (bx - ax) * t1, 0, az + (bz - az) * t1],
+            [ax + (bx - ax) * t1, height, az + (bz - az) * t1], [ax + (bx - ax) * t0, height, az + (bz - az) * t0]],
+          [[u, v], [u + 0.25, v], [u + 0.25, v + 0.25], [u, v + 0.25]]);
+      }
+    });
+  }
+
+  // A canopy slab over the shop fronts.
+  function batchCanopy(batch, corners, y) {
+    const outer = shrink(corners, -1.4);
+    corners.forEach((a, i) => {
+      const b = corners[(i + 1) % corners.length];
+      const oa = outer[i];
+      const ob = outer[(i + 1) % corners.length];
+      batchQuad(batch, parapetMat, [[a[0], y, a[1]], [oa[0], y, oa[1]], [ob[0], y, ob[1]], [b[0], y, b[1]]], [[0, 0], [0, 0.3], [1, 0.3], [1, 0]]);
+      batchQuad(batch, parapetMat, [[oa[0], y - 0.35, oa[1]], [ob[0], y - 0.35, ob[1]], [ob[0], y, ob[1]], [oa[0], y, oa[1]]], [[0, 0], [1, 0], [1, 0.1], [0, 0.1]]);
+      batchQuad(batch, darkMetal, [[a[0], y - 0.35, a[1]], [b[0], y - 0.35, b[1]], [ob[0], y - 0.35, ob[1]], [oa[0], y - 0.35, oa[1]]], [[0, 0], [1, 0], [1, 1], [0, 1]]);
+    });
+  }
+
+  // --- building types ---
+
+  // An office or apartment block, a hotel, or a tower: shops at the foot (unless `homes`),
+  // the facade above in whole floors, perhaps a set-back upper part, and a roof to stand on.
+  function addBuilding(batch, x, z, w, d, floors, kind = 'office', opts = {}) {
+    const { f, material, u0, v0 } = facadeFor(kind);
+    w = toBays(f, w);
+    d = toBays(f, d);
+    const shops = !opts.homes;
+    const base = shops ? SHOP_STOREY : 0;
+    const top = base + floors * f.floor;
+    const cut = opts.chamfer ? f.bay : 0;
+    const corners = footprintCorners(x, z, w, d, cut);
+    if (shops) {
+      batchShops(batch, shrink(corners, 0.4));
+      batchCanopy(batch, shrink(corners, 0.4), SHOP_STOREY - 0.2);
+      batchWalls(batch, parapetMat, corners, SHOP_STOREY - 0.2, SHOP_STOREY, 4);
+    }
+    batchWalls(batch, material, corners, base, top, f.tile, u0, v0);
+    let roofY = top;
+    let roofCorners = corners;
     let rw = w;
     let rd = d;
-    // the roof is somewhere to land or stand
-    const roof = (hw, hd, y) => surfaces.push({ minX: x - hw, maxX: x + hw, minZ: z - hd, maxZ: z + hd, h0: y, h1: y });
-    roof(w / 2 + 0.3, d / 2 + 0.3, top);
-    if (h > 24 && Math.random() < 0.6) {
-      rw = Math.round((w * 0.6) / 3) * 3;
-      rd = Math.round((d * 0.6) / 3) * 3;
-      const th = pick([6, 9, 12]);
-      part(tiledBox(rw, th, rd, 12, 12), sides(wall), x, top + th / 2, z);
-      part(new THREE.BoxGeometry(rw + 0.6, 0.5, rd + 0.6), trimMaterial, x, top + th + 0.1, z);
-      colliders.push({ minX: x - rw / 2, maxX: x + rw / 2, minZ: z - rd / 2, maxZ: z + rd / 2, minY: top, maxY: top + th });
-      top += th + 0.35;
-      roof(rw / 2 + 0.3, rd / 2 + 0.3, top);
+    // the tallest step back for a crown or a slimmer upper tier
+    if (opts.setback && floors > 14) {
+      batchLid(batch, roofGravel, corners, top + 0.02);
+      batchParapet(batch, corners, top, 1.1);
+      addSurface({ minX: x - w / 2, maxX: x + w / 2, minZ: z - d / 2, maxZ: z + d / 2, h0: standY + top, h1: standY + top });
+      rw = toBays(f, w * 0.68);
+      rd = toBays(f, d * 0.68);
+      const upper = Math.max(4, Math.round(floors * rand(0.15, 0.35)));
+      roofCorners = footprintCorners(x, z, rw, rd, cut);
+      roofY = top + upper * f.floor;
+      batchWalls(batch, material, roofCorners, top, roofY, f.tile, u0 + 0.5, v0);
+      addCollider({ minX: x - rw / 2, maxX: x + rw / 2, minZ: z - rd / 2, maxZ: z + rd / 2, minY: standY + top, maxY: standY + roofY });
     }
+    batchLid(batch, roofGravel, roofCorners, roofY + 0.02);
+    batchParapet(batch, roofCorners, roofY, 1.1);
+    batchRoofPlant(batch, x, z, rw - 2, rd - 2, roofY, roofY > 80);
+    addSurface({ minX: x - rw / 2, maxX: x + rw / 2, minZ: z - rd / 2, maxZ: z + rd / 2, h0: standY + roofY, h1: standY + roofY });
+    addCollider({ minX: x - w / 2 - 0.4, maxX: x + w / 2 + 0.4, minZ: z - d / 2 - 0.4, maxZ: z + d / 2 + 0.4, maxY: standY + top });
 
-    // air-conditioning units, a water tank, an antenna
-    const spot = () => [x + rand(-rw / 2 + 2, rw / 2 - 2), z + rand(-rd / 2 + 2, rd / 2 - 2)];
-    for (let n = Math.floor(rand(1, 3)); n > 0; n--) {
-      const [ux, uz] = spot();
-      part(new THREE.BoxGeometry(rand(1.6, 3), 1.1, rand(1.4, 2.4)), unitMaterial, ux, top + 0.55, uz);
+    // apartments: balconies with glass fronts on some bays of the two long sides
+    if (opts.balconies) {
+      for (let fl = 1; fl < floors; fl++) {
+        const y = base + fl * f.floor;
+        for (const side of [-1, 1]) {
+          for (let b = 1; b < Math.round(w / f.bay) - 1; b += 2) {
+            const bx = x - w / 2 + (b + 0.5) * f.bay;
+            const bz = z + side * (d / 2 + 0.7);
+            batchBox(batch, parapetMat, bx, y - 0.1, bz, f.bay * 0.9, 0.2, 1.4);
+            batchQuad(batch, glassBalustrade, side > 0
+              ? [[bx - f.bay * 0.45, y, bz + 0.7], [bx + f.bay * 0.45, y, bz + 0.7], [bx + f.bay * 0.45, y + 1.05, bz + 0.7], [bx - f.bay * 0.45, y + 1.05, bz + 0.7]]
+              : [[bx + f.bay * 0.45, y, bz - 0.7], [bx - f.bay * 0.45, y, bz - 0.7], [bx - f.bay * 0.45, y + 1.05, bz - 0.7], [bx + f.bay * 0.45, y + 1.05, bz - 0.7]],
+            [[0, 0], [1, 0], [1, 1], [0, 1]]);
+          }
+        }
+      }
     }
-    if (Math.random() < 0.35) {
-      const [tx, tz] = spot();
-      part(tankGeo, unitMaterial, tx, top + 1.1, tz);
-    }
-    if (h > 30 && Math.random() < 0.6) part(mastGeo, unitMaterial, x, top + 3.5, z);
-
-    colliders.push({ minX: x - w / 2, maxX: x + w / 2, minZ: z - d / 2, maxZ: z + d / 2, maxY: h });
+    // a hotel's name down one corner, lit at night
+    if (opts.hotel) addHotelSign(batch, x - w / 2 - 0.15, z - d / 2 + 4, top);
+    return { w, d, top: roofY };
   }
+
+  const hotelSignMat = (() => {
+    const draw = (night) => canvasTexture(64, 384, (g, w, h) => {
+      g.fillStyle = night ? '#000' : '#e9e4d6';
+      g.fillRect(0, 0, w, h);
+      g.fillStyle = night ? '#ffe2b0' : '#7a2d1f';
+      g.font = 'bold 54px Georgia, serif';
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      'HOTEL'.split('').forEach((ch, i) => g.fillText(ch, w / 2, 44 + i * 74));
+    });
+    const material = new THREE.MeshPhongMaterial({ map: draw(false), emissiveMap: draw(true), emissive: 0x000000 });
+    material.userData.glow = 1.2;
+    litMaterials.push(material);
+    return material;
+  })();
+
+  function addHotelSign(batch, x, z, top) {
+    const y1 = top - 2;
+    const y0 = y1 - 14;
+    batchQuad(batch, hotelSignMat, [[x - 0.01, y0, z - 1.2], [x - 0.01, y0, z + 1.2], [x - 0.01, y1, z + 1.2], [x - 0.01, y1, z - 1.2]],
+      [[0, 0], [1, 0], [1, 1], [0, 1]]);
+  }
+
+  // A house on a plot: walls of painted plaster with windows, a pitched roof of tiles, a
+  // front door and a garage door facing the street, a chimney, and a hedge-lined garden.
+  // `face` is the way the front looks: 0 means toward +z.
+  function addHouse(batch, x, z, face, opts = {}) {
+    const storeys = opts.storeys || (Math.random() < 0.7 ? 2 : 1);
+    const w = opts.w || pick([9, 10, 11, 12]);
+    const d = opts.d || pick([8, 9, 10]);
+    const wallH = storeys * 3;
+    const wallMat = pick(houseMats);
+    const roofMat = pick(roofTileMats);
+    const rise = d * rand(0.32, 0.45);
+    const hip = Math.random() < 0.4;
+    // local frame: front along +z
+    const c = Math.cos(face);
+    const s = Math.sin(face);
+    const at = (lx, y, lz) => [x + lx * c + lz * s, y, z - lx * s + lz * c];
+    const hw = w / 2;
+    const hd = d / 2;
+    const base = 0.25; // on a low plinth
+    // walls: each 4 m of wall is one window tile, lit or not at random
+    const wall = (ax, az, bx, bz) => {
+      const len = Math.hypot(bx - ax, bz - az);
+      const count = Math.max(1, Math.round(len / 4));
+      for (let st = 0; st < storeys; st++) {
+        for (let k = 0; k < count; k++) {
+          const t0 = k / count;
+          const t1 = (k + 1) / count;
+          const u = Math.random() < 0.45 ? 0.5 : 0;
+          const y0 = base + st * 3;
+          batchQuad(batch, wallMat, [
+            at(ax + (bx - ax) * t0, y0, az + (bz - az) * t0), at(ax + (bx - ax) * t1, y0, az + (bz - az) * t1),
+            at(ax + (bx - ax) * t1, y0 + 3, az + (bz - az) * t1), at(ax + (bx - ax) * t0, y0 + 3, az + (bz - az) * t0),
+          ], [[u, 0], [u + 0.5, 0], [u + 0.5, 1], [u, 1]]);
+        }
+      }
+    };
+    wall(-hw, hd, hw, hd); // front
+    wall(hw, hd, hw, -hd);
+    wall(hw, -hd, -hw, -hd);
+    wall(-hw, -hd, -hw, hd);
+    const plinth = (ax, az, bx, bz) => batchQuad(batch, parapetMat, [at(ax, 0, az), at(bx, 0, bz), at(bx, base, bz), at(ax, base, az)], [[0, 0], [1, 0], [1, 0.1], [0, 0.1]]);
+    plinth(-hw, hd, hw, hd);
+    plinth(hw, hd, hw, -hd);
+    plinth(hw, -hd, -hw, -hd);
+    plinth(-hw, -hd, -hw, hd);
+
+    // roof: ridge along the width, eaves overhanging 0.5 m
+    const eave = base + wallH;
+    const o = 0.5;
+    const ridgeY = eave + rise;
+    const t = tileOf(roofMat);
+    const slope = Math.hypot(hd + o, rise);
+    const inset = hip ? Math.min(hw - 0.5, hd + o) : 0;
+    // front and back slopes
+    for (const side of [1, -1]) {
+      const e0 = at(-hw - o, eave - 0.25, side * (hd + o));
+      const e1 = at(hw + o, eave - 0.25, side * (hd + o));
+      const r1 = at(hw + o - inset, ridgeY, 0);
+      const r0 = at(-hw - o + inset, ridgeY, 0);
+      const quad = side > 0 ? [e0, e1, r1, r0] : [e1, e0, r0, r1];
+      batchQuad(batch, roofMat, quad, [[0, 0], [(w + 2 * o) / t, 0], [(w + 2 * o - inset) / t, slope / t], [inset / t, slope / t]]);
+    }
+    if (hip) {
+      for (const side of [1, -1]) {
+        const a = at(side * (hw + o), eave - 0.25, hd + o);
+        const b = at(side * (hw + o), eave - 0.25, -hd - o);
+        const r = at(side * (hw + o - inset), ridgeY, 0);
+        batchTriangle(batch, roofMat, side > 0 ? [b, r, a] : [a, r, b], [[0, 0], [0.5 * (d + 2 * o) / t, slope / t], [(d + 2 * o) / t, 0]]);
+      }
+    } else {
+      for (const side of [1, -1]) {
+        const a = at(side * hw, eave, hd);
+        const b = at(side * hw, eave, -hd);
+        const r = at(side * hw, ridgeY - 0.1, 0);
+        batchTriangle(batch, wallMat, side > 0 ? [b, r, a] : [a, r, b], [[0, 0], [0.25, 0.3], [0.5, 0]]);
+      }
+    }
+    // soffits under the eaves, so the roof does not look paper thin from below
+    batchQuad(batch, fenceMat, [at(-hw - o, eave - 0.25, hd + o), at(-hw - o, eave - 0.25, -hd - o), at(hw + o, eave - 0.25, -hd - o), at(hw + o, eave - 0.25, hd + o)],
+      [[0, 0], [1, 0], [1, 1], [0, 1]]);
+
+    // front door, garage, chimney
+    const door = (lx, width, height, material) => batchQuad(batch, material,
+      [at(lx - width / 2, base, hd + 0.03), at(lx + width / 2, base, hd + 0.03), at(lx + width / 2, base + height, hd + 0.03), at(lx - width / 2, base + height, hd + 0.03)],
+      [[0, 0], [1, 0], [1, 1], [0, 1]]);
+    door(-hw + 2, 1.1, 2.2, doorMat);
+    if (opts.garage !== false && w >= 10) door(hw - 2.2, 2.8, 2.3, garageMat);
+    const chimneyAt = at(-hw * 0.5, ridgeY - 0.4, -hd * 0.3);
+    batchBox(batch, brickWall, chimneyAt[0], chimneyAt[1], chimneyAt[2], 0.8, 2.4, 0.8, face, 1.5);
+
+    addCollider({
+      minX: x - Math.abs(hw * c) - Math.abs(hd * s), maxX: x + Math.abs(hw * c) + Math.abs(hd * s),
+      minZ: z - Math.abs(hw * s) - Math.abs(hd * c), maxZ: z + Math.abs(hw * s) + Math.abs(hd * c), maxY: standY + ridgeY,
+      car: { x, z, h: face + Math.PI / 2, hl: hw, hw: hd },
+    });
+    addSurface({ minX: x - 1, maxX: x + 1, minZ: z - 1, maxZ: z + 1, h0: standY + ridgeY, h1: standY + ridgeY });
+  }
+
+  // A warehouse: corrugated steel walls, roller doors along one side, a shallow roof.
+  function addWarehouse(batch, x, z, w, d, h, face = 0) {
+    const sheet = pick(steelSheets);
+    const corners = footprintCorners(x, z, w, d);
+    batchWalls(batch, sheet, corners, 0, h, tileOf(sheet));
+    batchParapet(batch, corners, h, 0.6);
+    batchLid(batch, roofConcrete, corners, h + 0.02);
+    // roller doors on the side facing `face` (+1: toward +z, -1: toward -z)
+    const zf = z + face * (d / 2 + 0.03);
+    for (let dx = -w / 2 + 6; dx < w / 2 - 4; dx += 9) {
+      const quad = face > 0
+        ? [[x + dx, 0, zf], [x + dx + 4.5, 0, zf], [x + dx + 4.5, 5, zf], [x + dx, 5, zf]]
+        : [[x + dx + 4.5, 0, zf], [x + dx, 0, zf], [x + dx, 5, zf], [x + dx + 4.5, 5, zf]];
+      batchQuad(batch, rollerMat, quad, [[0, 0], [1, 0], [1, 1], [0, 1]]);
+    }
+    batchRoofPlant(batch, x, z, w - 4, d - 4, h, false);
+    addCollider({ minX: x - w / 2, maxX: x + w / 2, minZ: z - d / 2, maxZ: z + d / 2, maxY: standY + h });
+    addSurface({ minX: x - w / 2, maxX: x + w / 2, minZ: z - d / 2, maxZ: z + d / 2, h0: standY + h, h1: standY + h });
+  }
+
+  // --- tiles of instances ---
+
+  // Things there are hundreds or thousands of (trees, lamps) are split into square tiles of
+  // the world, each its own instanced mesh, so a tile that is out of view or too far away is
+  // skipped whole, shadows included.
+  const cullTiles = []; // { mesh, sphere, reach, owner }
+  const tileFrustum = new THREE.Frustum();
+  const tileMatrix = new THREE.Matrix4();
+  function tiledInstances(geometry, material, matrices, { tile = 160, reach = 650, colors = null, owner = null, setup = null } = {}) {
+    const groups = new Map();
+    const v = new THREE.Vector3();
+    matrices.forEach((m, i) => {
+      v.setFromMatrixPosition(m);
+      const key = `${Math.floor(v.x / tile)},${Math.floor(v.z / tile)}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(i);
+    });
+    const meshes = [];
+    for (const list of groups.values()) {
+      const mesh = new THREE.InstancedMesh(geometry, material, list.length);
+      const box = new THREE.Box3();
+      list.forEach((i, n) => {
+        mesh.setMatrixAt(n, matrices[i]);
+        if (colors) mesh.setColorAt(n, colors[i]);
+        box.expandByPoint(v.setFromMatrixPosition(matrices[i]));
+      });
+      mesh.frustumCulled = false;
+      mesh.userData.tiled = true;
+      if (setup) setup(mesh);
+      scene.add(mesh);
+      const sphere = box.getBoundingSphere(new THREE.Sphere());
+      sphere.radius += 12; // the things themselves reach out from their centres
+      cullTiles.push({ mesh, sphere, reach, owner });
+      meshes.push(mesh);
+    }
+    return meshes;
+  }
+
+  function cullTilesFor(view) {
+    tileFrustum.setFromProjectionMatrix(tileMatrix.multiplyMatrices(view.projectionMatrix, view.matrixWorldInverse));
+    const eye = view.position;
+    for (const t of cullTiles) {
+      const far = t.sphere.center.distanceTo(eye) - t.sphere.radius > t.reach;
+      t.mesh.visible = (!t.owner || t.owner.visible) && !far && tileFrustum.intersectsSphere(t.sphere);
+    }
+  }
+  scene.onBeforeRender = (r, s, view) => {
+    if (view.isPerspectiveCamera && view === camera) cullTilesFor(view);
+  };
 
   // --- trees, bushes and grass ---
 
@@ -476,11 +1087,13 @@
 
   function addTree(x, z) {
     plants.push({ type: Math.random() < 0.3 ? 'pine' : 'tree', x, y: KERB + 0.08, z, s: rand(0.8, 1.25) });
-    colliders.push({ minX: x - 0.45, maxX: x + 0.45, minZ: z - 0.45, maxZ: z + 0.45, maxY: 8 });
+    addCollider({ minX: x - 0.45, maxX: x + 0.45, minZ: z - 0.45, maxZ: z + 0.45, maxY: 8 });
   }
 
   function addBush(x, z) {
-    plants.push({ type: 'bush', x, y: KERB + 0.08, z, s: rand(0.8, 1.3) });
+    const s = rand(0.8, 1.3);
+    plants.push({ type: 'bush', x, y: KERB + 0.08, z, s });
+    addCollider({ minX: x - 0.5 * s, maxX: x + 0.5 * s, minZ: z - 0.5 * s, maxZ: z + 0.5 * s, maxY: KERB + 1.1 * s, soft: true });
   }
 
   function buildVegetation() {
@@ -560,7 +1173,7 @@
         for (let n = 0; n < 4; n++) {
           wood.push([p.x, p.y + rand(2.2, 3.1) * s, p.z, rand(0.5, 0.95), n * 1.6 + rand(0, 0.8), 0.1 * s, 2.3 * s]);
         }
-        for (let n = 0; n < 130; n++) {
+        for (let n = 0; n < 72; n++) {
           // a point in the crown, more of them toward the outside
           const a = Math.random() * Math.PI * 2;
           const up = rand(-0.4, 1);
@@ -569,7 +1182,7 @@
           const light = (0.62 + 0.38 * (up * 0.5 + 0.5)) * rand(0.85, 1.15); // darker underneath
           cards.leaf.push([
             p.x + Math.cos(a) * flat * 2.4 * s * out, p.y + (4.7 + up * 1.9 * out) * s, p.z + Math.sin(a) * flat * 2.4 * s * out,
-            rand(-1.2, 1.2), Math.random() * 6.3, rand(-1.2, 1.2), rand(1.7, 2.6) * s, rand(1.7, 2.6) * s,
+            rand(-1.2, 1.2), Math.random() * 6.3, rand(-1.2, 1.2), rand(2.1, 3.1) * s, rand(2.1, 3.1) * s,
             green[0] * light, green[1] * light, green[2] * light,
           ]);
         }
@@ -625,32 +1238,37 @@
     for (const [name, map, shadows] of [['leaf', leafTex, true], ['pine', pineTex, true], ['tuft', tuftTex, false]]) {
       const list = cards[name];
       if (!list.length) continue;
-      const mesh = new THREE.InstancedMesh(plane, new THREE.MeshLambertMaterial({ map, alphaTest: 0.45, side: THREE.DoubleSide }), list.length);
-      list.forEach((c, i) => {
+      const material = new THREE.MeshLambertMaterial({ map, alphaTest: 0.45, side: THREE.DoubleSide });
+      material.userData.snow = 'foliage';
+      const depth = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking, map, alphaTest: 0.45 });
+      const matrices = [];
+      const colors = [];
+      for (const c of list) {
         dummy.position.set(c[0], c[1], c[2]);
         dummy.rotation.set(c[3], c[4], c[5]);
         dummy.scale.set(c[6], c[7], 1);
         dummy.updateMatrix();
-        mesh.setMatrixAt(i, dummy.matrix);
-        mesh.setColorAt(i, tint.setRGB(c[8], c[9], c[10]));
-      });
-      if (shadows) {
-        mesh.castShadow = true;
-        // the shadow follows the leaves' outline, not the square card
-        mesh.customDepthMaterial = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking, map, alphaTest: 0.45 });
+        matrices.push(dummy.matrix.clone());
+        colors.push(new THREE.Color(c[8], c[9], c[10]));
       }
-      scene.add(mesh);
+      tiledInstances(plane, material, matrices, {
+        colors, reach: name === 'tuft' ? 160 : 700,
+        setup: (mesh) => {
+          if (!shadows) return;
+          mesh.castShadow = true;
+          mesh.customDepthMaterial = depth; // the shadow follows the leaves' outline, not the square card
+        },
+      });
     }
-    const trunks = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.55, 1, 1, 8).translate(0, 0.5, 0), bark, wood.length);
-    wood.forEach((t, i) => {
+    const trunkGeo = new THREE.CylinderGeometry(0.55, 1, 1, 8).translate(0, 0.5, 0);
+    const trunks = wood.map((t) => {
       dummy.position.set(t[0], t[1], t[2]);
       dummy.rotation.set(t[3], t[4], 0);
       dummy.scale.set(t[5], t[6], t[5]);
       dummy.updateMatrix();
-      trunks.setMatrixAt(i, dummy.matrix);
+      return dummy.matrix.clone();
     });
-    trunks.castShadow = true;
-    scene.add(trunks);
+    tiledInstances(trunkGeo, bark, trunks, { reach: 600, setup: (mesh) => { mesh.castShadow = true; } });
   }
 
   function addBayRow(cx, cz, count) {
@@ -663,8 +1281,32 @@
     }
   }
 
+  // ---------- City blocks ----------
+
+  // What each block of the grid holds, by its column bx (0 on the -x side) and row bz (0 on
+  // the south side). The north rows are homes, houses toward the hills and flats toward
+  // the lake; the middle is the business district with the towers; the rest is offices,
+  // hotels and shops, with warehouses in the corner by the highway. The metro runs north to
+  // south down the middle of column 3, so the buildings there keep clear of it.
+  const STATION_BLOCK = [3, 3];
+  const METRO_COLUMN = 3;
+  function districtOf(bx, bz) {
+    if (bz === 6) return bx <= 3 ? 'houses' : 'apartments';
+    if (bz === 5) return bx <= 1 ? 'houses' : 'apartments';
+    if (bz >= 2 && bz <= 4 && bx >= 2 && bx <= 5) return 'towers';
+    if (bz === 0 && bx <= 1) return 'industrial';
+    return 'commercial';
+  }
+
+  // A flat ground drawn like the road: first, writing no depth (see buildCity).
+  function underfoot(mesh) {
+    mesh.material.depthWrite = false;
+    mesh.renderOrder = -0.45;
+    return mesh;
+  }
+
   function addParkingLot(cx, cz) {
-    flatPlane(BLOCK_SIZE, BLOCK_SIZE, GROUND.tarmac[0], cx, cz, 0.06, ...GROUND.tarmac.slice(1));
+    underfoot(flatPlane(BLOCK_SIZE, BLOCK_SIZE, GROUND.tarmac[0], cx, cz, 0.06, ...GROUND.tarmac.slice(1)));
     addBayRow(cx, cz - 26, 17);
     addBayRow(cx, cz + 26, 17);
     addBayRow(cx, cz - 3.1, 13);
@@ -677,29 +1319,237 @@
 
   const kerbMat = new THREE.MeshLambertMaterial({ color: 0x8b9098 });
 
-  function addCityBlock(cx, cz) {
-    cityBlocks.push({ x: cx, z: cz, y: KERB });
-    // a raised kerb that cars and people step up onto
-    const kerb = new THREE.Mesh(new THREE.BoxGeometry(BLOCK_SIZE, KERB - 0.04, BLOCK_SIZE), kerbMat);
-    kerb.position.set(cx, (KERB - 0.04) / 2, cz);
-    scene.add(kerb);
-    flatPlane(BLOCK_SIZE, BLOCK_SIZE, GROUND.paving[0], cx, cz, KERB + 0.01, ...GROUND.paving.slice(1));
-    const half = BLOCK_SIZE / 2;
-    surfaces.push({ minX: cx - half, maxX: cx + half, minZ: cz - half, maxZ: cz + half, h0: KERB, h1: KERB });
+  // Pavements, lawns and drives of every block go into one mesh per material.
+  const groundBatch = makeBatch();
+  let pavingMat = null;
+  let lawnMat = null;
+  function groundRect(material, x, z, w, d, y, tile) {
+    batchQuad(groundBatch, material, [[x - w / 2, y, z + d / 2], [x + w / 2, y, z + d / 2], [x + w / 2, y, z - d / 2], [x - w / 2, y, z - d / 2]],
+      [[(x - w / 2) / tile, (z + d / 2) / tile], [(x + w / 2) / tile, (z + d / 2) / tile], [(x + w / 2) / tile, (z - d / 2) / tile], [(x - w / 2) / tile, (z - d / 2) / tile]]);
+  }
 
-    for (const ox of [-15, 15]) {
-      for (const oz of [-15, 15]) {
-        if (Math.random() < 0.15) {
-          // pocket park
-          flatPlane(24, 24, 0x6fb56a, cx + ox, cz + oz, KERB + 0.08, grassTex, GRASS_TILE);
-          lawns.push({ x: cx + ox, y: KERB + 0.08, z: cz + oz, size: 23 });
-          for (let i = 0; i < 4; i++) addTree(cx + ox + rand(-9, 9), cz + oz + rand(-9, 9));
-          for (let i = 0; i < 4; i++) addBush(cx + ox + rand(-10, 10), cz + oz + rand(-10, 10));
-        } else {
-          const bays = () => 3 * Math.floor(rand(6, 9)); // 18, 21 or 24 m
-          addBuilding(cx + ox, cz + oz, bays(), bays(), PODIUM + 3 * Math.floor(rand(2, 15)));
+  // The raised pavement every block stands on.
+  function addPavement(cx, cz) {
+    cityBlocks.push({ x: cx, z: cz, y: KERB });
+    if (!pavingMat) {
+      pavingMat = groundMaterial(GROUND.paving[0], GROUND.paving[1], GROUND.paving[3]);
+      lawnMat = groundMaterial(0x6fb56a, grassTex, null);
+    }
+    const half = BLOCK_SIZE / 2;
+    groundRect(pavingMat, cx, cz, BLOCK_SIZE, BLOCK_SIZE, KERB + 0.003, GROUND.paving[2]);
+    batchWalls(groundBatch, kerbMat, footprintCorners(cx, cz, BLOCK_SIZE, BLOCK_SIZE), 0, KERB + 0.01, 2);
+    addSurface({ minX: cx - half, maxX: cx + half, minZ: cz - half, maxZ: cz + half, h0: KERB, h1: KERB });
+  }
+
+  function addLawn(x, z, w, d) {
+    groundRect(lawnMat, x, z, w, d, KERB + 0.03, GRASS_TILE);
+    lawns.push({ x, y: KERB + 0.03, z, size: Math.min(w, d) - 1 });
+  }
+
+  // Buildings are merged a 2 x 2 group of blocks at a time.
+  const chunkBatches = new Map();
+  const chunkBatch = (bx, bz) => {
+    const key = `${bx >> 1},${bz >> 1}`;
+    if (!chunkBatches.has(key)) chunkBatches.set(key, makeBatch());
+    return chunkBatches.get(key);
+  };
+
+  function addCityBlock(cx, cz, bx, bz) {
+    addPavement(cx, cz);
+    const district = districtOf(bx, bz);
+    const corridor = bx === METRO_COLUMN; // keep |x - cx| < 8 open for the metro's piers
+    const batch = chunkBatch(bx, bz); // lifted onto the pavement when the chunk is finished
+    standY = KERB; // what is built here stands on the pavement
+
+    if (district === 'houses') {
+      // a row of houses along each street side, front gardens to the pavement, a shared
+      // green behind with trees
+      addLawn(cx, cz, BLOCK_SIZE - 6, BLOCK_SIZE - 6);
+      for (const side of [1, -1]) {
+        for (const ox of [-20.25, -6.75, 6.75, 20.25]) {
+          if (corridor && Math.abs(ox) < 9) continue;
+          const z = cz + side * 15.5;
+          const w = pick([9, 10, 11]);
+          addHouse(batch, cx + ox, z, side > 0 ? 0 : Math.PI, { w, d: pick([8, 9]) });
+          // a paved drive from the pavement up to the garage, and a hedge along the plot's edge
+          if (w >= 10) groundRect(pavingMat, cx + ox + side * (w / 2 - 2.2), cz + side * 23.5, 3.2, 7, KERB + 0.05, GROUND.paving[2]);
+          batchBox(batch, hedgeMat, cx + ox + 6.75, 0.6, cz + side * 15, 0.8, 1.2, 22, 0, 2);
+          addBush(cx + ox - 3.5, cz + side * 24.6);
+          if (Math.random() < 0.7) addTree(cx + ox + rand(-4, 4), cz + side * rand(3, 8));
         }
       }
+      for (const ox of [-27, 27]) batchBox(batch, hedgeMat, cx + ox, 0.6, cz, 0.8, 1.2, 48, 0, 2);
+    } else if (district === 'industrial') {
+      addWarehouse(batch, cx, cz - 13, 52, 24, rand(9, 12), -1);
+      addWarehouse(batch, cx, cz + 14, 48, 22, rand(8, 11), 1);
+    } else if (district === 'towers' && !corridor && Math.random() < 0.55) {
+      // one great tower on a plaza, with trees at the corners
+      const kind = pick(['tower', 'glass', 'highrise', 'block', 'tower']);
+      const f = FACADES[kind];
+      const floors = Math.round(rand(80, 150) / f.floor);
+      addBuilding(batch, cx, cz, rand(30, 36), rand(30, 36), floors, kind, { setback: Math.random() < 0.6, chamfer: Math.random() < 0.35 });
+      for (const ox of [-24, 24]) for (const oz of [-24, 24]) addTree(cx + ox, cz + oz);
+    } else {
+      // four buildings, one in each quarter; a pocket park now and then
+      const quarters = [[-15, -15], [15, -15], [-15, 15], [15, 15]];
+      const hotel = district === 'commercial' && Math.random() < 0.3 ? Math.floor(Math.random() * 4) : -1;
+      quarters.forEach(([ox, oz], q) => {
+        const ax = corridor ? Math.sign(ox) * 17.5 : ox;
+        if (Math.random() < (district === 'towers' ? 0.08 : 0.14)) {
+          addLawn(cx + ax, cz + oz, corridor ? 18 : 24, 24);
+          for (let i = 0; i < 4; i++) addTree(cx + ax + rand(-8, 8), cz + oz + rand(-9, 9));
+          for (let i = 0; i < 4; i++) addBush(cx + ax + rand(-9, 9), cz + oz + rand(-10, 10));
+          return;
+        }
+        const w = corridor ? rand(13, 17) : rand(18, 25);
+        const d = rand(18, 25);
+        if (district === 'apartments') {
+          const kind = pick(['brick', 'loft', 'brick', 'office']);
+          const f = FACADES[kind];
+          addBuilding(batch, cx + ax, cz + oz, w, d, Math.round(rand(14, 34) / f.floor), kind, { homes: Math.random() < 0.6, balconies: kind !== 'office' && Math.random() < 0.6 });
+        } else if (district === 'towers') {
+          const kind = pick(['tower', 'glass', 'ribbon', 'office', 'block']);
+          const f = FACADES[kind];
+          addBuilding(batch, cx + ax, cz + oz, w, d, Math.round(rand(40, 95) / f.floor), kind, { setback: Math.random() < 0.4 });
+        } else {
+          const kind = q === hotel ? pick(['loft', 'brick']) : pick(['office', 'ribbon', 'glass', 'loft', 'brick']);
+          const f = FACADES[kind];
+          addBuilding(batch, cx + ax, cz + oz, w, d, Math.round(rand(16, 52) / f.floor), kind, { hotel: q === hotel, chamfer: Math.random() < 0.15 });
+        }
+      });
+    }
+    standY = 0;
+  }
+
+  // The plaza under Central station: paving, trees in planters, benches.
+  function addStationPlaza(cx, cz) {
+    addPavement(cx, cz);
+    const batch = makeBatch();
+    for (const ox of [-20, 20]) {
+      for (const oz of [-20, -7, 7, 20]) {
+        addTree(cx + ox, cz + oz);
+        batchBox(batch, parapetMat, cx + ox, KERB + 0.25, cz + oz, 2.4, 0.5, 2.4);
+        addCollider({ minX: cx + ox - 1.2, maxX: cx + ox + 1.2, minZ: cz + oz - 1.2, maxZ: cz + oz + 1.2, maxY: KERB + 0.5, top: KERB + 0.5, low: true });
+      }
+    }
+    for (const ox of [-13, 13]) {
+      for (const oz of [-14, 0, 14]) {
+        batchBox(batch, fenceMat, cx + ox, KERB + 0.45, cz + oz, 0.5, 0.08, 1.8);
+        batchBox(batch, darkMetal, cx + ox, KERB + 0.22, cz + oz, 0.4, 0.44, 0.1);
+        addCollider({ minX: cx + ox - 0.27, maxX: cx + ox + 0.27, minZ: cz + oz - 0.92, maxZ: cz + oz + 0.92, maxY: KERB + 0.5, top: KERB + 0.5, low: true });
+      }
+    }
+    flushBatch(batch);
+  }
+
+  function buildCity() {
+    // The road surface is huge and only centimetres above the grass, which is too close
+    // for the depth buffer far from the camera. Grass and road are the lowest things in the
+    // scene, so draw them first, in order, without writing depth.
+    const road = flatPlane(WORLD, WORLD, GROUND.road[0], 0, 0, 0.03, ...GROUND.road.slice(1));
+    road.material.depthWrite = false;
+    road.renderOrder = -0.5;
+
+    for (let bx = 0; bx < BLOCKS; bx++) {
+      for (let bz = 0; bz < BLOCKS; bz++) {
+        const isLot = PARKING_LOTS.some(([x, z]) => x === bx && z === bz);
+        const isParkade = bx === PARKADE[0] && bz === PARKADE[1];
+        if (isLot) addParkingLot(blockCenter(bx), blockCenter(bz));
+        else if (isParkade) addParkade(blockCenter(bx), blockCenter(bz));
+        else if (bx === STATION_BLOCK[0] && bz === STATION_BLOCK[1]) addStationPlaza(blockCenter(bx), blockCenter(bz));
+        else addCityBlock(blockCenter(bx), blockCenter(bz), bx, bz);
+      }
+    }
+
+    // Lines along every road between crossings: a double yellow down the middle, white
+    // edge lines by the kerbs, and dashes dividing the two lanes each side.
+    const YELLOW = 0xe0b020;
+    const clear = JUNCTION + 5.4; // the lines stop short of the pedestrian crossings
+    for (let i = 0; i <= BLOCKS; i++) {
+      const c = roadCenter(i);
+      for (let k = 0; k < BLOCKS; k++) {
+        const from = roadCenter(k) + clear;
+        const to = roadCenter(k + 1) - clear;
+        const mid = (from + to) / 2;
+        const line = (offset, width, color) => {
+          marks.push({ x: c + offset, z: mid, sx: width, sz: to - from, color }); // on the north-south road
+          marks.push({ x: mid, z: c + offset, sx: to - from, sz: width, color }); // on the east-west road
+        };
+        line(-0.2, 0.14, YELLOW);
+        line(0.2, 0.14, YELLOW);
+        line(-ROAD_WIDTH / 2 + 0.55, 0.15);
+        line(ROAD_WIDTH / 2 - 0.55, 0.15);
+        for (let t = from + 1.5; t + 3 < to; t += 9) {
+          for (const offset of [-ROAD_WIDTH / 4, ROAD_WIDTH / 4]) {
+            marks.push({ x: c + offset, z: t + 1.5, sx: 0.14, sz: 3 });
+            marks.push({ x: t + 1.5, z: c + offset, sx: 3, sz: 0.14 });
+          }
+        }
+      }
+    }
+
+    // finish the merged meshes: the buildings stand on the pavement
+    for (const batch of chunkBatches.values()) {
+      for (const part of batch.values()) for (let i = 1; i < part.positions.length; i += 3) part.positions[i] += KERB;
+      flushBatch(batch);
+    }
+    flushBatch(groundBatch, false);
+
+    addFlyover();
+
+    // a zebra crossing, a stop line behind it, and a signal for every road that enters an intersection
+    for (let i = 0; i <= BLOCKS; i++) {
+      for (let j = 0; j <= BLOCKS; j++) {
+        DIRS.forEach(([dx, dz], d) => {
+          if (!inGrid(i - dx, j - dz)) return;
+          const [rx, rz] = rightOf([dx, dz]);
+          const at = (back, across2) => ({
+            x: roadCenter(i) - dx * (JUNCTION + back) + rx * across2,
+            z: roadCenter(j) - dz * (JUNCTION + back) + rz * across2,
+          });
+          for (let across2 = -ROAD_WIDTH / 2 + 0.75; across2 < ROAD_WIDTH / 2; across2 += 1) {
+            marks.push({ ...at(2.3, across2), sx: dx ? 3 : 0.5, sz: dx ? 0.5 : 3 });
+          }
+          marks.push({ ...at(4.6, ROAD_WIDTH / 4), sx: dx ? 0.45 : ROAD_WIDTH / 2 - 1, sz: dx ? ROAD_WIDTH / 2 - 1 : 0.45 });
+          signals.push({ i, j, d });
+        });
+      }
+    }
+  }
+
+  // All road paint in one instanced mesh, once every road has added its lines.
+  function paintMarks() {
+    const geo = new THREE.PlaneGeometry(1, 1);
+    geo.rotateX(-Math.PI / 2);
+    // road paint is lit like the road (so it darkens in shade) and a little scuffed
+    const scuffed = canvasTexture(64, 64, (g, w, h) => {
+      g.fillStyle = '#ffffff';
+      g.fillRect(0, 0, w, h);
+      speckle(g, w, h, 500, 0.12);
+    });
+    // Paint is part of the surface it is on, never a strip on top of it: on the ground it is
+    // drawn straight after the roads and car parks (which, like it, write no depth), at the
+    // height feet and tyres stand at, so anyone standing on a line covers it. On a deck or a
+    // parking level it lies a hair above the concrete and is drawn after it.
+    const m = new THREE.Matrix4();
+    const tint = new THREE.Color();
+    for (const raised of [false, true]) {
+      const list = marks.filter((mark) => !!mark.y === raised);
+      if (!list.length) continue;
+      const material = new THREE.MeshLambertMaterial({
+        color: 0xffffff, map: scuffed, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2,
+      });
+      const paint = new THREE.InstancedMesh(geo, material, list.length);
+      list.forEach((mark, i) => {
+        m.makeScale(mark.sx, 1, mark.sz);
+        m.setPosition(mark.x, raised ? mark.y + 0.012 : 0.004, mark.z);
+        paint.setMatrixAt(i, m);
+        paint.setColorAt(i, tint.setHex(mark.color || 0xe9e9e4));
+      });
+      paint.renderOrder = raised ? 0.6 : -0.4;
+      paint.receiveShadow = true;
+      paint.userData.snow = 'road';
+      scene.add(paint);
     }
   }
 
@@ -719,6 +1569,10 @@
         });
       }
     }
+    for (const spot of lampSpots) {
+      spots.push(spot);
+      if (spot.both) spots.push({ ...spot, turn: spot.turn + Math.PI });
+    }
     let parts;
     // the lantern's glass and bulb are dull by day and lit after dark (see updateEnvironment)
     const glass = new THREE.MeshPhongMaterial({
@@ -737,31 +1591,35 @@
         if (!o.isMesh) return;
         const geo = o.geometry.clone().applyMatrix4(o.matrixWorld).scale(1.3, 1.3, 1.3); // about 5 m tall
         const name = o.material.name;
-        const mesh = new THREE.InstancedMesh(geo, name.endsWith('glass') ? glass : name.endsWith('bulb') ? bulb : iron, spots.length);
-        mesh.castShadow = !name.endsWith('glass');
-        parts.push(mesh);
+        parts.push([geo, name.endsWith('glass') ? glass : name.endsWith('bulb') ? bulb : iron, !name.endsWith('glass')]);
       });
     } else {
       const metal = new THREE.MeshLambertMaterial({ color: 0x3a3f47 });
       parts = [
-        [new THREE.CylinderGeometry(0.07, 0.11, 7, 6).translate(0, 3.5, 0), metal],
-        [new THREE.BoxGeometry(0.1, 0.1, 1.9).translate(0, 7, 0.9), metal],
-        [new THREE.BoxGeometry(0.34, 0.12, 0.75).translate(0, 6.92, 1.6), bulb],
-      ].map(([geo, mat]) => new THREE.InstancedMesh(geo, mat, spots.length));
+        [new THREE.CylinderGeometry(0.07, 0.11, 7, 6).translate(0, 3.5, 0), metal, true],
+        [new THREE.BoxGeometry(0.1, 0.1, 1.9).translate(0, 7, 0.9), metal, true],
+        [new THREE.BoxGeometry(0.34, 0.12, 0.75).translate(0, 6.92, 1.6), bulb, false],
+      ];
     }
     const dummy = new THREE.Object3D();
-    spots.forEach((spot, i) => {
-      dummy.position.set(spot.x, KERB, spot.z);
+    for (const spot of spots) addPost(spot.x, spot.z, spot.tall ? 0.2 : 0.14, spot.y ?? KERB, spot.tall ? 9 : 5.5);
+    const posts = spots.map((spot) => {
+      dummy.position.set(spot.x, spot.y ?? KERB, spot.z);
       dummy.rotation.y = spot.turn;
+      dummy.scale.setScalar(spot.tall ? 1.7 : 1); // taller poles over the highway and the car park
       dummy.updateMatrix();
-      for (const mesh of parts) mesh.setMatrixAt(i, dummy.matrix);
+      return dummy.matrix.clone();
     });
-    scene.add(...parts);
+    dummy.scale.setScalar(1);
+    for (const [geo, material, shadow] of parts) {
+      // the bulbs are seen from much further than the posts, after dark
+      tiledInstances(geo, material, posts, { reach: material === bulb ? 900 : 260, setup: (mesh) => { mesh.castShadow = shadow; } });
+    }
 
     // the pool of light under each lamp: a soft glowing disc on the ground, shown after dark
     const pool = new THREE.PlaneGeometry(1, 1);
     pool.rotateX(-Math.PI / 2);
-    const glow = new THREE.InstancedMesh(pool, new THREE.MeshBasicMaterial({
+    const glowMat = new THREE.MeshBasicMaterial({
       color: 0xffd48a, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending,
       map: canvasTexture(64, 64, (g, w) => {
         g.fillStyle = '#000';
@@ -773,17 +1631,18 @@
         g.fillStyle = fade;
         g.fillRect(0, 0, w, w);
       }),
-    }), spots.length);
-    spots.forEach((spot, i) => {
-      dummy.position.set(spot.x, KERB + 0.05, spot.z);
-      dummy.rotation.y = 0;
-      dummy.scale.set(17, 1, 17);
-      dummy.updateMatrix();
-      glow.setMatrixAt(i, dummy.matrix);
     });
-    glow.renderOrder = 0.85;
-    glow.visible = false;
-    scene.add(glow);
+    const pools = spots.map((spot) => {
+      const reach = spot.tall ? 2.6 : 1.4; // the pool lies under the lamp, out over the road
+      dummy.position.set(spot.x + Math.sin(spot.turn) * reach, (spot.ground ?? spot.y ?? KERB) + 0.05, spot.z + Math.cos(spot.turn) * reach);
+      dummy.rotation.y = 0;
+      dummy.scale.set(spot.tall ? 26 : 17, 1, spot.tall ? 26 : 17);
+      dummy.updateMatrix();
+      return dummy.matrix.clone();
+    });
+    // switched on and off together (see updateEnvironment) through this stand-in
+    const glow = { material: glowMat, visible: false };
+    tiledInstances(pool, glowMat, pools, { reach: 900, owner: glow, setup: (mesh) => { mesh.renderOrder = 0.85; } });
     streetLights = { bulb, glass, glow };
   }
 
@@ -903,10 +1762,12 @@
     cloudy: { cover: 0.36, overcast: 0.5, rain: 0 },
     rain: { cover: 0.2, overcast: 0.85, rain: 0.65 },
     storm: { cover: 0.08, overcast: 1, rain: 1 },
+    snow: { cover: 0.12, overcast: 0.95, rain: 0, snow: 1 },
   };
   const env = {
     hour: 8, weather: 'clear', timer: rand(150, 240),
     cover: 0.56, overcast: 0, rain: 0, wet: 0, // eased toward the weather's values
+    snow: 0, snowCover: 0, slush: 0, // snow falling; how much has settled; how slushy it has gone
     night: 0, flash: 0, nextFlash: 6,
   };
   const tone = (hex) => new THREE.Color(hex);
@@ -934,13 +1795,20 @@
     env.hour = (env.hour + (dt * 24) / DAY_SECONDS) % 24;
     env.timer -= dt;
     if (env.timer <= 0) {
-      // mostly fair, sometimes overcast, now and then rain or a storm
+      // mostly fair, sometimes overcast, now and then rain, a storm or snow
       const roll = Math.random();
-      setWeather(roll < 0.45 ? 'clear' : roll < 0.7 ? 'cloudy' : roll < 0.9 ? 'rain' : 'storm');
+      setWeather(roll < 0.42 ? 'clear' : roll < 0.64 ? 'cloudy' : roll < 0.82 ? 'rain' : roll < 0.91 ? 'storm' : 'snow');
     }
     const goal = WEATHERS[env.weather];
     for (const key of ['cover', 'overcast', 'rain']) env[key] = approach(env[key], goal[key], 0.035 * dt);
-    env.wet = approach(env.wet, env.rain > 0.1 ? 1 : 0, (env.rain > 0.1 ? 0.04 : 0.012) * dt);
+    env.snow = approach(env.snow, goal.snow || 0, 0.035 * dt);
+    // snow settles slowly while it falls (about three minutes to cover everything), then
+    // lies, turns to slush and melts, quicker by day
+    if (env.snow > 0.05) env.snowCover = Math.min(1, env.snowCover + (env.snow * dt) / 170);
+    else if (env.snowCover > 0) env.snowCover = Math.max(0, env.snowCover - dt / (env.night > 0.5 ? 700 : 320));
+    env.slush = approach(env.slush, env.snow < 0.05 && env.snowCover > 0 ? 1 : 0, 0.02 * dt);
+    const soaking = env.rain > 0.1 || env.slush > 0.3;
+    env.wet = approach(env.wet, soaking ? 1 : 0, (soaking ? 0.04 : 0.012) * dt);
 
     // --- where the sun is
     const arc = ((env.hour - 6) / 12) * Math.PI; // 0 at sunrise, pi at sunset
@@ -985,6 +1853,10 @@
     scratchTone.copy(SKY_TONES.grey).multiplyScalar(0.12 + 0.88 * day);
     u.zenith.value.lerp(scratchTone, env.overcast * 0.85);
     u.horizon.value.lerp(scratchTone, env.overcast * 0.8);
+    // falling snow whitens the haze
+    scratchTone.setRGB(0.8, 0.83, 0.87).multiplyScalar(0.12 + 0.88 * day);
+    u.horizon.value.lerp(scratchTone, env.snow * 0.7);
+    u.zenith.value.lerp(scratchTone, env.snow * 0.5);
     mixTone(u.sunGlow.value, SKY_TONES.sunHigh, SKY_TONES.sunLow, low).multiplyScalar(day * (1 - 0.8 * env.overcast));
     mixTone(u.cloudLit.value, SKY_TONES.cloudDay, SKY_TONES.cloudDusk, low).multiplyScalar((0.1 + 0.9 * day) * (1 - 0.45 * env.overcast));
     u.cloudShade.value.copy(SKY_TONES.cloudShadeDay).multiplyScalar((0.07 + 0.93 * day) * (1 - 0.55 * env.overcast));
@@ -993,14 +1865,18 @@
     u.flash.value = env.flash;
     scene.fog.color.copy(u.horizon.value);
     scene.background.copy(u.horizon.value);
-    scene.fog.near = 260 - 170 * env.rain; // rain closes the view in
-    scene.fog.far = 1300 - 800 * env.rain;
+    scene.fog.near = 260 - 170 * env.rain - 170 * env.snow; // rain and snow close the view in
+    scene.fog.far = 1300 - 800 * env.rain - 820 * env.snow;
 
     // --- lamps: street lights and vehicle lights come on as it gets dark
     const lampsOn = smooth((env.night + env.overcast * 0.35 - 0.25) / 0.3);
     headlightMat.color.setRGB(0.72 + 0.28 * lampsOn, 0.7 + 0.27 * lampsOn, 0.62 + 0.23 * lampsOn);
     tailIdle = lampsOn > 0.5 ? 0xc01a1a : 0x7a1010;
     beamMat.opacity = lampsOn * 0.7;
+    lampsOnNow = lampsOn;
+    for (const material of litMaterials) material.emissive.setScalar(lampsOn * material.userData.glow);
+    beaconMat.color.setHex(lampsOn > 0.3 && Math.floor(clock * 1.3) % 2 === 0 ? 0xff2a1a : 0x400808);
+    for (const material of metroLamps) material.color.setHex(lampsOn > 0.3 ? material.userData.lit : 0x606060);
     if (streetLights) {
       streetLights.bulb.color.setRGB(0.55 + 0.45 * lampsOn, 0.52 + 0.4 * lampsOn, 0.45 + 0.2 * lampsOn);
       streetLights.glass.emissive.setRGB(1.0 * lampsOn, 0.8 * lampsOn, 0.42 * lampsOn);
@@ -1018,21 +1894,262 @@
       }
     }
 
+    // after dark, reflections show the lit city (photographed the first night)
+    const nightSky = lampsOn > 0.5 && !!reflectionNight;
+    if (lampsOn > 0.6 && !reflectionNight && reflection && clock > 3) captureReflections(true);
+    useReflection(nightSky ? reflectionNight : reflection);
+
     // --- wet ground: darker, glossier, and it picks up the sky
     for (const surface of wetSurfaces) {
       surface.material.color.copy(surface.color).multiplyScalar(1 - 0.38 * env.wet);
       surface.material.shininess = 8 + 90 * env.wet;
       surface.material.specular.setScalar(0.09 + 0.45 * env.wet);
-      surface.material.reflectivity = 0.22 * env.wet * (0.15 + 0.85 * day);
+      surface.material.reflectivity = 0.24 * env.wet * (nightSky ? 1 : 0.15 + 0.85 * day);
     }
     // reflections were photographed by day; fade them as the light goes
     for (const material of reflective) {
-      if (material.userData.reflect !== undefined) material.reflectivity = material.userData.reflect * (0.12 + 0.88 * day);
+      if (material.userData.reflect !== undefined) material.reflectivity = material.userData.reflect * (nightSky ? 0.85 : 0.12 + 0.88 * day);
     }
 
     updateRain(dt);
+    updateSnow(dt);
     updateAudio();
     $('clock').textContent = `${String(Math.floor(env.hour)).padStart(2, '0')}:${String(Math.floor((env.hour % 1) * 60)).padStart(2, '0')}`;
+  }
+
+  // --- snow ---
+
+  // Snow is drawn by every lit surface in the scene: wherever a surface faces the sky, it
+  // turns white in proportion to how much has settled (env.snowCover), first in patches,
+  // then all over, on roofs, pavements, parked cars, trees, lamps and bridges alike. Where
+  // vehicles drive, their wheels clear it: each frame they paint their tracks onto a map
+  // of the city seen from above, and the ground reads that map, so busy lanes stay dark
+  // and wet while quiet streets and verges fill up. When it stops snowing the snow lies a
+  // while, goes grey and slushy, and melts away.
+  const SNOW_AREA = 800; // the track map covers -800..800 m both ways
+  const snowUniforms = {
+    snowCover: { value: 0 },
+    snowSlush: { value: 0 },
+    snowTracks: { value: null },
+  };
+  const SNOW_TYPES = new Set(['MeshLambertMaterial', 'MeshPhongMaterial', 'MeshStandardMaterial', 'MeshPhysicalMaterial']);
+  const snowMode = (material) => {
+    if (!SNOW_TYPES.has(material.type) || material.userData.noSnow || material.transparent || material.skinning) return 'none';
+    return material.userData.snow === 'foliage' ? 'foliage' : 'ground';
+  };
+  THREE.Material.prototype.customProgramCacheKey = function () {
+    return `snow:${snowMode(this)}`;
+  };
+  THREE.Material.prototype.onBeforeCompile = function (shader) {
+    const kind = snowMode(this);
+    if (kind === 'none' || !shader.fragmentShader.includes('#include <color_fragment>')) return;
+    Object.assign(shader.uniforms, snowUniforms);
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vSnowPos;\nvarying float vSnowUp;')
+      .replace('#include <fog_vertex>', `#include <fog_vertex>
+        vec4 snowWorld = vec4(transformed, 1.0);
+        vec3 snowNormal = objectNormal;
+        #ifdef USE_INSTANCING
+          snowWorld = instanceMatrix * snowWorld;
+          snowNormal = mat3(instanceMatrix) * snowNormal;
+        #endif
+        snowWorld = modelMatrix * snowWorld;
+        vSnowPos = snowWorld.xyz;
+        vSnowUp = normalize(mat3(modelMatrix) * snowNormal).y;`);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>
+        ${kind === 'foliage' ? '#define SNOW_FOLIAGE' : ''}
+        uniform float snowCover;
+        uniform float snowSlush;
+        uniform sampler2D snowTracks;
+        varying vec3 vSnowPos;
+        varying float vSnowUp;
+        float snowHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+        float snowNoise(vec2 p) {
+          vec2 i = floor(p);
+          vec2 f = fract(p);
+          f = f * f * (3.0 - 2.0 * f);
+          return mix(mix(snowHash(i), snowHash(i + vec2(1.0, 0.0)), f.x), mix(snowHash(i + vec2(0.0, 1.0)), snowHash(i + vec2(1.0, 1.0)), f.x), f.y);
+        }`)
+      .replace('#include <color_fragment>', `#include <color_fragment>
+        float snowAmount = 0.0;
+        float snowCleared = 0.0;
+        if (snowCover > 0.001) {
+          #ifdef SNOW_FOLIAGE
+            float snowFacing = 0.25 + 0.6 * abs(vSnowUp);
+          #else
+            float snowFacing = smoothstep(0.3, 0.8, vSnowUp);
+          #endif
+          // it settles in patches first, then everywhere
+          float n = snowNoise(vSnowPos.xz * 0.35) * 0.65 + snowNoise(vSnowPos.xz * 2.1) * 0.35;
+          float settled = smoothstep(n - 0.22, n + 0.06, snowCover * 1.35 - 0.12);
+          // wheels have cleared it where they run (only down at road level)
+          vec2 snowUv = vec2(vSnowPos.x + ${SNOW_AREA.toFixed(1)}, ${SNOW_AREA.toFixed(1)} - vSnowPos.z) / ${(SNOW_AREA * 2).toFixed(1)};
+          snowCleared = vSnowPos.y < 1.0 ? texture2D(snowTracks, snowUv).r : 0.0;
+          snowAmount = snowFacing * settled * (1.0 - 0.85 * snowCleared);
+          vec3 snowColor = mix(vec3(0.93, 0.95, 0.99), vec3(0.62, 0.63, 0.65), snowSlush);
+          diffuseColor.rgb = mix(diffuseColor.rgb, snowColor, snowAmount);
+          // the cleared lanes are wet and dark
+          diffuseColor.rgb *= 1.0 - 0.28 * snowCleared * snowFacing * min(1.0, snowCover * 4.0);
+        }`);
+    if (shader.fragmentShader.includes('#include <specularmap_fragment>')) {
+      shader.fragmentShader = shader.fragmentShader.replace('#include <specularmap_fragment>', `#include <specularmap_fragment>
+        specularStrength *= 1.0 - 0.8 * snowAmount;
+        specularStrength = max(specularStrength, 0.6 * snowCleared * min(1.0, snowCover * 4.0));`);
+    }
+  };
+
+  // The track map: what has been cleared, 0 to 1, painted by wheels and filled back in by
+  // falling snow.
+  let snowTarget = null;
+  let snowScene = null;
+  let snowCamera = null;
+  let snowStrips = null;
+  let snowRefill = null;
+  let snowFlakes = null;
+  const SNOW_FLAKES = 2600;
+  const flakeData = new Float32Array(SNOW_FLAKES * 5); // x, y, z, the height of what is under it, a wobble phase
+
+  function setupSnow() {
+    snowTarget = new THREE.WebGLRenderTarget(2048, 2048, { depthBuffer: false, stencilBuffer: false });
+    snowUniforms.snowTracks.value = snowTarget.texture;
+    snowScene = new THREE.Scene();
+    snowCamera = new THREE.OrthographicCamera(-SNOW_AREA, SNOW_AREA, SNOW_AREA, -SNOW_AREA, 1, 200);
+    snowCamera.up.set(0, 0, -1); // so the map's v runs toward -z, as the shader reads it
+    snowCamera.position.set(0, 100, 0);
+    snowCamera.lookAt(0, 0, 0);
+    const strip = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
+    snowStrips = new THREE.InstancedMesh(strip, new THREE.MeshBasicMaterial({
+      color: 0xffffff, transparent: true, opacity: 0.14, blending: THREE.AdditiveBlending, depthTest: false, depthWrite: false,
+    }), 420);
+    snowStrips.frustumCulled = false;
+    snowScene.add(snowStrips);
+    // falling snow fills the tracks back in: a little is taken off everywhere each frame
+    snowRefill = new THREE.Mesh(new THREE.PlaneGeometry(SNOW_AREA * 2, SNOW_AREA * 2).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({
+      color: 0x000000, transparent: true, depthTest: false, depthWrite: false, blending: THREE.CustomBlending,
+      blendEquation: THREE.ReverseSubtractEquation, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
+    }));
+    snowRefill.frustumCulled = false;
+    snowScene.add(snowRefill);
+    clearSnowTracks();
+  }
+
+  function clearSnowTracks() {
+    const before = renderer.getRenderTarget();
+    renderer.setRenderTarget(snowTarget);
+    renderer.setClearColor(0x000000, 1);
+    renderer.clear(true, false, false);
+    renderer.setRenderTarget(before);
+  }
+
+  const stripDummy = new THREE.Object3D();
+  let tracksDirty = false;
+
+  // Each moving vehicle lays two strips, one under each line of wheels.
+  function paintSnowTracks(dt) {
+    let n = 0;
+    const lay = (x, z, h, dims, speed) => {
+      if (speed < 0.6 || n > 410 || Math.abs(x) > SNOW_AREA || Math.abs(z) > SNOW_AREA) return;
+      const fx = Math.sin(h);
+      const fz = Math.cos(h);
+      for (const side of [-1, 1]) {
+        const off = side * (dims.hw - 0.28);
+        stripDummy.position.set(x + fz * off, 0, z - fx * off);
+        stripDummy.rotation.set(0, h, 0);
+        stripDummy.scale.set(0.75, 1, dims.hl * 1.7);
+        stripDummy.updateMatrix();
+        snowStrips.setMatrixAt(n++, stripDummy.matrix);
+      }
+    };
+    for (const c of traffic) lay(c.x, c.z, c.h, c.model.dims, Math.abs(c.speed));
+    for (const c of highwayTraffic) lay(c.x, c.z, c.h, c.model.dims, c.speed);
+    for (const p of police) if (p.active) lay(p.x, p.z, p.h, p.model.dims, Math.abs(p.speed));
+    if (mode === 'car' && player && car.y < 1) lay(car.x, car.z, car.heading, player.dims, Math.hypot(car.vx, car.vz));
+    snowStrips.count = n;
+    snowStrips.instanceMatrix.needsUpdate = true;
+    snowStrips.material.opacity = Math.min(0.5, 0.14 * dt * 60);
+    const refill = env.snow * dt * 0.012;
+    snowRefill.material.color.setScalar(refill);
+    snowRefill.visible = refill > 0;
+    const before = renderer.getRenderTarget();
+    const autoClear = renderer.autoClear;
+    renderer.autoClear = false;
+    renderer.setRenderTarget(snowTarget);
+    renderer.render(snowScene, snowCamera);
+    renderer.setRenderTarget(before);
+    renderer.autoClear = autoClear;
+    tracksDirty = true;
+  }
+
+  // The flakes: soft white points drifting down round the camera, stopping on whatever
+  // they land on, just as the rain does.
+  function updateSnow(dt) {
+    snowUniforms.snowCover.value = env.snowCover;
+    snowUniforms.snowSlush.value = env.slush;
+    if (snowTarget && env.snowCover > 0.001) paintSnowTracks(dt);
+    else if (tracksDirty && snowTarget) {
+      clearSnowTracks();
+      tracksDirty = false;
+    }
+
+    if (env.snow < 0.02) {
+      if (snowFlakes) snowFlakes.visible = false;
+      return;
+    }
+    const eye = camera.position;
+    const [bx, by, bz] = [70, 36, 70];
+    if (!snowFlakes) {
+      for (let i = 0; i < SNOW_FLAKES; i++) {
+        flakeData[i * 5] = eye.x + rand(-0.5, 0.5) * bx;
+        flakeData[i * 5 + 1] = eye.y + rand(-0.5, 0.5) * by;
+        flakeData[i * 5 + 2] = eye.z + rand(-0.5, 0.5) * bz;
+        flakeData[i * 5 + 3] = coverAt(flakeData[i * 5], flakeData[i * 5 + 2]);
+        flakeData[i * 5 + 4] = Math.random() * 6.3;
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(SNOW_FLAKES * 3), 3));
+      snowFlakes = new THREE.Points(geo, new THREE.PointsMaterial({
+        color: 0xffffff, size: 0.11, transparent: true, opacity: 0.9, depthWrite: false,
+        map: canvasTexture(32, 32, (g, w) => {
+          const fade = g.createRadialGradient(w / 2, w / 2, 1, w / 2, w / 2, w / 2);
+          fade.addColorStop(0, 'rgba(255,255,255,1)');
+          fade.addColorStop(0.5, 'rgba(255,255,255,0.7)');
+          fade.addColorStop(1, 'rgba(255,255,255,0)');
+          g.fillStyle = fade;
+          g.fillRect(0, 0, w, w);
+        }),
+      }));
+      snowFlakes.material.userData.noSnow = true;
+      snowFlakes.frustumCulled = false;
+      snowFlakes.renderOrder = 5;
+      scene.add(snowFlakes);
+    }
+    snowFlakes.visible = true;
+    snowFlakes.geometry.setDrawRange(0, Math.floor(SNOW_FLAKES * Math.min(1, env.snow * 1.1)));
+    const points = snowFlakes.geometry.attributes.position.array;
+    for (let i = 0; i < SNOW_FLAKES; i++) {
+      const d = i * 5;
+      let x = flakeData[d] + (1.2 + Math.sin(clock * 0.7 + flakeData[d + 4]) * 0.8) * dt;
+      let y = flakeData[d + 1] - (1.1 + (i % 7) * 0.08) * dt;
+      let z = flakeData[d + 2] + Math.cos(clock * 0.9 + flakeData[d + 4]) * 0.5 * dt;
+      let moved = false;
+      if (y < Math.max(eye.y - by / 2, flakeData[d + 3])) {
+        y = eye.y + by / 2 - Math.random() * 2;
+        x = eye.x + rand(-0.5, 0.5) * bx;
+        z = eye.z + rand(-0.5, 0.5) * bz;
+        moved = true;
+      }
+      if (x - eye.x > bx / 2) { x -= bx; moved = true; } else if (x - eye.x < -bx / 2) { x += bx; moved = true; }
+      if (z - eye.z > bz / 2) { z -= bz; moved = true; } else if (z - eye.z < -bz / 2) { z += bz; moved = true; }
+      if (moved) flakeData[d + 3] = coverAt(x, z);
+      flakeData[d] = x;
+      flakeData[d + 1] = y;
+      flakeData[d + 2] = z;
+      points[i * 3] = x;
+      points[i * 3 + 1] = y;
+      points[i * 3 + 2] = z;
+    }
+    snowFlakes.geometry.attributes.position.needsUpdate = true;
   }
 
   // --- rain ---
@@ -1040,17 +2157,6 @@
   const RAIN_DROPS = 1800;
   const RAIN_BOX = [56, 34, 56]; // the box of air round the camera that the drops live in
   const rainDrops = new Float32Array(RAIN_DROPS * 4); // x, y, z in the world, and the height of whatever is above that spot
-
-  // The top of whatever stands at (x, z): the ground, a roof, a bridge deck. Rain stops there.
-  function coverAt(x, z) {
-    let h = terrain(x, z);
-    for (const s of surfaces) {
-      if (x < s.minX || x > s.maxX || z < s.minZ || z > s.maxZ) continue;
-      const sh = s.h0 + ((s.h1 - s.h0) * (x - s.minX)) / (s.maxX - s.minX);
-      if (sh > h) h = sh;
-    }
-    return h;
-  }
 
   function updateRain(dt) {
     if (env.rain < 0.02) {
@@ -1133,6 +2239,7 @@
     sports: { pitch: 72, bright: 1.5, gain: 1.15 }, sedan: { pitch: 55, bright: 1, gain: 1 },
     hatch: { pitch: 62, bright: 1, gain: 0.9 }, suv: { pitch: 47, bright: 0.85, gain: 1.05 },
     pickup: { pitch: 43, bright: 0.8, gain: 1.1 }, bus: { pitch: 30, bright: 0.55, gain: 1.5 },
+    truck: { pitch: 34, bright: 0.6, gain: 1.4 },
     moto: { pitch: 98, bright: 1.9, gain: 1.1 },
   };
   const OTHER_ENGINES = 4; // how many nearby vehicles are heard at once
@@ -1207,6 +2314,24 @@
       own: engine(),
       others: Array.from({ length: OTHER_ENGINES }, engine),
       heli: { blades, chop, chopDepth, whine, whineGain },
+      siren: (() => {
+        const tone = context.createOscillator();
+        tone.type = 'triangle';
+        const sweep = context.createOscillator();
+        sweep.frequency.value = 0.35;
+        const depth = context.createGain();
+        depth.gain.value = 320;
+        sweep.connect(depth).connect(tone.frequency);
+        tone.frequency.value = 960;
+        const gain = context.createGain();
+        gain.gain.value = 0;
+        tone.connect(gain).connect(master);
+        tone.start();
+        sweep.start();
+        return { gain };
+      })(),
+      train: wash('lowpass', 210, 0.8),
+      trainHiss: wash('bandpass', 1400, 1.2),
     };
   }
 
@@ -1252,6 +2377,7 @@
       if (d < 60) near.push({ x, z, kind, v, d });
     };
     for (const c of traffic) hear(c.x, c.z, c.model.kind, Math.abs(c.speed));
+    for (const c of highwayTraffic) hear(c.x, c.z, c.model.kind, c.speed);
     for (const p of police) if (p.active) hear(p.x, p.z, 'sedan', Math.abs(p.speed));
     near.sort((a, b) => a.d - b.d);
     audio.others.forEach((voice, i) => {
@@ -1264,6 +2390,25 @@
       const side = ((n.x - camera.position.x) * earRight.x + (n.z - camera.position.z) * earRight.z) / Math.max(1, n.d);
       setEngine(voice, n.kind, n.v, n.v > 2 ? 0.5 : 0, loud * 0.8, Math.max(-0.9, Math.min(0.9, side)));
     });
+
+    // the nearest moving train: a deep rumble and the hiss of wheels on rails
+    let rumble = 0;
+    for (const train of trains) {
+      for (const c of train.cars) {
+        const d = Math.hypot(c.group.position.x - camera.position.x, METRO_Y - camera.position.y, c.group.position.z - camera.position.z);
+        rumble = Math.max(rumble, Math.max(0, 1 - d / 140) ** 2 * Math.min(1, train.speed / 12));
+      }
+    }
+    glide(audio.train.gain.gain, rumble * 0.5);
+    // sirens: your own, or the nearest police car giving chase
+    let wail = mode === 'car' && lights.emergency ? 0.6 : 0;
+    for (const p of police) {
+      if (!p.active) continue;
+      const d = Math.hypot(p.x - camera.position.x, p.z - camera.position.z);
+      wail = Math.max(wail, Math.max(0, 1 - d / 220) ** 2 * 0.7);
+    }
+    glide(audio.siren.gain.gain, wail * 0.05);
+    glide(audio.trainHiss.gain.gain, rumble * 0.06);
 
     const h = audio.heli;
     const spin = heli ? heli.rotor : 0;
@@ -1316,6 +2461,24 @@
     burst('bandpass', 2600, 0.25 * strength, 0.25); // glass and trim
   }
 
+  // A fist landing: a dull thud with a slap on top; on a raised guard, a duller knock.
+  function playPunch(blocked, strength = 0.6) {
+    burst('lowpass', blocked ? 260 : 380, 0.35 + 0.35 * strength, 0.12);
+    burst('bandpass', blocked ? 900 : 2200, 0.12 + 0.18 * strength, 0.05, 0, 1.2);
+  }
+
+  function playWhoosh() {
+    burst('bandpass', 1200, 0.07, 0.18, 0, 0.6); // a swing that meets nothing
+  }
+
+  // A vehicle going up: a deep boom, a crack, and bits coming down after.
+  function playBlast(power, distance) {
+    const near = Math.max(0.15, 1 - distance / 400);
+    burst('lowpass', 90, Math.min(1.2, 1.0 * near * power), 2.8);
+    burst('lowpass', 420, Math.min(1, 0.7 * near * power), 1.1);
+    for (let n = 0; n < 6; n++) burst('bandpass', rand(600, 2400), 0.12 * near, 0.15, rand(0.15, 1.3));
+  }
+
   function playPop() {
     burst('bandpass', 900, 0.5, 0.08);
     burst('highpass', 3200, 0.14, 0.7, 0.05); // the air going out
@@ -1360,20 +2523,134 @@
     model.group.add(model.beam);
   }
 
-  // ---------- Hills ----------
+  // ---------- Spatial index ----------
 
-  // Rounded hills north of the city (+z), each flat on top: { x, z, r: radius, h: height }.
+  // Things that never move (walls, kerbs, decks, parked cars) are filed under the 16 m
+  // squares they cover, so a question about one spot only looks at what stands nearby.
+  const INDEX_CELL = 16;
+  const makeIndex = () => ({ cells: new Map(), stamp: 0 });
+
+  function indexCells(item, visit) {
+    const x1 = Math.floor(item.maxX / INDEX_CELL);
+    const z1 = Math.floor(item.maxZ / INDEX_CELL);
+    for (let cx = Math.floor(item.minX / INDEX_CELL); cx <= x1; cx++) {
+      for (let cz = Math.floor(item.minZ / INDEX_CELL); cz <= z1; cz++) visit(cx * 8192 + cz);
+    }
+  }
+
+  function indexAdd(index, item) {
+    indexCells(item, (key) => {
+      let list = index.cells.get(key);
+      if (!list) index.cells.set(key, (list = []));
+      list.push(item);
+    });
+  }
+
+  function indexRemove(index, item) {
+    indexCells(item, (key) => {
+      const list = index.cells.get(key);
+      const at = list ? list.indexOf(item) : -1;
+      if (at >= 0) list.splice(at, 1);
+    });
+  }
+
+  // Everything filed under the squares that the rectangle x0..x1, z0..z1 touches.
+  function indexQuery(index, x0, z0, x1, z1) {
+    const out = [];
+    const stamp = ++index.stamp;
+    const cx1 = Math.floor(x1 / INDEX_CELL);
+    const cz1 = Math.floor(z1 / INDEX_CELL);
+    for (let cx = Math.floor(x0 / INDEX_CELL); cx <= cx1; cx++) {
+      for (let cz = Math.floor(z0 / INDEX_CELL); cz <= cz1; cz++) {
+        const list = index.cells.get(cx * 8192 + cz);
+        if (!list) continue;
+        for (const item of list) {
+          if (item.seen === stamp) continue;
+          item.seen = stamp;
+          out.push(item);
+        }
+      }
+    }
+    return out;
+  }
+
+  const colliderIndex = makeIndex();
+  const surfaceIndex = makeIndex();
+
+  function addCollider(box) {
+    colliders.push(box);
+    indexAdd(colliderIndex, box);
+    return box;
+  }
+
+  function removeCollider(box) {
+    const at = colliders.indexOf(box);
+    if (at >= 0) colliders.splice(at, 1);
+    indexRemove(colliderIndex, box);
+  }
+
+  const collidersNear = (x, z, r) => indexQuery(colliderIndex, x - r, z - r, x + r, z + r);
+
+  // Something slim and upright in the way (a lamp post, a signal mast, a sign pole): solid
+  // to everyone from its foot at height y0 to `h` above it.
+  function addPost(x, z, r, y0, h, extra = {}) {
+    return addCollider({ minX: x - r, maxX: x + r, minZ: z - r, maxZ: z + r, minY: y0 - 0.6, maxY: y0 + h, ...extra });
+  }
+  // every solid thing that could be within r of (x, z), moving vehicles included
+  const solidsNear = (x, z, r) => collidersNear(x, z, r).concat(trafficBoxes, policeBoxes, trainBoxes);
+
+  // A collision box for a straight piece of wall or rail running from (ax, az) to (bx, bz),
+  // `half` thick either side, blocking between heights y0 and y1. Its true outline is kept
+  // in `car` (see boxContact), so a wall at an angle blocks only where it is.
+  function addSegmentCollider(ax, az, bx, bz, half, y0, y1, extra = {}) {
+    const len = Math.hypot(bx - ax, bz - az) || 0.01;
+    const x = (ax + bx) / 2;
+    const z = (az + bz) / 2;
+    const reach = len / 2 + half;
+    return addCollider({
+      minX: x - reach, maxX: x + reach, minZ: z - reach, maxZ: z + reach, minY: y0, maxY: y1,
+      car: { x, z, h: Math.atan2(bx - ax, bz - az), hl: len / 2, hw: half }, ...extra,
+    });
+  }
+
+  // ---------- Hills, lake and the shape of the land ----------
+
+  // Rounded hills, each flat on top: { x, z, r: radius, h: height }. The main one, with the
+  // road and the lookout, stands north of the city on its -x side; two more keep it company.
+  // The last two are the mounds the highway tunnels through at either end.
   const HILLS = [
-    { x: 0, z: 600, r: 230, h: 75 }, // the main hill, with the road and the lookout
-    { x: -300, z: 560, r: 170, h: 45 },
-    { x: 310, z: 620, r: 190, h: 55 },
+    { x: -430, z: 560, r: 230, h: 75 },
+    { x: -680, z: 330, r: 170, h: 45 },
+    { x: -200, z: 800, r: 170, h: 50 },
+    { x: 800, z: -372, r: 200, h: 40 },
+    { x: -800, z: -372, r: 200, h: 40 },
   ];
-  const HILL_BOUNDS = { minX: -500, maxX: 520, minZ: 280, maxZ: 860 };
-  const WORLD_LIMITS = { minX: -HALF - 240, maxX: HALF + 250, minZ: -HALF - 120, maxZ: 870 };
-  const ROAD_FLAT = 8; // the ground is levelled this far either side of the road's centre line
+  const HILL_BOUNDS = { minX: -900, maxX: -100, minZ: 150, maxZ: 980 }; // where the wild animals live
+  const WORLD_LIMITS = { minX: -790, maxX: 790, minZ: -600, maxZ: 940 };
+  const ROAD_FLAT = 8; // the ground is levelled this far either side of the hill road's centre line
   const ROAD_BLEND = 24; // and has returned to the natural slope by here
   const ROAD_HALF = 5.5; // half the width of the tarmac itself
   const smooth = (t) => (t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t));
+
+  // The highway runs along the south of the city, 3 lanes each way, from tunnel to tunnel.
+  const HIGHWAY = { z: -372, half: 15.5, lane: 3.6, end: 900, portal: 700 };
+
+  // The lake north of the city on its +x side: overlapping round pools, with a channel
+  // running south under the lake drive's bridge to a pond.
+  const LAKE = [
+    [420, 480, 125], [500, 550, 85], [340, 540, 75], [455, 400, 70],
+    [432, 335, 30], [425, 300, 22], [422, 266, 21], [422, 232, 22], [425, 185, 50],
+  ];
+  const WATER_Y = -0.45;
+
+  // How far (x, z) is from the water's edge: negative out on the lake.
+  function lakeEdge(x, z) {
+    if (x < 180 || x > 650 || z < 100 || z > 680) return 99;
+    // a soft minimum, so where two pools meet the shore curves instead of making a corner
+    let sum = 0;
+    for (const [cx, cz, r] of LAKE) sum += Math.exp(-(Math.hypot(x - cx, z - cz) - r) / 9);
+    return -9 * Math.log(sum);
+  }
 
   // The hills with no road cut into them.
   function naturalHeight(x, z) {
@@ -1388,12 +2665,12 @@
     return Math.max(0, h);
   }
 
-  // The road leaves the city's north edge and spirals up the main hill to its summit.
-  // Stored as points about 5 m apart, each with the height the road has there.
+  // The road leaves the city's north edge on its -x side and spirals up the main hill to
+  // its summit. Stored as points about 5 m apart, each with the height the road has there.
   const hillRoad = (() => {
     const main = HILLS[0];
-    const ctrl = [[38, 262], [38, 300], [38, 340], [42, 372]].map(([x, z]) => new THREE.Vector3(x, 0, z));
-    const start = -1.393; // angle at which the spiral meets the approach road
+    const ctrl = [[-190, 268], [-190, 300], [-198, 332], [-220, 362], [-248, 388]].map(([x, z]) => new THREE.Vector3(x, 0, z));
+    const start = -0.83; // angle at which the spiral meets the approach road
     const sweep = 3.3 * Math.PI;
     for (let a = 0.12; a <= sweep; a += 0.22) {
       const r = 215 - 185 * (a / sweep);
@@ -1415,15 +2692,27 @@
         points[i].h = sum / 21;
       }
     }
+    points[0].h = 0;
     return points;
   })();
+
+  // The hill road's pieces filed by area, for finding the nearest one quickly.
+  const hillRoadIndex = makeIndex();
+  for (let i = 0; i < hillRoad.length - 1; i++) {
+    const a = hillRoad[i];
+    const b = hillRoad[i + 1];
+    indexAdd(hillRoadIndex, {
+      i, minX: Math.min(a.x, b.x) - ROAD_BLEND, maxX: Math.max(a.x, b.x) + ROAD_BLEND,
+      minZ: Math.min(a.z, b.z) - ROAD_BLEND, maxZ: Math.max(a.z, b.z) + ROAD_BLEND,
+    });
+  }
 
   // Nearest point on the hill road: sets roadDist and the road's height there.
   let roadDist = Infinity;
   let roadHeight = 0;
   function nearestRoad(x, z) {
     let best = Infinity;
-    for (let i = 0; i < hillRoad.length - 1; i++) {
+    for (const { i } of indexQuery(hillRoadIndex, x, z, x, z)) {
       const a = hillRoad[i];
       const b = hillRoad[i + 1];
       const dx = b.x - a.x;
@@ -1440,16 +2729,67 @@
     roadDist = Math.sqrt(best);
   }
 
-  // Height of the bare ground at (x, z): flat in and around the city, hills to the north,
-  // with a level shelf cut across the slope wherever the road runs.
-  function terrain(x, z) {
-    const b = HILL_BOUNDS;
-    if (z < b.minZ || z > b.maxZ || x < b.minX || x > b.maxX) return 0;
-    const natural = naturalHeight(x, z);
-    nearestRoad(x, z);
-    if (roadDist >= ROAD_BLEND) return natural;
-    return roadHeight + (natural - roadHeight) * smooth((roadDist - ROAD_FLAT) / (ROAD_BLEND - ROAD_FLAT));
+  // Height of the bare ground at (x, z), worked out in full: the hills with a level shelf
+  // cut across the slope wherever the road runs, the lake bed and its beaches, and a
+  // cutting through each tunnel mound for the highway.
+  function terrainExact(x, z) {
+    roadDist = Infinity;
+    let h = naturalHeight(x, z);
+    if (h > 0) {
+      const cutting = Math.abs(z - HIGHWAY.z) - HIGHWAY.half - 3;
+      if (Math.abs(x) > 560 && cutting < 8) h *= smooth(cutting / 8);
+      nearestRoad(x, z);
+      if (roadDist < ROAD_BLEND) h = roadHeight + (h - roadHeight) * smooth((roadDist - ROAD_FLAT) / (ROAD_BLEND - ROAD_FLAT));
+    }
+    const edge = lakeEdge(x, z);
+    if (edge < 8) h = Math.max(-3.6, Math.min(h, WATER_Y + edge * 0.06)); // a gentle beach, then deeper water
+    return h;
   }
+
+  // The ground is measured once on a 4 m grid wherever it is not flat, and read back from
+  // there afterwards; each of these patches also gets a ground mesh of its own (see
+  // buildTerrain) with the same triangles, so what you stand on matches what you see.
+  const TERRAIN_STEP = 4;
+  const TERRAIN_REGIONS = [
+    { minX: -1000, maxX: -300, minZ: 100, maxZ: 1000 }, // the hills
+    { minX: -300, maxX: 0, minZ: 300, maxZ: 1000 },
+    { minX: 200, maxX: 800, minZ: 300, maxZ: 800 }, // the lake
+    { minX: 300, maxX: 600, minZ: 100, maxZ: 300 }, // the pond
+    { minX: 600, maxX: 1000, minZ: -600, maxZ: -100 }, // the tunnel mounds
+    { minX: -1000, maxX: -600, minZ: -600, maxZ: -100 },
+  ];
+  for (const r of TERRAIN_REGIONS) {
+    r.nx = (r.maxX - r.minX) / TERRAIN_STEP + 1;
+    r.nz = (r.maxZ - r.minZ) / TERRAIN_STEP + 1;
+    r.heights = new Float32Array(r.nx * r.nz);
+    for (let iz = 0; iz < r.nz; iz++) {
+      for (let ix = 0; ix < r.nx; ix++) {
+        r.heights[iz * r.nx + ix] = terrainExact(r.minX + ix * TERRAIN_STEP, r.minZ + iz * TERRAIN_STEP);
+      }
+    }
+  }
+
+  function terrain(x, z) {
+    for (const r of TERRAIN_REGIONS) {
+      if (x < r.minX || x > r.maxX || z < r.minZ || z > r.maxZ) continue;
+      const fx = (x - r.minX) / TERRAIN_STEP;
+      const fz = (z - r.minZ) / TERRAIN_STEP;
+      const ix = Math.min(r.nx - 2, Math.floor(fx));
+      const iz = Math.min(r.nz - 2, Math.floor(fz));
+      const tx = fx - ix;
+      const tz = fz - iz;
+      const H = r.heights;
+      const a = H[iz * r.nx + ix];
+      const b = H[iz * r.nx + ix + 1];
+      const c = H[(iz + 1) * r.nx + ix];
+      const d = H[(iz + 1) * r.nx + ix + 1];
+      // each square is two triangles split from (ix + 1, iz) to (ix, iz + 1)
+      return tx + tz <= 1 ? a + (b - a) * tx + (c - a) * tz : d + (c - d) * (1 - tx) + (b - d) * (1 - tz);
+    }
+    return 0;
+  }
+
+  const inWater = (x, z) => terrain(x, z) < WATER_Y - 0.05;
 
   function clampToWorld() {
     const w = WORLD_LIMITS;
@@ -1463,122 +2803,205 @@
     }
   }
 
-  function buildHills() {
-    const b = HILL_BOUNDS;
-    const width = b.maxX - b.minX;
-    const depth = b.maxZ - b.minZ;
-
-    // --- ground: a 4 m grid draped over the terrain, tinted by height, steepness and the road verge
-    const geo = new THREE.PlaneGeometry(width, depth, Math.round(width / 4), Math.round(depth / 4));
-    geo.rotateX(-Math.PI / 2);
-    geo.translate((b.minX + b.maxX) / 2, 0, (b.minZ + b.maxZ) / 2);
-    const pos = geo.attributes.position;
-    const uv = geo.attributes.uv;
-    const colors = new Float32Array(pos.count * 3);
-    const tint = new THREE.Color();
+  // The ground everywhere: a flat field of grass in 100 m tiles, except where one of the
+  // terrain patches has its own shaped mesh, tinted by height, steepness, beach and verge.
+  function buildTerrain() {
+    const grassMat = new THREE.MeshLambertMaterial({ vertexColors: true, map: grassTex });
     const grass = new THREE.Color(0x7fb86e);
     const upland = new THREE.Color(0x5c8f52);
     const rock = new THREE.Color(0x8a857c);
     const dirt = new THREE.Color(0x8c7a5c);
-    for (let i = 0; i < pos.count; i++) {
-      const x = pos.getX(i);
-      const z = pos.getZ(i);
-      const h = terrain(x, z);
-      const nearRoad = roadDist; // terrain() has just measured it for this point
-      // sink the mesh a little under the tarmac so the road surface always covers it
-      pos.setY(i, h - 0.16 * (1 - smooth((nearRoad - ROAD_FLAT) / 2)));
-      const steep = Math.hypot(
-        naturalHeight(x + 2, z) - naturalHeight(x - 2, z),
-        naturalHeight(x, z + 2) - naturalHeight(x, z - 2)
-      ) / 4;
-      tint.copy(grass).lerp(upland, Math.min(1, h / 45));
-      tint.lerp(rock, smooth((steep - 0.55) / 0.3));
-      if (nearRoad < ROAD_BLEND && z > 300) tint.lerp(dirt, 1 - smooth((nearRoad - ROAD_HALF) / 6));
-      colors.set([tint.r, tint.g, tint.b], i * 3);
-      uv.setXY(i, x / GRASS_TILE, z / GRASS_TILE);
-    }
-    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    geo.computeVertexNormals();
-    const ground = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true, map: grassTex }));
-    ground.receiveShadow = true;
-    scene.add(ground);
-
-    // --- road: strips that follow the path, each a band between two offsets from the centre line
-    const strip = (from, to, lift, material, dashed = false) => {
-      const points = [];
-      const index = [];
-      const uvs = [];
-      let travelled = 0;
-      hillRoad.forEach((p, i) => {
-        if (i) travelled += Math.hypot(p.x - hillRoad[i - 1].x, p.z - hillRoad[i - 1].z);
-        for (const side of [from, to]) uvs.push(side / GROUND.tarmac[2], travelled / GROUND.tarmac[2]);
-        const a = hillRoad[Math.max(0, i - 1)];
-        const c = hillRoad[Math.min(hillRoad.length - 1, i + 1)];
-        const len = Math.hypot(c.x - a.x, c.z - a.z);
-        const nx = -(c.z - a.z) / len; // sideways, level across the road
-        const nz = (c.x - a.x) / len;
-        for (const side of [from, to]) points.push(p.x + nx * side, p.h + lift, p.z + nz * side);
-        if (i < hillRoad.length - 1 && !(dashed && i % 4 > 1)) {
-          index.push(i * 2, i * 2 + 1, i * 2 + 2, i * 2 + 1, i * 2 + 3, i * 2 + 2);
+    const sand = new THREE.Color(0xd8c49a);
+    const wetSand = new THREE.Color(0x9a8a6a);
+    const lakeBed = new THREE.Color(0x6b6a55);
+    const tint = new THREE.Color();
+    for (const r of TERRAIN_REGIONS) {
+      const positions = new Float32Array(r.nx * r.nz * 3);
+      const colors = new Float32Array(r.nx * r.nz * 3);
+      const uvs = new Float32Array(r.nx * r.nz * 2);
+      for (let iz = 0; iz < r.nz; iz++) {
+        for (let ix = 0; ix < r.nx; ix++) {
+          const n = iz * r.nx + ix;
+          const x = r.minX + ix * TERRAIN_STEP;
+          const z = r.minZ + iz * TERRAIN_STEP;
+          const h = r.heights[n];
+          nearestRoad(x, z);
+          const nearRoad = roadDist;
+          // tuck the mesh a little under the hill road so the tarmac always covers it
+          positions.set([x, h - 0.16 * (1 - smooth((nearRoad - ROAD_FLAT) / 2)), z], n * 3);
+          const steep = Math.hypot(
+            naturalHeight(x + 2, z) - naturalHeight(x - 2, z),
+            naturalHeight(x, z + 2) - naturalHeight(x, z - 2)
+          ) / 4;
+          tint.copy(grass).lerp(upland, Math.min(1, Math.max(0, h) / 45));
+          tint.lerp(rock, smooth((steep - 0.55) / 0.3));
+          if (nearRoad < ROAD_BLEND) tint.lerp(dirt, 1 - smooth((nearRoad - ROAD_HALF) / 6));
+          const edge = lakeEdge(x, z);
+          if (edge < 16) tint.lerp(sand, 1 - smooth((edge - 9) / 7));
+          if (edge < 1) tint.copy(wetSand).lerp(lakeBed, smooth(-edge / 12));
+          colors.set([tint.r, tint.g, tint.b], n * 3);
+          uvs.set([x / GRASS_TILE, z / GRASS_TILE], n * 2);
         }
-      });
-      const g = new THREE.BufferGeometry();
-      g.setAttribute('position', new THREE.Float32BufferAttribute(points, 3));
-      g.setAttribute('normal', new THREE.Float32BufferAttribute(points.map((v, i) => (i % 3 === 1 ? 1 : 0)), 3));
-      g.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
-      g.setIndex(index);
-      const mesh = new THREE.Mesh(g, material);
-      mesh.receiveShadow = true;
-      scene.add(mesh);
-    };
-    const tarmac = photos.asphalt
-      ? groundMaterial(GROUND.tarmac[0], GROUND.tarmac[1], GROUND.tarmac[3], { side: THREE.DoubleSide })
-      : new THREE.MeshLambertMaterial({ color: 0x4b5058, side: THREE.DoubleSide });
-    const line = new THREE.MeshLambertMaterial({ color: 0xe9e9e4, side: THREE.DoubleSide });
-    strip(-ROAD_HALF, ROAD_HALF, 0.06, tarmac);
-    strip(-0.14, 0.14, 0.1, line, true);
-    strip(ROAD_HALF - 0.55, ROAD_HALF - 0.35, 0.1, line);
-    strip(-ROAD_HALF + 0.35, -ROAD_HALF + 0.55, 0.1, line);
+      }
+      const index = [];
+      for (let iz = 0; iz < r.nz - 1; iz++) {
+        for (let ix = 0; ix < r.nx - 1; ix++) {
+          const a = iz * r.nx + ix;
+          const b = a + 1;
+          const c = a + r.nx;
+          const d = c + 1;
+          index.push(a, c, b, b, c, d); // split from b to c, as terrain() assumes
+        }
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+      geo.setIndex(index);
+      geo.computeVertexNormals();
+      const ground = new THREE.Mesh(geo, grassMat);
+      ground.receiveShadow = true;
+      ground.userData.snow = 'ground';
+      scene.add(ground);
+    }
 
-    // --- pines and boulders scattered over the slopes, clear of the road and the summit
+    // the flat grass, in tiles, leaving room for the shaped patches
+    const covered = (x, z) => TERRAIN_REGIONS.some((r) => x >= r.minX && x < r.maxX && z >= r.minZ && z < r.maxZ);
+    const tiles = [];
+    for (let x = -1200; x < 1200; x += 100) {
+      for (let z = -1200; z < 1200; z += 100) {
+        if (!covered(x + 50, z + 50)) tiles.push([x + 50, z + 50]);
+      }
+    }
+    const tileGeo = new THREE.PlaneGeometry(100, 100).rotateX(-Math.PI / 2);
+    const uv = tileGeo.attributes.uv;
+    for (let i = 0; i < uv.count; i++) uv.setXY(i, (uv.getX(i) * 100) / GRASS_TILE, (uv.getY(i) * 100) / GRASS_TILE);
+    const field = new THREE.InstancedMesh(tileGeo, groundMaterial(0x7fb86e, grassTex, null), tiles.length);
+    const m = new THREE.Matrix4();
+    tiles.forEach(([x, z], i) => field.setMatrixAt(i, m.makeTranslation(x, 0, z)));
+    field.receiveShadow = true;
+    field.userData.snow = 'ground';
+    // flat and only centimetres below the roads: drawn first, without writing depth
+    field.material.depthWrite = false;
+    field.renderOrder = -0.6;
+    scene.add(field);
+
+    buildWater();
+    buildHillDetails();
+  }
+
+  // The lake's surface: dark, rippled water that mirrors the sky.
+  function buildWater() {
+    const ripples = canvasTexture(256, 256, (g, w, h) => {
+      // a normal map of soft overlapping ripples
+      const picture = g.createImageData(w, h);
+      const height = (x, y) => {
+        let v = 0;
+        for (let k = 1; k <= 4; k++) {
+          const f = (k * 2 * Math.PI) / w;
+          v += Math.sin(x * f * (k % 2 ? 1 : 2) + y * f * 0.7 + k * 1.7) / k + Math.sin(y * f * 1.3 - x * f * 0.4 + k) / (k + 1);
+        }
+        return v;
+      };
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const dx = height(x + 1, y) - height(x - 1, y);
+          const dy = height(x, y + 1) - height(x, y - 1);
+          const i = (y * w + x) * 4;
+          picture.data[i] = 128 + dx * 60;
+          picture.data[i + 1] = 128 + dy * 60;
+          picture.data[i + 2] = 255;
+          picture.data[i + 3] = 255;
+        }
+      }
+      g.putImageData(picture, 0, 0);
+    });
+    ripples.repeat.set(40, 40);
+    waterMat = reflect(new THREE.MeshPhongMaterial({
+      color: 0x24414f, normalMap: ripples, normalScale: new THREE.Vector2(0.5, 0.5), shininess: 120, specular: 0x8899aa,
+      transparent: true, opacity: 0.9,
+    }), 0.55);
+    waterMat.userData.noSnow = true;
+    for (const r of TERRAIN_REGIONS.slice(2, 4)) {
+      const water = new THREE.Mesh(new THREE.PlaneGeometry(r.maxX - r.minX, r.maxZ - r.minZ).rotateX(-Math.PI / 2), waterMat);
+      water.position.set((r.minX + r.maxX) / 2, WATER_Y, (r.minZ + r.maxZ) / 2);
+      water.receiveShadow = true;
+      scene.add(water);
+    }
+  }
+  let waterMat = null;
+
+  // Pines and boulders over the slopes, clear of the roads and the summit, and the lookout.
+  function buildHillDetails() {
+    const b = HILL_BOUNDS;
     const main = HILLS[0];
     const onSlope = (minHeight) => {
       for (let tries = 0; tries < 40; tries++) {
         const x = rand(b.minX, b.maxX);
         const z = rand(b.minZ, b.maxZ);
         if (naturalHeight(x, z) < minHeight || Math.hypot(x - main.x, z - main.z) < 46) continue;
-        const y = terrain(x, z);
-        if (roadDist > 11) return { x, y, z };
+        const y = terrainExact(x, z);
+        if (roadDist > 11) return { x, y: terrain(x, z), z };
       }
       return null;
     };
     const dummy = new THREE.Object3D();
-    const scatter = (parts, spots, place) => {
-      const meshes = parts.map(([geo2, mat]) => {
-        const mesh = new THREE.InstancedMesh(geo2, mat, spots.length);
-        mesh.castShadow = true;
-        scene.add(mesh);
-        return mesh;
-      });
-      spots.forEach((spot, i) => place(spot).forEach(([y, sx, sy], part) => {
-        dummy.position.set(spot.x, spot.y + y, spot.z);
-        dummy.scale.set(sx, sy, sx);
-        dummy.rotation.y = spot.turn;
-        dummy.updateMatrix();
-        meshes[part].setMatrixAt(i, dummy.matrix);
-      }));
-    };
     const spots = (count, minHeight) => Array.from({ length: count }, () => onSlope(minHeight))
       .filter(Boolean)
       .map((spot) => ({ ...spot, s: rand(0.8, 1.5), turn: Math.random() * 6 }));
 
-    const pines = spots(320, 3);
-    for (const t of pines) plants.push({ type: 'pine', x: t.x, y: t.y, z: t.z, s: t.s });
+    const pines = spots(420, 3);
+    for (const t of pines) plants.push({ type: Math.random() < 0.75 ? 'pine' : 'tree', x: t.x, y: t.y, z: t.z, s: t.s });
     for (const t of pines) {
-      colliders.push({ minX: t.x - 0.45, maxX: t.x + 0.45, minZ: t.z - 0.45, maxZ: t.z + 0.45, minY: t.y - 1, maxY: t.y + 8 });
+      addCollider({ minX: t.x - 0.45, maxX: t.x + 0.45, minZ: t.z - 0.45, maxZ: t.z + 0.45, minY: t.y - 1, maxY: t.y + 8 });
     }
     const stone = new THREE.MeshPhongMaterial({ color: 0x8d8a84, flatShading: true, shininess: 0 });
-    scatter([[new THREE.IcosahedronGeometry(1, 0), stone]], spots(110, 6), ({ s }) => [[0.2 * s, 1.3 * s, 0.9 * s]]);
+    const rocks = spots(140, 6);
+    const boulders = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 1), stone, rocks.length);
+    rocks.forEach((spot, i) => {
+      const r = 1.0 * spot.s;
+      addCollider({ minX: spot.x - r, maxX: spot.x + r, minZ: spot.z - r, maxZ: spot.z + r, minY: spot.y - 1, maxY: spot.y + 1.05 * spot.s, top: spot.y + 0.95 * spot.s });
+      dummy.position.set(spot.x, spot.y + 0.2 * spot.s, spot.z);
+      dummy.scale.set(1.3 * spot.s, 0.9 * spot.s, 1.1 * spot.s);
+      dummy.rotation.set(0, spot.turn, 0);
+      dummy.updateMatrix();
+      boulders.setMatrixAt(i, dummy.matrix);
+    });
+    boulders.castShadow = true;
+    scene.add(boulders);
+
+    // --- villas on shelves beside the hill road, on stone foundations where the ground falls away
+    const villas = makeBatch();
+    const stoneMat = cityMaterial('concrete', 0x9a948a);
+    let placedVillas = 0;
+    for (let i = 30; i < hillRoad.length - 30 && placedVillas < 14; i += 9) {
+      const p = hillRoad[i];
+      const [nx, nz] = across(hillRoad, i);
+      for (const side of [1, -1]) {
+        const x = p.x + nx * side * 19;
+        const z = p.z + nz * side * 19;
+        terrainExact(x, z);
+        if (roadDist < 15) continue;
+        const corners = [[-6, -6], [6, -6], [6, 6], [-6, 6]].map(([dx, dz]) => terrain(x + dx, z + dz));
+        const lowest = Math.min(...corners);
+        const highest = Math.max(...corners);
+        if (highest - lowest > 3.2 || Math.random() < 0.3) continue;
+        const before = new Map([...villas].map(([m, part]) => [m, part.positions.length]));
+        standY = highest;
+        addHouse(villas, x, z, Math.atan2(-nx * side, -nz * side), { storeys: 2, garage: Math.random() < 0.5 });
+        standY = 0;
+        // lift what was just added onto its shelf
+        for (const [m, part] of villas) {
+          for (let k = (before.get(m) || 0) + 1; k < part.positions.length; k += 3) part.positions[k] += highest;
+        }
+        batchBox(villas, stoneMat, x, (lowest + highest) / 2 - 0.4, z, 13, highest - lowest + 0.8, 13, 0, 3);
+        addCollider({ minX: x - 6.5, maxX: x + 6.5, minZ: z - 6.5, maxZ: z + 6.5, minY: lowest - 1, maxY: highest + 0.2, top: highest + 0.2 });
+        addSurface({ minX: x - 6.5, maxX: x + 6.5, minZ: z - 6.5, maxZ: z + 6.5, h0: highest + 0.2, h1: highest + 0.2 });
+        placedVillas++;
+        break;
+      }
+    }
+    flushBatch(villas);
 
     // --- summit lookout: a gravel pad, a shelter and a flag
     const top = terrain(main.x, main.z);
@@ -1597,7 +3020,7 @@
     };
     for (const [x, z] of [[-3, -3], [3, -3], [-3, 3], [3, 3]]) {
       piece(new THREE.CylinderGeometry(0.14, 0.14, 3, 8), wood, x, 1.5, z);
-      colliders.push({ minX: main.x + x - 0.2, maxX: main.x + x + 0.2, minZ: main.z + z - 0.2, maxZ: main.z + z + 0.2, minY: top, maxY: top + 3 });
+      addCollider({ minX: main.x + x - 0.2, maxX: main.x + x + 0.2, minZ: main.z + z - 0.2, maxZ: main.z + z + 0.2, minY: top, maxY: top + 3 });
     }
     piece(new THREE.ConeGeometry(5.4, 2.2, 4), lambert(0x8a2f2a), 0, 4.1, 0).rotation.y = Math.PI / 4;
     piece(new THREE.BoxGeometry(4, 0.12, 0.7), wood, 0, 0.55, 1.6);
@@ -1608,8 +3031,10 @@
 
   // ---------- Raised structures ----------
 
-  // Drivable surfaces above the ground: { minX, maxX, minZ, maxZ, h0, h1 }, sloping along x
-  // from h0 at minX to h1 at maxX (flat when equal).
+  // Surfaces to stand or drive on above the bare ground: decks, ramps, roofs, pavements.
+  // A box { minX, maxX, minZ, maxZ, h0, h1 } slopes from h0 to h1 along x (along z when
+  // `alongZ`); a strip { ax, az, bx, bz, ha, hb, half } is one piece of a curving deck,
+  // `half` wide either side of the line from a to b, rising from ha to hb.
   const surfaces = [];
   const concrete = new THREE.MeshLambertMaterial({ color: 0x8d929b });
   const deckMat = photos.asphalt
@@ -1618,19 +3043,58 @@
   const DECK_TILE = GROUND.tarmac[2];
   const kickerMat = new THREE.MeshLambertMaterial({ color: 0xf2b705 });
 
+  function addSurface(s) {
+    if (s.half !== undefined) {
+      s.minX = Math.min(s.ax, s.bx) - s.half;
+      s.maxX = Math.max(s.ax, s.bx) + s.half;
+      s.minZ = Math.min(s.az, s.bz) - s.half;
+      s.maxZ = Math.max(s.az, s.bz) + s.half;
+    }
+    surfaces.push(s);
+    indexAdd(surfaceIndex, s);
+    return s;
+  }
+
+  // The height of surface s at (x, z), or null where it does not reach.
+  function surfaceHeight(s, x, z) {
+    if (x < s.minX || x > s.maxX || z < s.minZ || z > s.maxZ) return null;
+    if (s.half === undefined) {
+      if (s.h0 === s.h1) return s.h0;
+      return s.alongZ
+        ? s.h0 + ((s.h1 - s.h0) * (z - s.minZ)) / (s.maxZ - s.minZ)
+        : s.h0 + ((s.h1 - s.h0) * (x - s.minX)) / (s.maxX - s.minX);
+    }
+    const dx = s.bx - s.ax;
+    const dz = s.bz - s.az;
+    const len2 = dx * dx + dz * dz;
+    const t = ((x - s.ax) * dx + (z - s.az) * dz) / len2;
+    if (t < -0.03 || t > 1.03) return null;
+    if (Math.abs((x - s.ax) * dz - (z - s.az) * dx) / Math.sqrt(len2) > s.half) return null;
+    return s.ha + (s.hb - s.ha) * Math.max(0, Math.min(1, t));
+  }
+
   // Height of whatever is under (x, z) for something currently at height y. Surfaces well
   // above y are overhead, not underfoot, which is what lets you drive beneath a deck.
   function groundAt(x, z, y) {
     let h = terrain(x, z);
-    for (const s of surfaces) {
-      if (x < s.minX || x > s.maxX || z < s.minZ || z > s.maxZ) continue;
-      const sh = s.h0 + ((s.h1 - s.h0) * (x - s.minX)) / (s.maxX - s.minX);
-      if (sh <= y + STEP_UP && sh > h) h = sh;
+    for (const s of indexQuery(surfaceIndex, x, z, x, z)) {
+      const sh = surfaceHeight(s, x, z);
+      if (sh !== null && sh <= y + STEP_UP && sh > h) h = sh;
     }
     // solid things with a flat top (walls, parked cars) can be stood on too
-    for (const b of colliders) {
+    for (const b of collidersNear(x, z, 0)) {
       if (b.top === undefined || b.top <= h || b.top > y + STEP_UP) continue;
       if (x >= b.minX && x <= b.maxX && z >= b.minZ && z <= b.maxZ) h = b.top;
+    }
+    return h;
+  }
+
+  // The top of whatever stands at (x, z): the ground, a roof, a deck. Rain stops there.
+  function coverAt(x, z) {
+    let h = Math.max(terrain(x, z), WATER_Y);
+    for (const s of indexQuery(surfaceIndex, x, z, x, z)) {
+      const sh = surfaceHeight(s, x, z);
+      if (sh !== null && sh > h) h = sh;
     }
     return h;
   }
@@ -1647,7 +3111,7 @@
 
   function addDeck(x0, x1, z0, z1, y, mat = deckMat) {
     slab(x0, x1, y - 0.4, y, z0, z1, mat);
-    surfaces.push({ minX: x0, maxX: x1, minZ: z0, maxZ: z1, h0: y, h1: y });
+    addSurface({ minX: x0, maxX: x1, minZ: z0, maxZ: z1, h0: y, h1: y });
   }
 
   function addRamp(x0, x1, z0, z1, hA, hB, mat = deckMat) {
@@ -1659,19 +3123,19 @@
     mesh.rotation.z = Math.atan2(hB - hA, x1 - x0);
     mesh.castShadow = mesh.receiveShadow = true;
     scene.add(mesh);
-    surfaces.push({ minX: x0, maxX: x1, minZ: z0, maxZ: z1, h0: hA, h1: hB });
+    addSurface({ minX: x0, maxX: x1, minZ: z0, maxZ: z1, h0: hA, h1: hB });
   }
 
   // A wall that only blocks things standing between y0 and y1.
   function addWall(x0, x1, z0, z1, y0, y1, visible = true) {
     if (visible) slab(x0, x1, y0, y1, z0, z1);
-    colliders.push({ minX: x0, maxX: x1, minZ: z0, maxZ: z1, minY: y0, maxY: y1 + 0.6, top: y1 });
+    addCollider({ minX: x0, maxX: x1, minZ: z0, maxZ: z1, minY: y0, maxY: y1 + 0.6, top: y1 });
   }
 
   // Stops ground-level things from driving into the underside of a ramp. It must only
   // cover the tall half: near the foot, a car climbing the ramp is still low enough to hit it.
   function addBlocker(x0, x1, z0, z1) {
-    colliders.push({ minX: x0, maxX: x1, minZ: z0, maxZ: z1, maxY: 0.45 });
+    addCollider({ minX: x0, maxX: x1, minZ: z0, maxZ: z1, maxY: 0.45 });
   }
 
   function addFlyover() {
@@ -1699,8 +3163,8 @@
     };
     wedge(x0, [[0, 0], [x1 - x0, 0], [x1 - x0, H]]);
     wedge(x2, [[0, 0], [x3 - x2, 0], [0, H]]);
-    surfaces.push({ minX: x0, maxX: x1, minZ: z - half, maxZ: z + half, h0: 0, h1: H });
-    surfaces.push({ minX: x2, maxX: x3, minZ: z - half, maxZ: z + half, h0: H, h1: 0 });
+    addSurface({ minX: x0, maxX: x1, minZ: z - half, maxZ: z + half, h0: 0, h1: H });
+    addSurface({ minX: x2, maxX: x3, minZ: z - half, maxZ: z + half, h0: H, h1: 0 });
     addBlocker((x0 + x1) / 2, x1, z - half, z + half);
     addBlocker(x2, (x2 + x3) / 2, z - half, z + half);
 
@@ -1711,9 +3175,9 @@
     for (const side of [-1, 1]) {
       const zr = z + side * (half - 0.15);
       slab(x1, x2, H, H + 0.8, zr - 0.15, zr + 0.15);
-      colliders.push({ minX: x1, maxX: x2, minZ: zr - 0.15, maxZ: zr + 0.15, minY: H - 0.5, maxY: H + 2 });
-      colliders.push({ minX: x0, maxX: x1, minZ: zr - 0.15, maxZ: zr + 0.15, maxY: H + 2 });
-      colliders.push({ minX: x2, maxX: x3, minZ: zr - 0.15, maxZ: zr + 0.15, maxY: H + 2 });
+      addCollider({ minX: x1, maxX: x2, minZ: zr - 0.15, maxZ: zr + 0.15, minY: H - 0.5, maxY: H + 2 });
+      addCollider({ minX: x0, maxX: x1, minZ: zr - 0.15, maxZ: zr + 0.15, maxY: H + 2 });
+      addCollider({ minX: x2, maxX: x3, minZ: zr - 0.15, maxZ: zr + 0.15, maxY: H + 2 });
       for (const [a, b, rise] of [[x0, x1, 1], [x2, x3, -1]]) {
         const rail = new THREE.Mesh(new THREE.BoxGeometry(Math.hypot(b - a, H), 0.8, 0.3), concrete);
         rail.position.set((a + b) / 2, H / 2 + 0.4, zr);
@@ -1795,96 +3259,1157 @@
     }
   }
 
-  function buildCity() {
-    // The grass and the road surface are huge and only centimetres apart, which is too
-    // close for the depth buffer far from the camera. They are the lowest things in the
-    // scene, so draw them first, in order, without writing depth.
-    [
-      flatPlane(2400, 2400, 0x7fb86e, 0, 0, 0, grassTex, GRASS_TILE),
-      flatPlane(WORLD, WORLD, GROUND.road[0], 0, 0, 0.03, ...GROUND.road.slice(1)),
-    ].forEach((ground, i) => {
-      ground.material.depthWrite = false;
-      ground.renderOrder = -0.6 + i * 0.1;
-    });
+  // ---------- Roads beyond the grid ----------
 
-    for (let bx = 0; bx < BLOCKS; bx++) {
-      for (let bz = 0; bz < BLOCKS; bz++) {
-        const isLot = PARKING_LOTS.some(([x, z]) => x === bx && z === bz);
-        const isParkade = bx === PARKADE[0] && bz === PARKADE[1];
-        if (isLot) addParkingLot(blockCenter(bx), blockCenter(bz));
-        else if (isParkade) addParkade(blockCenter(bx), blockCenter(bz));
-        else addCityBlock(blockCenter(bx), blockCenter(bz));
+  // Every road off the street grid is a ribbon laid along a line of points { x, z, h }
+  // about 5 m apart: the hill road, the lake drive and its bridge, the highway's link road
+  // and slip roads, and the streets out to the mall, the houses and the south side. Where a
+  // ribbon is raised off the ground it gets a deck, parapets and piers, and becomes a
+  // surface to drive on.
+  const ribbons = []; // { name, points, half, lift }
+  const ribbonIndex = makeIndex(); // every piece of every ribbon, for "is this spot on a road?"
+  const lampSpots = []; // street lamps along the ribbons: { x, y, z, turn }
+
+  // A smooth line through control points [x, z], as points `spacing` metres apart.
+  function smoothPath(ctrl, spacing = 5) {
+    const curve = new THREE.CatmullRomCurve3(ctrl.map(([x, z]) => new THREE.Vector3(x, 0, z)), false, 'centripetal');
+    return curve.getSpacedPoints(Math.max(1, Math.round(curve.getLength() / spacing))).map((p) => ({ x: p.x, z: p.z, h: 0 }));
+  }
+
+  // Evens out a height profile into ramps: a moving average `reach` points either way.
+  function easeHeights(points, reach, passes = 3) {
+    const last = points.length - 1;
+    for (let pass = 0; pass < passes; pass++) {
+      const heights = points.map((p) => p.h);
+      for (let i = 0; i <= last; i++) {
+        let sum = 0;
+        for (let k = -reach; k <= reach; k++) sum += heights[Math.max(0, Math.min(last, i + k))];
+        points[i].h = sum / (reach * 2 + 1);
       }
     }
+  }
 
-    // Lines along every road between crossings: a double yellow down the middle, white
-    // edge lines by the kerbs, and dashes dividing the two lanes each side.
-    const YELLOW = 0xe0b020;
-    const clear = JUNCTION + 5.4; // the lines stop short of the pedestrian crossings
-    for (let i = 0; i <= BLOCKS; i++) {
-      const c = roadCenter(i);
-      for (let k = 0; k < BLOCKS; k++) {
-        const from = roadCenter(k) + clear;
-        const to = roadCenter(k + 1) - clear;
-        const mid = (from + to) / 2;
-        const line = (offset, width, color) => {
-          marks.push({ x: c + offset, z: mid, sx: width, sz: to - from, color }); // on the north-south road
-          marks.push({ x: mid, z: c + offset, sx: to - from, sz: width, color }); // on the east-west road
-        };
-        line(-0.2, 0.14, YELLOW);
-        line(0.2, 0.14, YELLOW);
-        line(-ROAD_WIDTH / 2 + 0.55, 0.15);
-        line(ROAD_WIDTH / 2 - 0.55, 0.15);
-        for (let t = from + 1.5; t + 3 < to; t += 9) {
-          for (const offset of [-ROAD_WIDTH / 4, ROAD_WIDTH / 4]) {
-            marks.push({ x: c + offset, z: t + 1.5, sx: 0.14, sz: 3 });
-            marks.push({ x: t + 1.5, z: c + offset, sx: 3, sz: 0.14 });
-          }
+  // Sideways unit vector (to the left of travel) at point i of a ribbon.
+  function across(points, i) {
+    const a = points[Math.max(0, i - 1)];
+    const c = points[Math.min(points.length - 1, i + 1)];
+    const len = Math.hypot(c.x - a.x, c.z - a.z) || 1;
+    return [-(c.z - a.z) / len, (c.x - a.x) / len];
+  }
+
+  // Distance from (x, z) to the nearest ribbon road, ignoring `except`.
+  function ribbonDistance(x, z, except = null) {
+    let best = Infinity;
+    for (const piece of indexQuery(ribbonIndex, x, z, x, z)) {
+      if (piece.road === except) continue;
+      const { ax, az, bx, bz } = piece;
+      const dx = bx - ax;
+      const dz = bz - az;
+      const t = Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / (dx * dx + dz * dz || 1)));
+      const d = Math.hypot(ax + dx * t - x, az + dz * t - z) - piece.road.half;
+      if (d < best) best = d;
+    }
+    return best;
+  }
+
+  // A band of the ribbon from `from` to `to` metres off its centre line (left is +), `lift`
+  // above the road surface, drawn in `material`; `dash` leaves gaps (on, off in points).
+  function ribbonStrip(road, from, to, lift, material, dash = null, order = 0) {
+    const { points } = road;
+    const positions = [];
+    const uvs = [];
+    const index = [];
+    let travelled = 0;
+    points.forEach((p, i) => {
+      if (i) travelled += Math.hypot(p.x - points[i - 1].x, p.z - points[i - 1].z);
+      const [nx, nz] = across(points, i);
+      for (const side of [from, to]) {
+        positions.push(p.x + nx * side, p.h + road.lift + lift, p.z + nz * side);
+        uvs.push(side / GROUND.road[2], travelled / GROUND.road[2]);
+      }
+      if (i < points.length - 1 && !(dash && i % (dash[0] + dash[1]) >= dash[0])) {
+        index.push(i * 2, i * 2 + 1, i * 2 + 2, i * 2 + 1, i * 2 + 3, i * 2 + 2);
+      }
+    });
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+    geo.setIndex(index);
+    geo.computeVertexNormals();
+    const mesh = new THREE.Mesh(geo, material);
+    mesh.receiveShadow = true;
+    mesh.renderOrder = order;
+    scene.add(mesh);
+    return mesh;
+  }
+
+  // A solid band swept along the ribbon's points i0..i1: its cross-section runs from `from`
+  // to `to` metres across, and from top(p) down to bottom(p) in height.
+  function ribbonSweep(points, i0, i1, from, to, top, bottom, material) {
+    const positions = [];
+    const index = [];
+    const ring = 8; // four corners, each twice so the faces have their own normals
+    for (let i = i0; i <= i1; i++) {
+      const p = points[i];
+      const [nx, nz] = across(points, i);
+      const t = top(p, i);
+      const b = bottom(p, i);
+      const corner = (side, y) => [p.x + nx * side, y, p.z + nz * side];
+      // top-left, top-right, bottom-right, bottom-left, each twice
+      for (const c of [corner(from, t), corner(to, t), corner(to, t), corner(to, b), corner(to, b), corner(from, b), corner(from, b), corner(from, t)]) {
+        positions.push(...c);
+      }
+      if (i < i1) {
+        const k = (i - i0) * ring;
+        for (let f = 0; f < 4; f++) {
+          const a = k + f * 2;
+          const b2 = a + 1;
+          index.push(a, b2, a + ring, b2, b2 + ring, a + ring);
         }
       }
     }
+    // close both ends
+    for (const [k, flip] of [[0, false], [(i1 - i0) * ring, true]]) {
+      const quad = [k, k + 2, k + 4, k + 6];
+      index.push(...(flip ? [quad[0], quad[1], quad[2], quad[0], quad[2], quad[3]] : [quad[0], quad[2], quad[1], quad[0], quad[3], quad[2]]));
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geo.setIndex(index);
+    geo.computeVertexNormals();
+    const mesh = new THREE.Mesh(geo, material);
+    mesh.castShadow = mesh.receiveShadow = true;
+    scene.add(mesh);
+    return mesh;
+  }
 
-    addFlyover();
+  const roadTarmac = () => (photos.asphalt
+    ? groundMaterial(GROUND.road[0], GROUND.road[1], GROUND.road[3], { side: THREE.DoubleSide })
+    : new THREE.MeshLambertMaterial({ color: 0x4b5058, side: THREE.DoubleSide }));
+  const onTarmac = { side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2 };
+  const lineWhite = new THREE.MeshLambertMaterial({ color: 0xe9e9e4, ...onTarmac });
+  const lineYellow = new THREE.MeshLambertMaterial({ color: 0xe0b020, ...onTarmac });
+  const bridgeConcrete = new THREE.MeshLambertMaterial({ color: 0xa4a7ab });
 
-    // a zebra crossing, a stop line behind it, and a signal for every road that enters an intersection
-    for (let i = 0; i <= BLOCKS; i++) {
-      for (let j = 0; j <= BLOCKS; j++) {
-        DIRS.forEach(([dx, dz], d) => {
-          if (!inGrid(i - dx, j - dz)) return;
-          const [rx, rz] = rightOf([dx, dz]);
-          const at = (back, across) => ({
-            x: roadCenter(i) - dx * (JUNCTION + back) + rx * across,
-            z: roadCenter(j) - dz * (JUNCTION + back) + rz * across,
-          });
-          for (let across = -ROAD_WIDTH / 2 + 0.75; across < ROAD_WIDTH / 2; across += 1) {
-            marks.push({ ...at(2.3, across), sx: dx ? 3 : 0.5, sz: dx ? 0.5 : 3 });
-          }
-          marks.push({ ...at(4.6, ROAD_WIDTH / 4), sx: dx ? 0.45 : ROAD_WIDTH / 2 - 1, sz: dx ? ROAD_WIDTH / 2 - 1 : 0.45 });
-          signals.push({ i, j, d });
-        });
+  // Lays a road along `points`. Options: half (half its width), center ('double', 'dashed'
+  // or none), lanes (2 for two lanes each way), lamps (metres between street lamps).
+  function addRibbon(name, points, opts = {}) {
+    const road = { name, points, half: opts.half || 6, lift: opts.lift ?? 0.05, center: opts.center };
+    ribbons.push(road);
+    for (let i = 0; i < points.length - 1; i++) {
+      const a = points[i];
+      const b = points[i + 1];
+      indexAdd(ribbonIndex, {
+        road, ax: a.x, az: a.z, bx: b.x, bz: b.z,
+        minX: Math.min(a.x, b.x) - road.half - 2, maxX: Math.max(a.x, b.x) + road.half + 2,
+        minZ: Math.min(a.z, b.z) - road.half - 2, maxZ: Math.max(a.z, b.z) + road.half + 2,
+      });
+    }
+    if (opts.noDraw) return road;
+
+    const half = road.half;
+    // feet and tyres stand on the tarmac as it is drawn, not on the line it was laid along
+    for (let k = 0; k < points.length - 1; k++) {
+      const a = points[k];
+      const b = points[k + 1];
+      addSurface({ ax: a.x, az: a.z, bx: b.x, bz: b.z, ha: a.h + road.lift, hb: b.h + road.lift, half: half + 0.05 });
+    }
+    ribbonStrip(road, -half, half, 0, opts.material || roadTarmac(), null, 0.05);
+    ribbonStrip(road, half - 0.55, half - 0.4, 0.004, lineWhite);
+    ribbonStrip(road, -half + 0.4, -half + 0.55, 0.004, lineWhite);
+    if (road.center === 'double') {
+      ribbonStrip(road, 0.12, 0.27, 0.004, lineYellow);
+      ribbonStrip(road, -0.27, -0.12, 0.004, lineYellow);
+    } else if (road.center === 'dashed') {
+      ribbonStrip(road, -0.08, 0.08, 0.004, lineWhite, [1, 1]);
+    }
+    if (opts.lanes === 2) {
+      for (const side of [-1, 1]) ribbonStrip(road, side * half / 2 - 0.07, side * half / 2 + 0.07, 0.004, lineWhite, [1, 1]);
+    }
+
+    // --- raised: a deck under the road, parapets either side, piers down to the ground
+    const raised = points.map((p) => p.h > terrain(p.x, p.z) + 0.3);
+    let i = 0;
+    while (i < points.length) {
+      if (!raised[i]) {
+        i++;
+        continue;
+      }
+      const i0 = Math.max(0, i - 1);
+      while (i < points.length && raised[i]) i++;
+      const i1 = Math.min(points.length - 1, i);
+      const ground = (p) => terrain(p.x, p.z) - 0.2;
+      // the deck: a slab 1.3 m deep, solid to the ground while it is that low (an embankment)
+      ribbonSweep(points, i0, i1, -half - 0.6, half + 0.6, (p) => p.h + road.lift - 0.01, (p) => Math.max(ground(p), p.h - 1.3), bridgeConcrete);
+      for (const side of [-1, 1]) {
+        const inner = side * (half + 0.15);
+        const outer = side * (half + 0.55);
+        ribbonSweep(points, i0, i1, Math.min(inner, outer), Math.max(inner, outer), (p) => p.h + 0.95, (p) => p.h, bridgeConcrete);
+      }
+      for (let k = i0; k < i1; k++) {
+        const a = points[k];
+        const b = points[k + 1];
+        addSurface({ ax: a.x, az: a.z, bx: b.x, bz: b.z, ha: a.h + road.lift, hb: b.h + road.lift, half: half + 0.6 });
+        const low = Math.min(a.h, b.h);
+        const high = Math.max(a.h, b.h);
+        for (const side of [-1, 1]) {
+          const [anx, anz] = across(points, k);
+          const [bnx, bnz] = across(points, k + 1);
+          const off = side * (half + 0.35);
+          addSegmentCollider(a.x + anx * off, a.z + anz * off, b.x + bnx * off, b.z + bnz * off, 0.2, low - 0.8, high + 1.2);
+        }
+        // too low to pass under, but too high to drive up onto from the side: the space
+        // beneath is closed to anything on the ground (the sides keep it from the ramp's foot)
+        if (low > 1.2 && low < 4.2) addSegmentCollider(a.x, a.z, b.x, b.z, half + 0.6, -2, low - 0.4);
+      }
+      // piers every 25 m or so, kept off any road below
+      for (let k = i0 + 2; k < i1 - 1; k += 5) {
+        const p = points[k];
+        const floor = terrain(p.x, p.z);
+        if (p.h - 1.3 - floor < 0.8 || !pierFits(p.x, p.z, road)) continue;
+        const [nx, nz] = across(points, k);
+        const pier = new THREE.Mesh(new THREE.BoxGeometry(1.3, p.h - 1.3 - floor + 0.3, half * 1.4), bridgeConcrete);
+        pier.position.set(p.x, floor + (p.h - 1.3 - floor) / 2 - 0.15, p.z);
+        pier.rotation.y = Math.atan2(nx, nz);
+        pier.castShadow = true;
+        scene.add(pier);
+        addSegmentCollider(p.x - nx * half * 0.7, p.z - nz * half * 0.7, p.x + nx * half * 0.7, p.z + nz * half * 0.7, 0.65, floor - 1, p.h - 1.3);
       }
     }
 
-    // all paint in one instanced mesh
-    const geo = new THREE.PlaneGeometry(1, 1);
-    geo.rotateX(-Math.PI / 2);
-    // road paint is lit like the road (so it darkens in shade) and a little scuffed
-    const scuffed = canvasTexture(64, 64, (g, w, h) => {
-      g.fillStyle = '#ffffff';
-      g.fillRect(0, 0, w, h);
-      speckle(g, w, h, 500, 0.12);
-    });
-    const paint = new THREE.InstancedMesh(geo, new THREE.MeshLambertMaterial({ color: 0xffffff, map: scuffed }), marks.length);
+    // --- street lamps along it
+    if (opts.lamps) {
+      let next = 0;
+      let travelled = 0;
+      points.forEach((p, k) => {
+        if (k) travelled += Math.hypot(p.x - points[k - 1].x, p.z - points[k - 1].z);
+        if (travelled < next || k === 0 || k === points.length - 1) return;
+        next = travelled + opts.lamps;
+        const side = Math.round(travelled / opts.lamps) % 2 ? 1 : -1;
+        const [nx, nz] = across(points, k);
+        const off = side * (half + (raised[k] ? 0.35 : 1.1));
+        // the lamp's arm reaches back over the road
+        lampSpots.push({ x: p.x + nx * off, y: p.h + (raised[k] ? 0.95 : 0.05), ground: p.h + 0.06, z: p.z + nz * off, turn: Math.atan2(-nx * side, -nz * side) });
+      });
+    }
+    return road;
+  }
+
+  // Can a pier stand at (x, z) without blocking a road, the highway or a lane of the grid?
+  function pierFits(x, z, self) {
+    if (Math.abs(z - HIGHWAY.z) < 1.2 && Math.abs(x) < HIGHWAY.end) return true; // the median
+    if (Math.abs(z - HIGHWAY.z) < HIGHWAY.half + 1.5 && Math.abs(x) < HIGHWAY.end) return false;
+    if (Math.abs(x) < HALF + 1 && Math.abs(z) < HALF + 1) {
+      if (Math.abs(x - roadCenter(roadIndex(x))) < ROAD_WIDTH / 2 + 1) return false;
+      if (Math.abs(z - roadCenter(roadIndex(z))) < ROAD_WIDTH / 2 + 1) return false;
+    }
+    return ribbonDistance(x, z, self) > 1.5;
+  }
+
+  // The streets beyond the grid. Hill and lake roads leave from the north edge of the city;
+  // the link road leaves from its south edge and crosses the highway on a bridge, with a
+  // slip road on and off each carriageway; spurs lead out to the mall and its car park.
+  function buildRoads() {
+    const lakeDrive = smoothPath([
+      [274, 266], [330, 266], [380, 266], [430, 266], [480, 266], [540, 272], [590, 300], [625, 350],
+      [640, 420], [635, 500], [610, 570], [565, 625], [500, 660], [420, 675], [340, 668], [270, 645],
+      [210, 605], [165, 555], [135, 495], [118, 430], [114, 360], [114, 300], [114, 274],
+    ]);
+    // a low bridge where it crosses the water, eased into ramps at either end
+    for (const p of lakeDrive) p.h = lakeEdge(p.x, p.z) < 12 ? 2.6 : 0;
+    easeHeights(lakeDrive, 6);
+    addRibbon('lake', lakeDrive, { half: 6.5, center: 'double', lamps: 38 });
+
+    addRibbon('hill', hillRoad.filter((p) => p.z >= 274), { half: ROAD_HALF, center: 'dashed', lift: 0.06 });
+
+    // the link road: up over the highway and down again
+    const link = smoothPath([[-114, -274], [-114, -488]]);
+    for (const p of link) {
+      const z = -p.z;
+      p.h = z < 288 ? 0 : z < 346 ? (7.6 * (z - 288)) / 58 : z < 398 ? 7.6 : z < 456 ? (7.6 * (456 - z)) / 58 : 0;
+    }
+    easeHeights(link, 2, 2);
+    addRibbon('link', link, { half: 7, center: 'double', lanes: 2, lamps: 30 });
+
+    const slip = (name, ctrl) => addRibbon(name, smoothPath(ctrl), { half: 4, lift: 0.09 });
+    slip('ramp-a', [[-330, -359], [-262, -354], [-205, -343], [-168, -325], [-142, -304], [-126, -289], [-118, -279]]);
+    slip('ramp-b', [[-110, -279], [-102, -289], [-86, -304], [-60, -325], [-20, -343], [35, -353], [110, -359]]);
+    slip('ramp-c', [[100, -385], [30, -391], [-25, -401], [-64, -421], [-90, -445], [-104, -462], [-110, -472]]);
+    slip('ramp-d', [[-118, -472], [-124, -462], [-138, -445], [-164, -421], [-203, -401], [-253, -391], [-330, -385]]);
+
+    addRibbon('south', smoothPath([[-520, -488], [-300, -488], [-114, -488], [100, -488], [330, -488]]), { half: 6, center: 'double', lamps: 40 });
+    addRibbon('mall-north', smoothPath([[-274, -38], [-334, -38]]), { half: 7, center: 'double' });
+    addRibbon('mall-south', smoothPath([[-274, -190], [-334, -190]]), { half: 7, center: 'double' });
+    addRibbon('houses', smoothPath([[-38, 274], [-38, 400], [-38, 500]]), { half: 5, center: 'dashed', lamps: 36 });
+    // a turning circle at the end of the street of houses
+    const circle = new THREE.Mesh(new THREE.CircleGeometry(13, 40).rotateX(-Math.PI / 2), roadTarmac());
+    circle.position.set(-38, 0.045, 510);
+    circle.receiveShadow = true;
+    scene.add(circle);
+
+    buildHighway();
+    buildRoadGraph();
+  }
+
+  // Trees beyond the city: avenues along the roads, rows beside the highway, and copses
+  // scattered over the open ground, all kept off roads, water and the car park.
+  function plantCountryside() {
+    const open = (x, z, clear) => {
+      if (Math.abs(x) < HALF + 6 && Math.abs(z) < HALF + 6) return false;
+      if (Math.abs(x) > WORLD_LIMITS.maxX - 5 || z < WORLD_LIMITS.minZ + 5 || z > WORLD_LIMITS.maxZ - 5) return false;
+      if (lakeEdge(x, z) < 4 || terrain(x, z) > 30) return false;
+      if (Math.abs(z - HIGHWAY.z) < HIGHWAY.half + 4) return false;
+      if (x > MALL_LOT.minX - 8 && x < MALL.maxX + 8 && z > MALL_LOT.minZ - 8 && z < MALL.maxZ + 8) return false;
+      if (Math.hypot(x + 38, z - 510) < 18) return false;
+      return ribbonDistance(x, z) > clear;
+    };
+    const plant = (x, z, bushy) => {
+      const y = terrain(x, z);
+      if (bushy) plants.push({ type: 'bush', x, y: y + 0.05, z, s: rand(0.9, 1.5) });
+      else {
+        plants.push({ type: Math.random() < 0.2 ? 'pine' : 'tree', x, y: y + 0.05, z, s: rand(0.85, 1.3) });
+        addCollider({ minX: x - 0.45, maxX: x + 0.45, minZ: z - 0.45, maxZ: z + 0.45, minY: y - 1, maxY: y + 8 });
+      }
+    };
+    for (const road of ribbons) {
+      if (!['lake', 'link', 'south', 'houses', 'mall-north', 'mall-south'].includes(road.name)) continue;
+      road.points.forEach((p, k) => {
+        if (k % 4) return;
+        const [nx, nz] = across(road.points, k);
+        for (const side of [-1, 1]) {
+          const x = p.x + nx * side * (road.half + 4);
+          const z = p.z + nz * side * (road.half + 4);
+          if (p.h < 0.5 && open(x, z, 2.5)) plant(x, z, false);
+        }
+      });
+    }
+    for (let x = -HIGHWAY.portal + 20; x < HIGHWAY.portal - 20; x += 18) {
+      for (const side of [-1, 1]) {
+        const z = HIGHWAY.z + side * (HIGHWAY.half + 9 + rand(-1, 1));
+        if (open(x, z, 3)) plant(x + rand(-3, 3), z, Math.random() < 0.35);
+      }
+    }
+    for (let n = 0; n < 100; n++) {
+      const cx = rand(-760, 760);
+      const cz = rand(-580, 900);
+      if (!open(cx, cz, 10)) continue;
+      const count = Math.floor(rand(3, 10));
+      for (let k = 0; k < count; k++) {
+        const x = cx + rand(-16, 16);
+        const z = cz + rand(-16, 16);
+        if (open(x, z, 5)) plant(x, z, Math.random() < 0.3);
+      }
+    }
+  }
+
+  // ---------- The highway ----------
+
+  // Three lanes each way, the +x carriageway on the north side, the -x one on the south,
+  // with a concrete barrier down the middle, rails along the edges (open where the slip
+  // roads join), tall lamps in the median and a tunnel at each end.
+  const highwayLanes = []; // { dir: +1 | -1, z }: the centre of each lane
+  for (let k = 0; k < 3; k++) {
+    highwayLanes.push({ dir: 1, z: HIGHWAY.z + 2.2 + HIGHWAY.lane * (k + 0.5) });
+    highwayLanes.push({ dir: -1, z: HIGHWAY.z - 2.2 - HIGHWAY.lane * (k + 0.5) });
+  }
+
+  function buildHighway() {
+    const { z: hz, half, end, portal } = HIGHWAY;
+    const len = end * 2;
+    const deck = flatPlane(len, half * 2, GROUND.road[0], 0, hz, 0.04, ...GROUND.road.slice(1));
+    deck.renderOrder = -0.45;
+    deck.material.depthWrite = false;
+
+    // paint: dashed lane lines, a yellow edge by the barrier, a white edge by the shoulder
+    for (const dir of [1, -1]) {
+      const at = (offset) => hz + dir * offset;
+      marks.push({ x: 0, z: at(1.5), sx: len, sz: 0.15, color: 0xe0b020 });
+      marks.push({ x: 0, z: at(2.2 + HIGHWAY.lane * 3 + 0.1), sx: len, sz: 0.18 });
+      for (const k of [1, 2]) {
+        for (let x = -end; x < end; x += 12) marks.push({ x: x + 2, z: at(2.2 + HIGHWAY.lane * k), sx: 4, sz: 0.15 });
+      }
+    }
+
+    // the median barrier: a sloped concrete wall
+    const barrier = new THREE.Shape();
+    barrier.moveTo(-0.4, 0);
+    barrier.lineTo(0.4, 0);
+    barrier.lineTo(0.2, 0.3);
+    barrier.lineTo(0.12, 0.85);
+    barrier.lineTo(-0.12, 0.85);
+    barrier.lineTo(-0.2, 0.3);
+    barrier.closePath();
+    const wall = new THREE.Mesh(new THREE.ExtrudeGeometry(barrier, { depth: len, bevelEnabled: false }), bridgeConcrete);
+    wall.rotation.y = Math.PI / 2;
+    wall.position.set(-end, 0.04, hz);
+    wall.castShadow = wall.receiveShadow = true;
+    scene.add(wall);
+    addCollider({ minX: -end, maxX: end, minZ: hz - 0.4, maxZ: hz + 0.4, maxY: 0.9, top: 0.9 });
+
+    // steel guard rails along both outer edges, with gaps where the slip roads join
+    const gaps = { 1: [[-335, 112]], [-1]: [[-335, 102]] };
+    const railMat = reflect(new THREE.MeshPhongMaterial({ color: 0xb9bec4, shininess: 60, specular: 0x666666 }), 0.2);
+    const railGeo = new THREE.BoxGeometry(1, 0.32, 0.08);
+    const postGeo = new THREE.BoxGeometry(0.12, 0.75, 0.12);
+    const runs = [];
+    for (const dir of [1, -1]) {
+      const z = hz + dir * (half - 0.3);
+      let from = -portal;
+      for (const [g0, g1] of [...gaps[dir], [portal, portal]]) {
+        if (g0 > from) runs.push({ x0: from, x1: g0, z });
+        from = g1;
+      }
+    }
+    const posts = [];
+    for (const run of runs) {
+      const rail = new THREE.Mesh(railGeo, railMat);
+      rail.scale.x = run.x1 - run.x0;
+      rail.position.set((run.x0 + run.x1) / 2, 0.62, run.z);
+      rail.castShadow = true;
+      scene.add(rail);
+      addCollider({ minX: run.x0, maxX: run.x1, minZ: run.z - 0.12, maxZ: run.z + 0.12, maxY: 1 });
+      for (let x = run.x0; x <= run.x1; x += 4) posts.push([x, run.z + Math.sign(run.z - hz) * 0.1]);
+    }
+    const postMesh = new THREE.InstancedMesh(postGeo, steelMat, posts.length);
     const m = new THREE.Matrix4();
-    const tint = new THREE.Color();
-    marks.forEach((mark, i) => {
-      m.makeScale(mark.sx, 1, mark.sz);
-      m.setPosition(mark.x, (mark.y || 0) + 0.1, mark.z);
-      paint.setMatrixAt(i, m);
-      paint.setColorAt(i, tint.setHex(mark.color || 0xe9e9e4));
+    posts.forEach(([x, z], i) => postMesh.setMatrixAt(i, m.makeTranslation(x, 0.4, z)));
+    scene.add(postMesh);
+
+    // tall lamps in the median, an arm over each carriageway
+    for (let x = -portal + 30; x < portal; x += 60) {
+      for (const dir of [1, -1]) lampSpots.push({ x, y: 0.9, ground: 0.06, z: hz + dir * 0.2, turn: dir > 0 ? 0 : Math.PI, tall: true });
+    }
+
+    // overhead signs on gantries before the interchange, one for each direction
+    const signFace = canvasTexture(512, 160, (g, w, h) => {
+      g.fillStyle = '#0f5f37';
+      g.fillRect(0, 0, w, h);
+      g.strokeStyle = '#fff';
+      g.lineWidth = 6;
+      g.strokeRect(8, 8, w - 16, h - 16);
+      g.fillStyle = '#fff';
+      g.font = 'bold 54px system-ui, sans-serif';
+      g.textBaseline = 'middle';
+      g.fillText('City Centre', 36, 58);
+      g.font = 'bold 40px system-ui, sans-serif';
+      g.fillText('Mall · Metro  EXIT ↗', 36, 116);
     });
-    paint.receiveShadow = true;
-    scene.add(paint);
+    const signMat = new THREE.MeshLambertMaterial({ map: signFace });
+    for (const dir of [1, -1]) {
+      const x = -114 - dir * 330;
+      const z0 = hz + dir * 1;
+      const z1 = hz + dir * (half + 0.5);
+      for (const z of [z0, z1]) {
+        const leg = new THREE.Mesh(new THREE.BoxGeometry(0.35, 7.4, 0.35), steelMat);
+        leg.position.set(x, 3.7, z);
+        scene.add(leg);
+        addCollider({ minX: x - 0.25, maxX: x + 0.25, minZ: z - 0.25, maxZ: z + 0.25, maxY: 7.4 });
+      }
+      const beam = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.5, Math.abs(z1 - z0)), steelMat);
+      beam.position.set(x, 7.2, (z0 + z1) / 2);
+      scene.add(beam);
+      const board = new THREE.Mesh(new THREE.PlaneGeometry(10, 3.1), signMat);
+      board.position.set(x - dir * 0.25, 5.8, (z0 + z1) / 2 + dir * 1.2);
+      board.rotation.y = dir > 0 ? -Math.PI / 2 : Math.PI / 2;
+      scene.add(board);
+    }
+
+    // --- tunnels: a portal in each mound and a dark bore beyond it
+    const tunnelMat = new THREE.MeshLambertMaterial({ color: 0x55585d, side: THREE.DoubleSide });
+    const lampMat = new THREE.MeshBasicMaterial({ color: 0xffd9a0 });
+    for (const side of [1, -1]) {
+      const x0 = side * portal;
+      const depth = 260;
+      const cx = x0 + side * depth / 2;
+      const height = 8;
+      for (const [w, h, d, y, z] of [[depth, 0.6, half * 2 + 2, height + 0.3, hz], [depth, height, 0.6, height / 2, hz - half - 0.6], [depth, height, 0.6, height / 2, hz + half + 0.6]]) {
+        const piece = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), tunnelMat);
+        piece.position.set(cx, y, z);
+        scene.add(piece);
+      }
+      // the face round the opening
+      const face = new THREE.Mesh(new THREE.BoxGeometry(2, 22, half * 2 + 30), bridgeConcrete);
+      face.position.set(x0, height + 11 - 0.01, hz);
+      face.castShadow = true;
+      scene.add(face);
+      for (const dz of [-1, 1]) {
+        const wing = new THREE.Mesh(new THREE.BoxGeometry(2, height, 14), bridgeConcrete);
+        wing.position.set(x0, height / 2, hz + dz * (half + 7.5));
+        scene.add(wing);
+      }
+      // a row of lamps down the bore, so it reads as a tunnel and not a hole
+      for (let d = 10; d < depth; d += 14) {
+        for (const dz of [-1, 1]) {
+          const lamp = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.2, 0.3), lampMat);
+          lamp.position.set(x0 + side * d, height - 0.6, hz + dz * (half - 1));
+          scene.add(lamp);
+        }
+      }
+      for (const dz of [-1, 1]) addCollider({ minX: Math.min(x0, x0 + side * depth), maxX: Math.max(x0, x0 + side * depth), minZ: hz + dz * (half + 0.3) - 0.3, maxZ: hz + dz * (half + 0.3) + 0.3, maxY: height });
+    }
+
+    // the highway as a line, for finding routes along it
+    addRibbon('highway', smoothPath([[-portal, hz], [portal, hz]], 10), { half, noDraw: true });
+  }
+
+  // ---------- Route finding ----------
+
+  // The road network as a graph: every crossing of the street grid, and every point along
+  // the ribbons, joined to its neighbours; ribbon ends join whatever they touch.
+  const roadNodes = []; // { x, y, z, links: [[node, length]] }
+
+  function buildRoadGraph() {
+    const join = (a, b) => {
+      const d = Math.hypot(a.x - b.x, a.z - b.z);
+      a.links.push([b, d]);
+      b.links.push([a, d]);
+    };
+    const grid = [];
+    for (let i = 0; i <= BLOCKS; i++) {
+      grid.push([]);
+      for (let j = 0; j <= BLOCKS; j++) {
+        const node = { x: roadCenter(i), y: 0, z: roadCenter(j), links: [] };
+        grid[i].push(node);
+        roadNodes.push(node);
+        if (i) join(node, grid[i - 1][j]);
+        if (j) join(node, grid[i][j - 1]);
+      }
+    }
+    const ends = [];
+    for (const road of ribbons) {
+      let prev = null;
+      road.points.forEach((p, k) => {
+        if (k % 2 && k !== road.points.length - 1) return; // every other point is plenty
+        const node = { x: p.x, y: p.h, z: p.z, links: [] };
+        roadNodes.push(node);
+        if (prev) join(node, prev);
+        prev = node;
+        if (k === 0 || k === road.points.length - 1) ends.push(node);
+      });
+    }
+    // each ribbon end joins the nearest node of anything else within reach
+    for (const end of ends) {
+      let best = null;
+      let bestDist = 26;
+      for (const node of roadNodes) {
+        if (node === end || end.links.some(([n]) => n === node)) continue;
+        const d = Math.hypot(node.x - end.x, node.z - end.z);
+        if (d < bestDist && Math.abs(node.y - end.y) < 2) {
+          best = node;
+          bestDist = d;
+        }
+      }
+      if (best) join(end, best);
+    }
+  }
+
+  function nearestNode(x, z) {
+    let best = roadNodes[0];
+    let bestDist = Infinity;
+    for (const node of roadNodes) {
+      const d = (node.x - x) ** 2 + (node.z - z) ** 2;
+      if (d < bestDist) {
+        bestDist = d;
+        best = node;
+      }
+    }
+    return best;
+  }
+
+  // The shortest way along the roads between two nodes, as a list of nodes.
+  function findPath(from, to) {
+    const dist = new Map([[from, 0]]);
+    const back = new Map();
+    const open = [from];
+    while (open.length) {
+      let at = 0;
+      for (let k = 1; k < open.length; k++) if (dist.get(open[k]) < dist.get(open[at])) at = k;
+      const node = open[at];
+      open[at] = open[open.length - 1];
+      open.pop();
+      if (node === to) break;
+      const base = dist.get(node);
+      for (const [next, len] of node.links) {
+        const d = base + len;
+        if (d < (dist.get(next) ?? Infinity)) {
+          if (!dist.has(next)) open.push(next);
+          dist.set(next, d);
+          back.set(next, node);
+        }
+      }
+    }
+    const path = [to];
+    while (path[0] !== from && back.has(path[0])) path.unshift(back.get(path[0]));
+    return path;
+  }
+
+  // ---------- Metro ----------
+
+  // An elevated line runs north to south down the middle of the city, then curves over the
+  // highway to the south side. Two tracks on a concrete viaduct, three stations under
+  // curved glass roofs (North, Central over the station plaza, and South), and two trains
+  // shuttling end to end, each on its own track, stopping at every station.
+  const METRO_Y = 11; // rail level
+  const PLATFORM = 1.05; // platform height above the rails
+  const TRACK = 2.1; // each track's centre from the line's centre
+  const CAR_LENGTH = 15;
+  const metroLine = smoothPath([
+    [0, 520], [0, 300], [0, 0], [0, -150], [6, -200], [25, -245], [55, -288], [95, -330],
+    [140, -372], [185, -414], [230, -450], [280, -484], [330, -515],
+  ], 4);
+  for (const p of metroLine) p.h = METRO_Y;
+  // distance along the line to each point, for placing trains
+  const metroAlong = [0];
+  for (let i = 1; i < metroLine.length; i++) {
+    metroAlong.push(metroAlong[i - 1] + Math.hypot(metroLine[i].x - metroLine[i - 1].x, metroLine[i].z - metroLine[i - 1].z));
+  }
+  const METRO_LENGTH = metroAlong[metroAlong.length - 1];
+  const nearestAlong = (x, z) => {
+    let best = 0;
+    let bestDist = Infinity;
+    metroLine.forEach((p, i) => {
+      const d = (p.x - x) ** 2 + (p.z - z) ** 2;
+      if (d < bestDist) {
+        bestDist = d;
+        best = metroAlong[i];
+      }
+    });
+    return best;
+  };
+  const STATIONS = [
+    { name: 'North', s: nearestAlong(0, 440) },
+    { name: 'Central', s: nearestAlong(0, 0) },
+    { name: 'South', s: METRO_LENGTH - 32 },
+  ];
+  const trains = [];
+  const trainBoxes = []; // solid while you are up at track level
+
+  // The point `s` metres along the line, `off` metres to its left: { x, z, h: heading }.
+  function metroPoint(s, off = 0) {
+    s = Math.max(0, Math.min(METRO_LENGTH, s));
+    let i = 1;
+    while (i < metroAlong.length - 1 && metroAlong[i] < s) i++;
+    const a = metroLine[i - 1];
+    const b = metroLine[i];
+    const t = (s - metroAlong[i - 1]) / (metroAlong[i] - metroAlong[i - 1] || 1);
+    const dx = b.x - a.x;
+    const dz = b.z - a.z;
+    const len = Math.hypot(dx, dz) || 1;
+    return { x: a.x + dx * t - (dz / len) * off, z: a.z + dz * t + (dx / len) * off, h: Math.atan2(dx, dz) };
+  }
+
+  function buildMetro() {
+    const line = { points: metroLine, lift: 0, half: 4.8 };
+    const n = metroLine.length - 1;
+    const stationAt = (i) => STATIONS.some((st) => Math.abs(metroAlong[i] - st.s) < 36);
+
+    // --- the viaduct: a box girder with walls along both edges, wider at the stations
+    const wide = (p, i) => (stationAt(i) ? 8.6 : 4.8);
+    const sweepVar = (from, to, top, bottom, material) => {
+      // like ribbonSweep, but the width may change along the line
+      const positions = [];
+      const index = [];
+      metroLine.forEach((p, i) => {
+        const [nx, nz] = across(metroLine, i);
+        const f = from(p, i);
+        const t2 = to(p, i);
+        const corner = (side, y) => [p.x + nx * side, y, p.z + nz * side];
+        for (const c of [corner(f, top(p, i)), corner(t2, top(p, i)), corner(t2, top(p, i)), corner(t2, bottom(p, i)),
+          corner(t2, bottom(p, i)), corner(f, bottom(p, i)), corner(f, bottom(p, i)), corner(f, top(p, i))]) positions.push(...c);
+        if (i < n) {
+          const k = i * 8;
+          for (let face = 0; face < 4; face++) {
+            const a = k + face * 2;
+            index.push(a, a + 1, a + 8, a + 1, a + 9, a + 8);
+          }
+        }
+      });
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geo.setIndex(index);
+      geo.computeVertexNormals();
+      const mesh = new THREE.Mesh(geo, material);
+      mesh.castShadow = mesh.receiveShadow = true;
+      scene.add(mesh);
+      return mesh;
+    };
+    sweepVar((p, i) => -wide(p, i), (p, i) => wide(p, i), () => METRO_Y - 0.35, () => METRO_Y - 2.2, bridgeConcrete);
+    for (const side of [-1, 1]) {
+      const inner = (p, i) => side * (wide(p, i) - 0.3);
+      const outer = (p, i) => side * wide(p, i);
+      sweepVar(side > 0 ? inner : outer, side > 0 ? outer : inner, () => METRO_Y + 1.1, () => METRO_Y - 0.4, bridgeConcrete);
+    }
+    // the track beds: concrete slabs with sleepers, and the rails on them
+    const sleepers = new THREE.MeshLambertMaterial({
+      map: canvasTexture(64, 64, (g, w, h) => {
+        g.fillStyle = '#7d7a74';
+        g.fillRect(0, 0, w, h);
+        speckle(g, w, h, 600, 0.15);
+        g.fillStyle = '#a9a59c';
+        for (let y = 4; y < h; y += 32) g.fillRect(6, y, w - 12, 12);
+      }),
+    });
+    const railSteel = reflect(new THREE.MeshPhongMaterial({ color: 0x8e9196, shininess: 90, specular: 0xbbbbbb }), 0.3);
+    const bed = { points: metroLine, lift: 0 };
+    for (const t of [-TRACK, TRACK]) {
+      const strip = ribbonStrip(bed, t - 1.4, t + 1.4, -0.33, sleepers);
+      strip.geometry.attributes.uv.array.forEach((v, k, arr) => { if (k % 2 === 0) arr[k] = (v * 5) / 2.8; });
+      for (const r of [-0.72, 0.72]) {
+        ribbonSweep(metroLine, 0, n, t + r - 0.04, t + r + 0.04, () => METRO_Y, () => METRO_Y - 0.2, railSteel);
+      }
+    }
+    // the deck, walls and buffer stops are solid at track level
+    for (let i = 0; i < n; i++) {
+      const a = metroLine[i];
+      const b = metroLine[i + 1];
+      addSurface({ ax: a.x, az: a.z, bx: b.x, bz: b.z, ha: METRO_Y - 0.3, hb: METRO_Y - 0.3, half: wide(a, i) });
+      for (const side of [-1, 1]) {
+        const [anx, anz] = across(metroLine, i);
+        const [bnx, bnz] = across(metroLine, i + 1);
+        const off = side * (wide(a, i) - 0.15);
+        // low enough to step over from a platform, a wall to anyone down on the tracks
+        addSegmentCollider(a.x + anx * off, a.z + anz * off, b.x + bnx * off, b.z + bnz * off, 0.2, METRO_Y - 1, METRO_Y + 1.2, { top: METRO_Y + 1 });
+      }
+    }
+
+    // --- piers: a round column with a hammerhead, about every 30 m, never on a road
+    const pierMat = cityMaterial('concrete', 0xc4c6c9);
+    const batch = makeBatch();
+    for (let i = 4; i < n - 2; i += 7) {
+      const p = metroLine[i];
+      if (!pierFits(p.x, p.z, null)) {
+        // try a little either way along the line
+        const alt = [i - 2, i + 2, i - 3, i + 3].find((k) => pierFits(metroLine[k].x, metroLine[k].z, null));
+        if (alt === undefined) continue;
+        i = alt;
+      }
+      const q = metroLine[i];
+      const floor = groundAt(q.x, q.z, 1);
+      const [nx, nz] = across(metroLine, i);
+      const turn = Math.atan2(nx, nz);
+      batchMatrix.makeTranslation(q.x, (floor + METRO_Y - 3.6) / 2, q.z);
+      batchGeometry(batch, pierMat, new THREE.CylinderGeometry(0.85, 0.95, METRO_Y - 3.6 - floor, 16), batchMatrix);
+      batchBox(batch, pierMat, q.x, METRO_Y - 2.9, q.z, 2.4, 1.4, 7.5, turn + Math.PI / 2, 3);
+      addCollider({ minX: q.x - 0.95, maxX: q.x + 0.95, minZ: q.z - 0.95, maxZ: q.z + 0.95, minY: floor - 1, maxY: METRO_Y - 3 });
+    }
+
+    // --- catenary: a portal over the tracks every 40 m, and the wires
+    const wires = [];
+    for (let i = 2; i < n; i += 10) {
+      const p = metroLine[i];
+      const [nx, nz] = across(metroLine, i);
+      const w = wide(p, i) - 0.5;
+      for (const side of [-1, 1]) {
+        batchMatrix.makeTranslation(p.x + nx * side * w, METRO_Y + 3.2, p.z + nz * side * w);
+        batchGeometry(batch, steelMat, new THREE.CylinderGeometry(0.1, 0.12, 6.4, 8), batchMatrix);
+      }
+      batchBox(batch, steelMat, p.x, METRO_Y + 6.3, p.z, 0.16, 0.25, w * 2, Math.atan2(nx, nz), 1);
+    }
+    for (const t of [-TRACK, TRACK]) {
+      for (let i = 0; i < n; i++) {
+        const a = metroPoint(metroAlong[i], t);
+        const b = metroPoint(metroAlong[i + 1], t);
+        wires.push(a.x, METRO_Y + 5.6, a.z, b.x, METRO_Y + 5.6, b.z);
+      }
+    }
+    const wireGeo = new THREE.BufferGeometry();
+    wireGeo.setAttribute('position', new THREE.Float32BufferAttribute(wires, 3));
+    scene.add(new THREE.LineSegments(wireGeo, new THREE.LineBasicMaterial({ color: 0x2a2c30 })));
+
+    // --- stations: side platforms, a curved glass roof on steel arches, lamps, and stairs
+    // down to the street
+    const roofGlass = reflect(new THREE.MeshPhongMaterial({
+      color: 0x6f9fd0, transparent: true, opacity: 0.55, shininess: 100, specular: 0xaabbcc, side: THREE.DoubleSide, depthWrite: false,
+    }), 0.5);
+    const platformMat = cityMaterial('concrete', 0xd9d9d6);
+    const edgeMat = new THREE.MeshLambertMaterial({ color: 0xe8c33a });
+    const stationLamp = new THREE.MeshBasicMaterial({ color: 0x606060 });
+    stationLamp.userData.lit = 0xfff4dc;
+    metroLamps.push(stationLamp);
+    for (const st of STATIONS) {
+      const c = metroPoint(st.s);
+      const turn = c.h;
+      const along = (d, off, y) => {
+        const p = metroPoint(st.s + d, off);
+        return [p.x, y, p.z];
+      };
+      for (const side of [-1, 1]) {
+        const p0 = metroPoint(st.s - 32, side * 6);
+        const p1 = metroPoint(st.s + 32, side * 6);
+        addSurface({ ax: p0.x, az: p0.z, bx: p1.x, bz: p1.z, ha: METRO_Y + PLATFORM, hb: METRO_Y + PLATFORM, half: 2.25 });
+        // platform: from just outside the train's sweep to the viaduct wall
+        for (let d = -32; d < 32; d += 4) {
+          const a0 = along(d, side * 3.75, 0);
+          const a1 = along(d + 4, side * 3.75, 0);
+          const mx = (a0[0] + a1[0]) / 2;
+          const mz = (a0[2] + a1[2]) / 2;
+          const [nx, nz] = [-Math.cos(turn), Math.sin(turn)];
+          batchBox(batch, platformMat, mx + nx * side * 2.25, METRO_Y + PLATFORM / 2 - 0.3, mz + nz * side * 2.25, 4.5, PLATFORM + 0.3, 4.05, turn, 3);
+          batchBox(batch, edgeMat, mx + nx * side * 0.25, METRO_Y + PLATFORM + 0.005, mz + nz * side * 0.25, 0.5, 0.02, 4.05, turn, 1);
+        }
+      }
+      // the roof: a shallow barrel vault of glass on steel arches
+      const arch = new THREE.CylinderGeometry(11, 11, 70, 24, 1, true, -Math.PI * 0.32, Math.PI * 0.64);
+      const vault = new THREE.Mesh(arch, roofGlass);
+      vault.rotation.x = -Math.PI / 2; // the curve's axis along the track, its crown on top
+      vault.position.y = -0.8;
+      const holder = new THREE.Group();
+      holder.add(vault);
+      holder.position.set(c.x, METRO_Y + 0.5, c.z);
+      holder.rotation.y = turn;
+      scene.add(holder);
+      holder.updateMatrix();
+      // the station's steelwork, lamps and boards are merged in with the rest of the line
+      const fixed = (geo, material, x, y, z, rz = 0, ry = 0) => {
+        const local = new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(0, ry, rz)).setPosition(x, y, z);
+        batchGeometry(batch, material, geo, new THREE.Matrix4().multiplyMatrices(holder.matrix, local));
+      };
+      for (let d = -35; d <= 35; d += 7) {
+        fixed(new THREE.TorusGeometry(11, 0.12, 6, 24, Math.PI * 0.64), steelMat, 0, -0.8, d, Math.PI * 0.18);
+        for (const side of [-1, 1]) {
+          fixed(new THREE.BoxGeometry(0.25, 5.8, 0.25), steelMat, side * 9.3, 2.3, d);
+          fixed(new THREE.BoxGeometry(0.4, 0.12, 2.4), stationLamp, side * 5.6, 4.6, d); // lamps hung under the roof
+        }
+      }
+      // name boards
+      const board = new THREE.MeshLambertMaterial({
+        map: canvasTexture(256, 64, (g, w, h) => {
+          g.fillStyle = '#123f7a';
+          g.fillRect(0, 0, w, h);
+          g.fillStyle = '#fff';
+          g.font = 'bold 34px system-ui, sans-serif';
+          g.textAlign = 'center';
+          g.textBaseline = 'middle';
+          g.fillText(`Ⓜ ${st.name}`, w / 2, h / 2 + 2);
+        }),
+      });
+      for (const d of [-18, 18]) {
+        for (const side of [-1, 1]) fixed(new THREE.PlaneGeometry(3.2, 0.8), board, side * 7.9, 3.4, d, 0, side > 0 ? -Math.PI / 2 : Math.PI / 2);
+      }
+      // stairs from the street to each platform, at the station's ends
+      for (const side of [-1, 1]) {
+        const end = st.name === 'South' ? -1 : 1;
+        const top = metroPoint(st.s + end * 24, side * 10.6);
+        const foot = metroPoint(st.s + end * 24 - end * 19, side * 10.6);
+        const base = groundAt(foot.x, foot.z, 1);
+        const rise = METRO_Y + PLATFORM - base;
+        const run = Math.hypot(top.x - foot.x, top.z - foot.z);
+        const steps = 34;
+        for (let k = 0; k < steps; k++) {
+          const t = (k + 0.5) / steps;
+          const y = base + rise * ((k + 1) / steps);
+          batchBox(batch, platformMat, foot.x + (top.x - foot.x) * t, y - 0.12, foot.z + (top.z - foot.z) * t, 2.4, 0.24, run / steps + 0.04, turn, 2);
+        }
+        const slope = Math.hypot(run, rise);
+        batchMatrix.makeRotationFromEuler(new THREE.Euler(-end * Math.atan2(rise, run), turn, 0, 'YXZ'));
+        batchMatrix.setPosition((foot.x + top.x) / 2, (base + METRO_Y + PLATFORM) / 2 - 0.45, (foot.z + top.z) / 2);
+        batchGeometry(batch, pierMat, tileBoxFaces(new THREE.BoxGeometry(2.2, 0.45, slope), 2.2, 0.45, slope, 3), batchMatrix);
+        for (const rail of [-1.15, 1.15]) {
+          const [nx, nz] = [-Math.cos(turn), Math.sin(turn)];
+          batchMatrix.setPosition((foot.x + top.x) / 2 + nx * rail, (base + METRO_Y + PLATFORM) / 2 + 0.9, (foot.z + top.z) / 2 + nz * rail);
+          batchGeometry(batch, steelMat, new THREE.BoxGeometry(0.06, 0.06, slope), batchMatrix);
+        }
+        // the landing between the stairs and the platform
+        const land = metroPoint(st.s + end * 26.5, side * 8.1);
+        batchBox(batch, platformMat, land.x, METRO_Y + PLATFORM / 2, land.z, 7.4, PLATFORM + 0.3, 5, turn, 3);
+        addSurface({ ax: foot.x, az: foot.z, bx: top.x, bz: top.z, ha: base, hb: METRO_Y + PLATFORM, half: 1.2 });
+        addSurface({ ax: land.x - (top.x - foot.x) / run * 2.5, az: land.z - (top.z - foot.z) / run * 2.5, bx: land.x + (top.x - foot.x) / run * 2.5, bz: land.z + (top.z - foot.z) / run * 2.5, ha: METRO_Y + PLATFORM, hb: METRO_Y + PLATFORM, half: 3.7 });
+        // a support under the stair's top
+        batchBox(batch, pierMat, top.x, (base + METRO_Y) / 2, top.z, 1, METRO_Y - base, 1, turn, 3);
+      }
+    }
+    flushBatch(batch);
+
+    // --- the trains
+    for (const [off, s, dir] of [[TRACK, STATIONS[0].s, 1], [-TRACK, STATIONS[2].s, -1]]) {
+      const cars = [];
+      for (let k = 0; k < 4; k++) cars.push(createMetroCar(k === 0, k === 3));
+      trains.push({ off, s, dir, speed: 0, dwell: rand(4, 12), cars });
+    }
+    for (const train of trains) {
+      for (const car2 of train.cars) {
+        const box = { minX: 0, maxX: 0, minZ: 0, maxZ: 0, minY: METRO_Y - 0.5, maxY: METRO_Y + 4.3, car: { x: 0, z: 0, h: 0, hl: CAR_LENGTH / 2, hw: 1.5 } };
+        car2.box = box;
+        trainBoxes.push(box);
+      }
+    }
+    void line;
+  }
+  const metroLamps = []; // materials lit after dark: station lamps, train windows
+
+  // One car of a train: a white body with a blue stripe and a band of windows, rounded at
+  // the roof, with a sloping cab at each end of the train. Faces +z.
+  const trainLivery = (() => {
+    const draw = (night) => canvasTexture(512, 128, (g, w, h) => {
+      g.fillStyle = night ? '#000' : '#eef1f4';
+      g.fillRect(0, 0, w, h);
+      if (!night) {
+        g.fillStyle = '#1f5fbf';
+        g.fillRect(0, 92, w, 12);
+        g.fillStyle = '#9fb7d8';
+        g.fillRect(0, 106, w, 4);
+      }
+      // windows, with doors between them
+      for (let x = 10; x < w; x += 128) {
+        for (const [wx, ww] of [[0, 52], [64, 52]]) {
+          if (night) {
+            g.fillStyle = 'rgba(235,245,255,0.9)';
+          } else {
+            const glass = g.createLinearGradient(0, 30, 0, 74);
+            glass.addColorStop(0, '#5d7387');
+            glass.addColorStop(1, '#1b2632');
+            g.fillStyle = glass;
+          }
+          g.fillRect(x + wx, 30, ww, 44);
+        }
+        // a door
+        g.fillStyle = night ? 'rgba(200,215,230,0.5)' : '#c9ced4';
+        g.fillRect(x + 118, 22, 2, 82);
+      }
+    });
+    const material = new THREE.MeshPhongMaterial({ map: draw(false), emissiveMap: draw(true), emissive: 0x000000, shininess: 60, specular: 0x666666 });
+    material.userData.glow = 0.9;
+    litMaterials.push(material);
+    return reflect(material, 0.15);
+  })();
+  const trainDark = new THREE.MeshLambertMaterial({ color: 0x2a2d33 });
+  const trainWhite = reflect(new THREE.MeshPhongMaterial({ color: 0xeef1f4, shininess: 60, specular: 0x666666 }), 0.15);
+  const trainHead = new THREE.MeshBasicMaterial({ color: 0xfff3d6 });
+  const trainTail = new THREE.MeshBasicMaterial({ color: 0x5a0a0a });
+
+  function createMetroCar(front, back) {
+    const group = new THREE.Group();
+    const w = 2.9;
+    const h = 3.5;
+    // the body's cross-section, rounded at the roof, extruded along the car
+    const section = new THREE.Shape();
+    section.moveTo(-w / 2, 0.4);
+    section.lineTo(w / 2, 0.4);
+    section.lineTo(w / 2, h - 0.7);
+    section.quadraticCurveTo(w / 2, h, 0, h);
+    section.quadraticCurveTo(-w / 2, h, -w / 2, h - 0.7);
+    section.closePath();
+    const body = new THREE.ExtrudeGeometry(section, { depth: CAR_LENGTH - 0.6, bevelEnabled: false, curveSegments: 6 });
+    body.translate(0, PLATFORM - 0.4, -(CAR_LENGTH - 0.6) / 2);
+    // stretch the livery along the sides: x across, y up → u along the car, v up
+    const pos = body.attributes.position;
+    const uv = body.attributes.uv;
+    for (let i = 0; i < pos.count; i++) uv.setXY(i, (pos.getZ(i) + CAR_LENGTH / 2) / CAR_LENGTH * 2, (pos.getY(i) - PLATFORM + 0.4) / h);
+    const shell = new THREE.Mesh(body, trainLivery);
+    shell.castShadow = true;
+    group.add(shell);
+    // under-frame and bogies
+    const frame = new THREE.Mesh(new THREE.BoxGeometry(w - 0.3, 0.6, CAR_LENGTH - 1.2), trainDark);
+    frame.position.y = PLATFORM - 0.5;
+    group.add(frame);
+    for (const z of [-CAR_LENGTH / 2 + 2.6, CAR_LENGTH / 2 - 2.6]) {
+      const bogie = new THREE.Mesh(new THREE.BoxGeometry(2.3, 0.7, 2.8), trainDark);
+      bogie.position.set(0, 0.45, z);
+      group.add(bogie);
+    }
+    // the cab ends: a sloping nose with a dark windscreen and lamps
+    const ends = [];
+    for (const [is, dir] of [[front, 1], [back, -1]]) {
+      if (!is) continue;
+      const nose = new THREE.Mesh(new THREE.BoxGeometry(w, h - 0.6, 1.6), trainWhite);
+      nose.position.set(0, PLATFORM + (h - 0.6) / 2 - 0.4, dir * (CAR_LENGTH / 2 - 0.2));
+      nose.scale.set(1, 1, 1);
+      group.add(nose);
+      const screen = new THREE.Mesh(new THREE.PlaneGeometry(w - 0.4, 1.3), darkGlass);
+      screen.position.set(0, PLATFORM + 2.0, dir * (CAR_LENGTH / 2 + 0.61));
+      screen.rotation.set(dir > 0 ? -0.35 : 0.35, dir > 0 ? 0 : Math.PI, 0);
+      group.add(screen);
+      const lamps = [];
+      for (const side of [-1, 1]) {
+        const lamp = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.18, 0.05), trainHead);
+        lamp.position.set(side * 0.95, PLATFORM + 0.55, dir * (CAR_LENGTH / 2 + 0.62));
+        group.add(lamp);
+        lamps.push(lamp);
+      }
+      ends.push({ dir, lamps });
+    }
+    // a pantograph on the leading car
+    if (front) {
+      const pan = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.06, 0.3), steelMat);
+      pan.position.set(0, PLATFORM + h + 1.4, -2);
+      group.add(pan);
+      const arm = new THREE.Mesh(new THREE.BoxGeometry(0.06, 1.6, 0.06), steelMat);
+      arm.position.set(0, PLATFORM + h + 0.6, -2.3);
+      arm.rotation.x = 0.4;
+      group.add(arm);
+    }
+    scene.add(group);
+    return { group, ends };
+  }
+
+  // Each train runs to the next station, waits there with its doors open, and turns round
+  // at the end of the line.
+  function updateTrains(dt) {
+    for (const train of trains) {
+      if (train.dwell > 0) {
+        train.dwell -= dt;
+        train.speed = 0;
+      } else {
+        // the next stop ahead in the direction of travel
+        const ahead = STATIONS.map((st) => st.s).filter((s) => (s - train.s) * train.dir > 0.5);
+        const stop = ahead.length ? (train.dir > 0 ? Math.min(...ahead) : Math.max(...ahead)) : null;
+        const left = stop === null ? 0 : Math.abs(stop - train.s);
+        const braking = (train.speed * train.speed) / (2 * 0.9);
+        train.speed = left <= braking + 0.5 ? Math.max(0.6, Math.sqrt(2 * 0.9 * Math.max(0, left))) : Math.min(19, train.speed + 0.8 * dt);
+        train.s += train.dir * train.speed * dt;
+        if (stop === null || (stop - train.s) * train.dir <= 0.05) {
+          if (stop !== null) train.s = stop;
+          train.speed = 0;
+          train.dwell = 16;
+          // at the end of the line, set off back the other way
+          if (!STATIONS.some((st) => (st.s - train.s) * train.dir > 0.5)) train.dir = -train.dir;
+        }
+      }
+      const night = lampsOnNow > 0.5;
+      train.cars.forEach((c, k) => {
+        // the cars follow on behind the front, whichever way it is going
+        const s = train.s - train.dir * (k - 1.5) * (CAR_LENGTH + 0.5);
+        const p = metroPoint(s, train.off);
+        c.group.position.set(p.x, METRO_Y, p.z);
+        c.group.rotation.y = p.h;
+        for (const end of c.ends) {
+          const leading = end.dir * train.dir > 0;
+          for (const lamp of end.lamps) lamp.material = leading ? trainHead : night ? trainTail : trainDark;
+        }
+        const box = c.box;
+        Object.assign(box.car, { x: p.x, z: p.z, h: p.h });
+        box.minX = p.x - 8;
+        box.maxX = p.x + 8;
+        box.minZ = p.z - 8;
+        box.maxZ = p.z + 8;
+      });
+    }
+  }
+  let lampsOnNow = 0;
+
+  // ---------- The mall ----------
+
+  // A shopping centre out past the city's -x edge: a long two-storey block with a glass
+  // entrance hall and a curved roof, shop signs along its front, loading bays behind, and
+  // a big car park in front, reached along two streets from the city.
+  const MALL = { minX: -490, maxX: -350, minZ: -10, maxZ: 70, h: 20 };
+  const MALL_LOT = { minX: -497, maxX: -337, minZ: -208, maxZ: -26 };
+
+  function buildMall() {
+    const batch = makeBatch();
+    const { minX, maxX, minZ, maxZ, h } = MALL;
+    const cx = (minX + maxX) / 2;
+    const cz = (minZ + maxZ) / 2;
+    const w = maxX - minX;
+    const d = maxZ - minZ;
+    const wallMat = cityMaterial('concrete', 0xe3dfd6);
+    const bandMat = cityMaterial('concrete', 0xb9b4aa);
+    const glass = FACADES.glass;
+    const glassMat = glass.materials[1] || glass.materials[0];
+
+    // walls: concrete, with a two-storey band of glass along the front
+    batchWalls(batch, wallMat, footprintCorners(cx, cz, w, d), 0, h, 6);
+    batchQuad(batch, glassMat, [[maxX - 2, 1, minZ - 0.05], [minX + 2, 1, minZ - 0.05], [minX + 2, 13, minZ - 0.05], [maxX - 2, 13, minZ - 0.05]],
+      [[0, 0], [w / glass.tile, 0], [w / glass.tile, 12 / glass.tile], [0, 12 / glass.tile]]);
+    for (const y of [0.9, 7, 13]) batchBox(batch, bandMat, cx, y, minZ - 0.3, w - 3, 0.6, 0.6, 0, 4);
+    // the entrance hall: a tall glass box standing out from the middle of the front
+    const hallW = 36;
+    const hall = footprintCorners(cx, minZ - 6, hallW, 12);
+    batchWalls(batch, glassMat, hall, 0, 17, glass.tile);
+    batchLid(batch, roofConcrete, hall, 17.02);
+    batchParapet(batch, hall, 17, 0.8);
+    // a canopy over the doors
+    batchBox(batch, bandMat, cx, 5.2, minZ - 14, hallW + 6, 0.5, 5, 0, 4);
+    for (const ox of [-hallW / 2 - 2, hallW / 2 + 2]) batchBox(batch, darkMetal, cx + ox, 2.6, minZ - 15.8, 0.35, 5.2, 0.35, 0, 1);
+    // roof: flat, with a long glass vault down the middle
+    batchLid(batch, roofConcrete, footprintCorners(cx, cz, w, d), h + 0.02);
+    batchParapet(batch, footprintCorners(cx, cz, w, d), h, 1.2);
+    batchRoofPlant(batch, cx - 45, cz, 30, 50, h, false);
+    batchRoofPlant(batch, cx + 45, cz, 30, 50, h, false);
+    const vault = new THREE.Mesh(new THREE.CylinderGeometry(9, 9, w - 30, 24, 1, true, -Math.PI * 0.4, Math.PI * 0.8), reflect(new THREE.MeshPhongMaterial({
+      color: 0x86a9c6, transparent: true, opacity: 0.6, shininess: 100, specular: 0xaabbcc, side: THREE.DoubleSide, depthWrite: false,
+    }), 0.5));
+    vault.rotation.z = Math.PI / 2;
+    vault.position.set(cx, h - 5, cz);
+    scene.add(vault);
+    // loading bays at the back
+    for (let x = minX + 20; x < maxX - 20; x += 14) {
+      batchQuad(batch, rollerMat, [[x, 0, maxZ + 0.03], [x + 6, 0, maxZ + 0.03], [x + 6, 5.5, maxZ + 0.03], [x, 5.5, maxZ + 0.03]], [[0, 0], [1, 0], [1, 1], [0, 1]]);
+    }
+
+    // signs: the mall's name over the entrance, and shop names along the front, lit at night
+    const signs = ['CITY MALL', 'FASHION', 'CINEMA', 'FOOD HALL', 'SPORTS', 'HOME & GARDEN', 'ELECTRONICS', 'BOOKSHOP'];
+    const signMat = (() => {
+      const draw = (night) => canvasTexture(512, 512, (g, sw, sh) => {
+        signs.forEach((text, n) => {
+          const y0 = n * 64;
+          g.fillStyle = night ? '#000' : n ? '#2b2f36' : '#f4f1ea';
+          g.fillRect(0, y0, sw, 64);
+          g.fillStyle = night ? (n ? '#ffe9c4' : '#fff6e6') : n ? '#f2ede2' : '#b3261e';
+          g.font = `bold ${n ? 40 : 50}px Georgia, serif`;
+          g.textAlign = 'center';
+          g.textBaseline = 'middle';
+          g.fillText(text, sw / 2, y0 + 34);
+        });
+      });
+      const material = new THREE.MeshPhongMaterial({ map: draw(false), emissiveMap: draw(true), emissive: 0x000000 });
+      material.userData.glow = 1.1;
+      litMaterials.push(material);
+      return material;
+    })();
+    const sign = (n, x, y, z, sw, sh) => {
+      const v0 = 1 - (n + 1) / 8;
+      batchQuad(batch, signMat, [[x + sw / 2, y, z], [x - sw / 2, y, z], [x - sw / 2, y + sh, z], [x + sw / 2, y + sh, z]],
+        [[0, v0], [1, v0], [1, v0 + 1 / 8], [0, v0 + 1 / 8]]);
+    };
+    sign(0, cx, 17.6, minZ - 12.1, 30, 3.75);
+    [-58, -36, 36, 58].forEach((ox, k) => sign(k + 1, cx + ox, 14.2, minZ - 0.4, 16, 2));
+
+    addCollider({ minX, maxX, minZ, maxZ, maxY: h });
+    addCollider({ minX: cx - hallW / 2, maxX: cx + hallW / 2, minZ: minZ - 12, maxZ: minZ, maxY: 17 });
+    addSurface({ minX, maxX, minZ, maxZ, h0: h, h1: h });
+    addSurface({ minX: cx - hallW / 2, maxX: cx + hallW / 2, minZ: minZ - 12, maxZ: minZ, h0: 17, h1: 17 });
+
+    // --- forecourt: a paved walk along the front, with trees and benches
+    const fore = { minZ: MALL_LOT.maxZ, maxZ: minZ };
+    underfoot(flatPlane(w + 20, fore.maxZ - fore.minZ + 14, GROUND.paving[0], cx, (fore.minZ + fore.maxZ) / 2 + 7, 0.07, ...GROUND.paving.slice(1))).userData.snow = 'ground';
+    for (let x = minX + 6; x < maxX; x += 16) {
+      if (Math.abs(x - cx) < hallW / 2 + 4) continue;
+      addTree(x, fore.minZ + 6);
+    }
+
+    // --- the car park: rows of bays both sides of each aisle, lamps down the middle
+    const lot = MALL_LOT;
+    const lotW = lot.maxX - lot.minX;
+    const lotD = lot.maxZ - lot.minZ;
+    underfoot(flatPlane(lotW, lotD, GROUND.tarmac[0], (lot.minX + lot.maxX) / 2, (lot.minZ + lot.maxZ) / 2, 0.06, ...GROUND.tarmac.slice(1)));
+    for (let z = lot.maxZ - 16; z > lot.minZ + 10; z -= 26) {
+      for (const half of [-1, 1]) {
+        const x0 = half < 0 ? lot.minX + 8 : (lot.minX + lot.maxX) / 2 + 5;
+        const count = 20;
+        const mid = x0 + (count * BAY_W) / 2;
+        addBayRow(mid, z - 3.1, count);
+        addBayRow(mid, z + 3.1, count);
+        marks.push({ x: mid, z, sx: count * BAY_W, sz: 0.15 });
+        // islands with a tree at each end of the double row
+        for (const end of [-1, 1]) {
+          const ix = mid + end * ((count * BAY_W) / 2 + 2);
+          batchBox(batch, kerbMat, ix, 0.12, z, 3, 0.24, 11.5, 0, 2);
+          addTree(ix, z);
+        }
+      }
+      for (let x = lot.minX + 30; x < lot.maxX - 10; x += 34) lampSpots.push({ x, y: 0.06, z, turn: 0, tall: true, both: true });
+    }
+    // the lot's edge: a kerb with a gap at each entrance
+    const edge = (x0, z0, x1, z1) => {
+      batchBox(batch, kerbMat, (x0 + x1) / 2, 0.12, (z0 + z1) / 2, Math.abs(x1 - x0) + 0.3, 0.24, Math.abs(z1 - z0) + 0.3, 0, 2);
+      addCollider({ minX: Math.min(x0, x1) - 0.15, maxX: Math.max(x0, x1) + 0.15, minZ: Math.min(z0, z1) - 0.15, maxZ: Math.max(z0, z1) + 0.15, maxY: 0.24, top: 0.24 });
+    };
+    edge(lot.minX, lot.minZ, lot.maxX, lot.minZ);
+    edge(lot.minX, lot.minZ, lot.minX, lot.maxZ);
+    edge(lot.maxX, lot.minZ, lot.maxX, -198);
+    edge(lot.maxX, -182, lot.maxX, -46);
+    flushBatch(batch);
   }
 
   // ---------- Road details ----------
@@ -1953,7 +4478,7 @@
   const footprints = [];
   let nextFootprint = 0;
 
-  function stampFootprint(strength) {
+  function stampFootprint(strength, snow = false) {
     if (!footprints.length) {
       const sole = canvasTexture(32, 64, (g) => {
         g.fillStyle = '#fff';
@@ -1979,12 +4504,14 @@
     }
     const print = footprints[nextFootprint++ % footprints.length];
     const side = hero.foot * 0.11; // left foot is +, toward the hero's left
-    print.mesh.position.set(car.x + Math.cos(hero.facing) * side, car.y + 0.105, car.z - Math.sin(hero.facing) * side);
+    print.mesh.position.set(car.x + Math.cos(hero.facing) * side, car.y + (car.y < 0.05 ? 0.005 : 0.014), car.z - Math.sin(hero.facing) * side);
     print.mesh.rotation.y = hero.facing;
     print.mesh.scale.x = hero.foot;
     print.mesh.visible = true;
     print.strength = 0.8 * strength;
-    print.life = 14;
+    print.life = snow ? 90 : 14;
+    print.snow = snow;
+    print.mesh.material.color.setHex(snow ? 0x7c8796 : 0x0f1317); // pressed snow is blue-grey
   }
 
   // Called with the distance the hero has just walked on the ground.
@@ -2000,7 +4527,10 @@
     hero.strideLeft = 0.7 + 0.35 * hero.run;
     hero.foot = -hero.foot;
     playStep(hero.run > 0.5, wading || soaked > 0.1);
-    if (soaked > 0.08) {
+    const snowy = env.snowCover > 0.15 && car.y < 1 && coverAt(car.x, car.z) < car.y + 1.5;
+    if (snowy) {
+      stampFootprint(0.45 + 0.4 * env.snowCover, true);
+    } else if (soaked > 0.08) {
       stampFootprint(0.35 + 0.45 * soaked);
     } else if (hero.wet > 0 && !wading) {
       stampFootprint(hero.wet / WET_STEPS);
@@ -2012,7 +4542,8 @@
   function dryFootprints(dt) {
     for (const print of footprints) {
       if (print.life <= 0) continue;
-      print.life -= dt * (env.wet > 0.08 ? 0.3 : 1); // on wet ground they stay until it dries
+      // on wet ground they stay until it dries, in snow until it melts
+      print.life -= dt * (print.snow ? (env.snowCover > 0.1 ? 0.05 : 1) : env.wet > 0.08 ? 0.3 : 1);
       print.mesh.material.opacity = print.strength * Math.min(1, print.life / 6);
       if (print.life <= 0) print.mesh.visible = false;
     }
@@ -2065,7 +4596,7 @@
     // --- repaired patches: rectangles of newer, darker tarmac
     roadDecals(
       groundMaterial(0xc4c6ca, GROUND.tarmac[1], GROUND.tarmac[3], { depthWrite: false }),
-      45, 0.045, [1, 6], () => [rand(1.6, 3.4), rand(2.5, 7)], 0.1
+      45, 0.0025, [1, 6], () => [rand(1.6, 3.4), rand(2.5, 7)], 0.1
     );
 
     // --- cracks: thin wandering lines
@@ -2092,7 +4623,7 @@
       };
       wander(w / 2, 4, 2.4, 16);
     });
-    roadDecals(decal(crack), 70, 0.05, [0.8, 7], () => [rand(0.8, 1.4), rand(3, 7), rand(-0.5, 0.5)], 0.2);
+    roadDecals(decal(crack), 70, 0.003, [0.8, 7], () => [rand(0.8, 1.4), rand(3, 7), rand(-0.5, 0.5)], 0.2);
 
     // --- potholes: a broken-edged hole with rubble in it
     const pothole = canvasTexture(128, 128, (g, w, h) => {
@@ -2110,7 +4641,7 @@
         g.fillRect(w / 2 + rand(-34, 34), h / 2 + rand(-34, 34), rand(2, 5), rand(2, 5));
       }
     });
-    potholes = roadDecals(decal(pothole), 40, 0.055, [1, 6.6], () => {
+    potholes = roadDecals(decal(pothole), 40, 0.0035, [1, 6.6], () => {
       const s = rand(0.8, 1.7);
       return [s, s * rand(0.8, 1.4), rand(0, 3)];
     }, 0.3);
@@ -2136,7 +4667,7 @@
       color: 0x1c2126, alphaMap: pool, transparent: true, opacity: 0.88, depthWrite: false,
       shininess: 160, specular: 0xffffff,
     }), 0.6); // dark water with the sky and buildings showing in it
-    puddles = roadDecals(water, 70, 0.06, [3.5, 7.2], () => [rand(1.4, 3), rand(2, 5.5), rand(-0.3, 0.3)], 0.4);
+    puddles = roadDecals(water, 70, 0.004, [3.5, 7.2], () => [rand(1.4, 3), rand(2, 5.5), rand(-0.3, 0.3)], 0.4);
 
     // --- manhole covers
     const cover = canvasTexture(128, 128, (g, w, h) => {
@@ -2166,7 +4697,7 @@
       g.fillStyle = '#17181a';
       for (const a of [0.6, 3.74]) g.fillRect(c + Math.cos(a) * 36 - 4, c + Math.sin(a) * 36 - 4, 8, 8); // lifting holes
     });
-    roadDecals(decal(cover), 60, 0.065, [1.5, 6.5], () => [0.85, 0.85, rand(0, 3)], 0.5);
+    roadDecals(decal(cover), 60, 0.0045, [1.5, 6.5], () => [0.85, 0.85, rand(0, 3)], 0.5);
 
     // --- storm drains along the kerbs
     const grate = canvasTexture(128, 64, (g, w, h) => {
@@ -2175,7 +4706,7 @@
       g.fillStyle = '#0c0d0e';
       for (let x = 10; x < w - 8; x += 14) g.fillRect(x, 8, 7, h - 16);
     });
-    roadDecals(new THREE.MeshLambertMaterial({ map: grate, depthWrite: false }), 110, 0.065,
+    roadDecals(new THREE.MeshLambertMaterial({ map: grate, depthWrite: false }), 110, 0.0045,
       [ROAD_WIDTH / 2 - 0.42, ROAD_WIDTH / 2 - 0.38], () => [0.5, 0.95], 0.5);
   }
 
@@ -2305,33 +4836,52 @@
       }
     }
     // the way out to the hills, on the road that leads there
-    place(1, 38, HALF - 60, hills, 2.6, 1, 4.2);
-    place(1, 38, roadCenter(3) + JUNCTION + 14, hills, 2.6, 1, 4.2);
+    place(1, roadCenter(1), HALF - 60, hills, 2.6, 1, 4.2);
+    place(1, roadCenter(1), roadCenter(3) + JUNCTION + 14, hills, 2.6, 1, 4.2);
 
     const poles = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.04, 0.04, 1, 8), steelMat, signs.length);
     const dummy = new THREE.Object3D();
     const plate = new THREE.PlaneGeometry(1, 1);
+    const boards = new Map(); // material -> matrices: every board of a kind is one instanced mesh
     signs.forEach((sign, n) => {
       const y = groundAt(sign.x, sign.z, 1);
+      addPost(sign.x, sign.z, 0.09, y, sign.top);
       dummy.position.set(sign.x, y + sign.top / 2, sign.z);
       dummy.scale.set(1, sign.top, 1);
+      dummy.rotation.set(0, 0, 0);
       dummy.updateMatrix();
       poles.setMatrixAt(n, dummy.matrix);
       for (const [material, turn, gap] of [[sign.material.front, sign.turn, 0.062], [sign.material.back, sign.turn + Math.PI, 0.056]]) {
-        const board = new THREE.Mesh(plate, material);
-        board.scale.set(sign.width, sign.height, 1);
-        board.position.set(sign.x + Math.sin(sign.turn) * gap, y + sign.top - sign.height / 2, sign.z + Math.cos(sign.turn) * gap);
-        board.rotation.y = turn;
-        scene.add(board);
+        dummy.scale.set(sign.width, sign.height, 1);
+        dummy.position.set(sign.x + Math.sin(sign.turn) * gap, y + sign.top - sign.height / 2, sign.z + Math.cos(sign.turn) * gap);
+        dummy.rotation.set(0, turn, 0);
+        dummy.updateMatrix();
+        if (!boards.has(material)) boards.set(material, []);
+        boards.get(material).push(dummy.matrix.clone());
       }
     });
+    for (const [material, list] of boards) {
+      const mesh = new THREE.InstancedMesh(plate, material, list.length);
+      list.forEach((m, i) => mesh.setMatrixAt(i, m));
+      scene.add(mesh);
+    }
     scene.add(poles);
   }
 
   // Takes one all-round picture of the city from above a crossing and hands it to every
   // shiny material as its reflection. It is a still, so reflections do not move with you,
   // but paint, glass and puddles pick up the sky and the buildings.
-  function captureReflections() {
+  // A second picture is taken the first time night falls, with every window and lamp lit,
+  // and swapped in after dark, so wet streets and glass mirror the city's lights.
+  let reflectionNight = null;
+  let reflectionNow = null;
+  function useReflection(texture) {
+    if (!texture || texture === reflectionNow) return;
+    reflectionNow = texture;
+    for (const material of reflective) material.envMap = texture;
+  }
+
+  function captureReflections(night = false) {
     const target = new THREE.WebGLCubeRenderTarget(256, {
       generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter,
     });
@@ -2344,11 +4894,16 @@
     probe.update(renderer, scene);
     hero.model.group.visible = heroShown;
     scene.remove(probe);
+    if (night) {
+      reflectionNight = target.texture;
+      return;
+    }
     reflection = target.texture;
     for (const material of reflective) {
       material.envMap = reflection;
       material.needsUpdate = true;
     }
+    reflectionNow = reflection;
   }
 
   // ---------- Cars ----------
@@ -2545,44 +5100,409 @@
     };
   }
 
-  // --- built vehicles: saloon, hatchback, SUV, pickup, bus and motorbike ---
+  // --- the bus and the truck: loaded models ---
 
-  // Each kind is described by a side profile and a few sizes; the shapes are made once
-  // and shared by every vehicle of that kind. All lengths are metres; x runs forward.
+  // A city bus and a DAF CF tractor unit (vehicle-models.js, made by vehicle-model-build.mjs),
+  // each already in the game's frame: metres, facing +z with its left toward +x, wheels on
+  // the ground. Every part is named "role|name": wheels to spin (the front pair steer as
+  // well), the driver's door to swing, lamps to light. The rest is merged by material, so a
+  // whole bus is a couple of dozen draw calls. Materials become plain lit ones that keep the
+  // model's own pictures; the glass is properly clear (you sit behind it); and each vehicle
+  // has its own paint and livery, to tint and, if it burns, to char.
+  const VEHICLE_MODELS = {
+    bus: {
+      source: 'BUS_GLB',
+      paint: ['standard'], // its white sides
+      livery: { standard21: 1, standard111: 0.78, standard2: 'light' }, // roof, lower band, upper band
+      glass: ['glass'],
+      chrome: ['chrome', 'standard11111', 'metall'],
+      inside: ['seat', 'light', 'wood'],
+      // lamp glows [x, y, z, width, height], mirrored for the other side
+      glows: {
+        head: [0.81, 0.77, 5.515, 0.36, 0.15],
+        tail: [0.84, 0.93, -5.46, 0.15, 0.12],
+        amberRear: [0.84, 0.8, -5.46, 0.15, 0.09],
+        amberFront: [1.1, 1.08, 5.4, 0.04, 0.1],
+      },
+      seat: [3.95, 0.6], eye: 1.9, roof: 2.72, stats: { top: 24, nitroTop: 32, engine: 6, nitroEngine: 12, brake: 22, grip: 14 },
+    },
+    truck: {
+      source: 'TRUCK_GLB',
+      paint: ['Cr_Exterieur'], // the cab, white under its tint
+      glass: ['Vitre'],
+      chrome: ['Retro'],
+      inside: ['Interieur_2', 'Interieur_3', 'Interieur_4', 'Sige', 'Cr_Interieur'],
+      seat: [1.82, 0.58], eye: 2.36, roof: 3.0, stats: { top: 28, nitroTop: 36, engine: 8, nitroEngine: 15, brake: 25, grip: 15 },
+    },
+  };
+  const vehicleTemplates = {};
+  const modelGlass = reflect(new THREE.MeshPhongMaterial({
+    color: 0x9db2c4, transparent: true, opacity: 0.16, shininess: 110, specular: 0xb8c8d8, depthWrite: false, side: THREE.DoubleSide,
+  }), 0.22);
+
+  // Joins geometries (position, normal, uv) into one indexed geometry.
+  function joinGeometries(list) {
+    let vertices = 0;
+    let indices = 0;
+    for (const g of list) {
+      vertices += g.attributes.position.count;
+      indices += g.index ? g.index.count : g.attributes.position.count;
+    }
+    const position = new Float32Array(vertices * 3);
+    const normal = new Float32Array(vertices * 3);
+    const uv = new Float32Array(vertices * 2);
+    const index = vertices > 65535 ? new Uint32Array(indices) : new Uint16Array(indices);
+    let v = 0;
+    let i = 0;
+    // element by element: the loader may hand over interleaved attributes
+    const copy = (attribute, out, at, size) => {
+      if (!attribute) return;
+      for (let k = 0; k < attribute.count; k++) {
+        out[(at + k) * size] = attribute.getX(k);
+        out[(at + k) * size + 1] = attribute.getY(k);
+        if (size === 3) out[(at + k) * size + 2] = attribute.getZ(k);
+      }
+    };
+    for (const g of list) {
+      const n = g.attributes.position.count;
+      copy(g.attributes.position, position, v, 3);
+      copy(g.attributes.normal, normal, v, 3);
+      copy(g.attributes.uv, uv, v, 2);
+      if (g.index) for (let k = 0; k < g.index.count; k++) index[i++] = g.index.array[k] + v;
+      else for (let k = 0; k < n; k++) index[i++] = v + k;
+      v += n;
+    }
+    const out = new THREE.BufferGeometry();
+    out.setAttribute('position', new THREE.BufferAttribute(position, 3));
+    out.setAttribute('normal', new THREE.BufferAttribute(normal, 3));
+    out.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    out.setIndex(new THREE.BufferAttribute(index, 1));
+    out.computeBoundingSphere();
+    return out;
+  }
+
+  // The triangles of `geo` whose middles pass `keep(x, y, z)`, as a geometry of their own.
+  function pickTriangles(geo, keep) {
+    const p = geo.attributes.position;
+    const source = geo.index ? geo.index.array : Array.from({ length: p.count }, (_, k) => k);
+    const kept = [];
+    for (let t = 0; t < source.length; t += 3) {
+      const [a, b, c] = [source[t], source[t + 1], source[t + 2]];
+      if (keep((p.getX(a) + p.getX(b) + p.getX(c)) / 3, (p.getY(a) + p.getY(b) + p.getY(c)) / 3, (p.getZ(a) + p.getZ(b) + p.getZ(c)) / 3)) kept.push(a, b, c);
+    }
+    const out = geo.clone();
+    out.setIndex(kept);
+    return out;
+  }
+
+  function loadVehicleModels(done) {
+    const kinds = Object.keys(VEHICLE_MODELS).filter((kind) => window[VEHICLE_MODELS[kind].source]);
+    if (!THREE.GLTFLoader || !kinds.length) {
+      done();
+      return;
+    }
+    let left = kinds.length;
+    const finished = () => {
+      left -= 1;
+      if (!left) done();
+    };
+    for (const kind of kinds) {
+      const text = atob(window[VEHICLE_MODELS[kind].source]);
+      const bytes = new Uint8Array(text.length);
+      for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
+      new THREE.GLTFLoader().parse(bytes.buffer, '', (gltf) => {
+        vehicleTemplates[kind] = prepareVehicle(kind, gltf.scene);
+        finished();
+      }, (error) => {
+        console.warn(`The ${kind} model failed to load; using the built one.`, error);
+        finished();
+      });
+    }
+  }
+
+  // Sorts a loaded vehicle into what each copy of it needs.
+  function prepareVehicle(kind, root) {
+    const spec = VEHICLE_MODELS[kind];
+    root.updateMatrixWorld(true);
+    const materials = {}; // name -> the plain material copies are made from
+    const roles = {}; // role -> [{ geometry, name }]
+    root.traverse((o) => {
+      if (!o.isMesh) return;
+      let named = o;
+      while (named && !named.name.includes('|')) named = named.parent;
+      const role = named ? named.name.split('|')[0] : 'part';
+      const source = o.material;
+      const name = source.name;
+      if (!materials[name]) {
+        if (source.map) source.map.encoding = THREE.LinearEncoding; // the scene's other pictures are linear too
+        const shiny = spec.chrome.includes(name);
+        const material = new THREE.MeshPhongMaterial({
+          color: source.color, map: source.map, side: THREE.DoubleSide,
+          shininess: shiny ? 110 : spec.paint.includes(name) ? 70 : 18, specular: shiny ? 0xdddddd : spec.paint.includes(name) ? 0x666666 : 0x151515,
+          transparent: source.transparent && !spec.glass.includes(name), opacity: source.opacity, alphaTest: source.alphaTest,
+        });
+        if (spec.inside.includes(name)) material.userData.noSnow = true;
+        materials[name] = { material, reflect: shiny ? 0.45 : spec.paint.includes(name) ? 0.18 : 0 };
+      }
+      roles[role] = roles[role] || [];
+      roles[role].push({ geometry: joinGeometries([o.geometry]).applyMatrix4(o.matrixWorld), name });
+    });
+
+    // the body: one mesh per material
+    const byMaterial = new Map();
+    for (const part of [...(roles.part || []), ...(roles.door_r || []), ...(roles.lamp_tail || [])]) {
+      if (!byMaterial.has(part.name)) byMaterial.set(part.name, []);
+      byMaterial.get(part.name).push(part.geometry);
+    }
+    const chunks = [...byMaterial].map(([name, list]) => ({ name, geometry: joinGeometries(list) }));
+
+    // wheels round their own middles: the front pair each on its own, the back axle as one
+    const box = new THREE.Box3();
+    const centre = new THREE.Vector3();
+    const wheels = {};
+    for (const role of ['wheel_fl', 'wheel_fr', 'wheel_r']) {
+      const list = roles[role] || [];
+      box.makeEmpty();
+      for (const part of list) box.expandByObject(new THREE.Mesh(part.geometry));
+      box.getCenter(centre);
+      if (role === 'wheel_r') centre.x = 0;
+      // one mesh per material: tyres together, rims together
+      const same = new Map();
+      for (const part of list) {
+        if (!same.has(part.name)) same.set(part.name, []);
+        same.get(part.name).push(part.geometry.translate(-centre.x, -centre.y, -centre.z));
+      }
+      wheels[role] = {
+        at: centre.clone(),
+        radius: (box.max.y - box.min.y) / 2,
+        parts: [...same].map(([name, geometries]) => ({ name, geometry: joinGeometries(geometries) })),
+      };
+    }
+
+    // the driver's door hangs on its front edge
+    let door = null;
+    if (roles.door_l) {
+      box.makeEmpty();
+      for (const part of roles.door_l) box.expandByObject(new THREE.Mesh(part.geometry));
+      const hinge = new THREE.Vector3(box.max.x - 0.03, 0, box.max.z - 0.04);
+      door = { at: hinge, parts: roles.door_l.map((part) => ({ name: part.name, geometry: part.geometry.translate(-hinge.x, 0, -hinge.z) })) };
+    }
+
+    // the lamp lenses: those at the front are the headlamps, those at the back the tail lamps
+    let lamps = null;
+    if (roles.lamps) {
+      const lens = roles.lamps[0];
+      const front = pickTriangles(lens.geometry, (x, y, z) => z > 0);
+      const back = pickTriangles(lens.geometry, (x, y, z) => z < 0);
+      front.computeBoundingBox();
+      lamps = { name: lens.name, front, back, frontBox: front.boundingBox.clone() };
+    }
+
+    const all = new THREE.Box3().setFromObject(root);
+    const wb = wheels.wheel_fl.at.z - wheels.wheel_r.at.z;
+    return {
+      materials, chunks, wheels, door, lamps,
+      dims: { hl: (all.max.z - all.min.z) / 2, hw: Math.min(1.3, (all.max.x - all.min.x) / 2 - 0.1), wb },
+    };
+  }
+
+  // A glow on a lamp: a small flat shape that adds its light, set each frame from the stand-in
+  // the lighting code works through (see lampMaterial) by `bright`.
+  function lampGlow(w, h, x, y, z, back, standIn, bright) {
+    const material = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false });
+    const glow = new THREE.Mesh(new THREE.PlaneGeometry(w, h), material);
+    glow.position.set(x, y, z);
+    if (back) glow.rotation.y = Math.PI;
+    glow.renderOrder = 3;
+    glow.onBeforeRender = () => bright(standIn.color, material.color);
+    return glow;
+  }
+  // how the stand-ins' colours turn to light: headlamps are dark by day and white at night
+  // (or when you switch them on), tail lamps glow faintly and flare when braking, and
+  // indicators blink
+  const headGlow = (c, out) => out.setRGB(1, 0.95, 0.82).multiplyScalar(Math.max(0, Math.min(1, (c.r - 0.74) / 0.25)));
+  const tailGlow = (c, out) => out.setRGB(c.r, c.g * 0.6, c.b * 0.6).multiplyScalar(c.r > 0.7 ? 1 : 0.35);
+  const amberGlow = (c, out) => out.setRGB(1, 0.6, 0.1).multiplyScalar(c.r > 0.6 ? 1 : 0);
+
+  function createModelVehicle(color, kind) {
+    const t = vehicleTemplates[kind];
+    const spec = VEHICLE_MODELS[kind];
+    const group = new THREE.Group();
+    const detail = new THREE.Group(); // inside, and small: dropped far off (see updateVehicleDetail)
+    group.add(detail);
+
+    // this vehicle's own copy of each material, to tint and to char
+    const own = new Map();
+    const mine = (name) => {
+      if (!own.has(name)) {
+        const base = t.materials[name];
+        const copy = base.material.clone();
+        if (base.reflect) reflect(copy, base.reflect);
+        own.set(name, copy);
+      }
+      return own.get(name);
+    };
+    const paint = mine(spec.paint[0]);
+    if (kind === 'truck') paint.color.setHex(color); // the cab: white, so it takes the tint
+    if (spec.livery && color !== BUS_COLORS[0]) {
+      // the bands and roof in this bus company's colours (the first colour keeps the red and orange)
+      const tint = new THREE.Color(color);
+      for (const [name, how] of Object.entries(spec.livery)) {
+        const c = mine(name).color;
+        if (how === 'light') c.copy(tint).lerp(new THREE.Color(0xffffff), 0.45);
+        else c.copy(tint).multiplyScalar(how);
+      }
+    }
+
+    const meshFor = (geometry, name, parent) => {
+      const glass = spec.glass.includes(name);
+      const mesh = new THREE.Mesh(geometry, glass ? modelGlass : mine(name));
+      if (glass) mesh.renderOrder = 2;
+      else mesh.castShadow = !spec.inside.includes(name);
+      parent.add(mesh);
+      return mesh;
+    };
+    const deform = [];
+    const glassParts = [];
+    for (const chunk of t.chunks) {
+      const mesh = meshFor(chunk.geometry, chunk.name, spec.inside.includes(chunk.name) ? detail : group);
+      if (spec.paint.includes(chunk.name) || (spec.livery && chunk.name in spec.livery)) deform.push(mesh);
+      if (spec.glass.includes(chunk.name)) glassParts.push(mesh);
+    }
+
+    // wheels
+    const wheels = [];
+    const frontPivots = [];
+    for (const role of ['wheel_fl', 'wheel_fr', 'wheel_r']) {
+      const w = t.wheels[role];
+      const wheel = new THREE.Group();
+      for (const part of w.parts) meshFor(part.geometry, part.name, wheel);
+      if (role === 'wheel_r') {
+        wheel.position.copy(w.at);
+        group.add(wheel);
+      } else {
+        const pivot = new THREE.Group();
+        pivot.position.copy(w.at);
+        pivot.add(wheel);
+        group.add(pivot);
+        frontPivots.push(pivot);
+      }
+      wheels.push(wheel);
+    }
+
+    // the driver's door
+    let door = null;
+    if (t.door) {
+      door = new THREE.Group();
+      door.position.copy(t.door.at);
+      for (const part of t.door.parts) {
+        const mesh = meshFor(part.geometry, part.name, door);
+        if (spec.glass.includes(part.name)) glassParts.push(mesh);
+        else if (spec.paint.includes(part.name)) deform.push(mesh);
+      }
+      group.add(door);
+    }
+
+    // lamps, worked through stand-ins like every other vehicle's
+    const headMat = { color: new THREE.Color(headlightMat.color.getHex()), userData: {} };
+    const tailMat = { color: new THREE.Color(tailIdle), userData: {} };
+    const amberL = { color: new THREE.Color(AMBER_OFF), userData: {} };
+    const amberR = { color: new THREE.Color(AMBER_OFF), userData: {} };
+    headMats.push(headMat);
+    if (t.lamps) {
+      // the model's own lenses, lit from within
+      for (const [geometry, standIn, bright] of [[t.lamps.front, headMat, headGlow], [t.lamps.back, tailMat, tailGlow]]) {
+        const lens = mine(t.lamps.name).clone();
+        lens.emissive = new THREE.Color(0);
+        own.set(`lens ${standIn === headMat ? 'front' : 'back'}`, lens); // scorched with the rest if it burns
+        const mesh = new THREE.Mesh(geometry, lens);
+        mesh.onBeforeRender = () => bright(standIn.color, lens.emissive);
+        group.add(mesh);
+      }
+      const b = t.lamps.frontBox;
+      for (const side of [1, -1]) group.add(lampGlow(0.1, 0.09, side * (b.max.x - 0.07), (b.min.y + b.max.y) / 2, b.max.z + 0.012, false, side > 0 ? amberL : amberR, amberGlow));
+      for (const side of [1, -1]) group.add(lampGlow(0.12, 0.1, side * 0.95, 0.72, -t.dims.hl + 0.06, true, side > 0 ? amberL : amberR, amberGlow));
+    }
+    if (spec.glows) {
+      const add = ([x, y, z, w, h], standIn, bright, both = true) => {
+        for (const side of both ? [1, -1] : [1]) {
+          const which = typeof standIn === 'function' ? standIn(side) : standIn;
+          group.add(lampGlow(w, h, side * x, y, z, z < 0, which, bright));
+        }
+      };
+      add(spec.glows.head, headMat, headGlow);
+      add(spec.glows.tail, tailMat, tailGlow);
+      add(spec.glows.amberFront, (side) => (side > 0 ? amberL : amberR), amberGlow);
+      add(spec.glows.amberRear, (side) => (side > 0 ? amberL : amberR), amberGlow);
+    }
+
+    const flame = new THREE.Mesh(
+      new THREE.ConeGeometry(0.28, 1.6, 10),
+      new THREE.MeshBasicMaterial({ color: 0xff9a1f, transparent: true, opacity: 0.85 })
+    );
+    flame.rotation.x = -Math.PI / 2;
+    flame.position.set(0.6, 0.5, -t.dims.hl - 0.75);
+    flame.visible = false;
+    group.add(flame);
+
+    scene.add(group);
+    return {
+      steeringWheel: new THREE.Group(), // the model's own wheel is part of its dashboard
+      group, detail, wheels, frontPivots, tailMat, headMat, amberL, amberR, flame, kind, paint, door, deform, glassParts,
+      dims: { ...t.dims }, stats: { ...spec.stats, eye: spec.eye }, seat: spec.seat, seatY: spec.eye - 0.76, roof: spec.roof,
+      spin: 1, steerAxis: 'z', steerTurn: 1,
+      // you sit in the real cab: nothing to add for the inside view, nothing to hide
+      interior: new THREE.Group(), interiorAlways: true, cabin: new THREE.Group(),
+      materials: [...own.values()], // everything of its own, charred if it burns
+      model: true,
+    };
+  }
+
+  // --- built vehicles: saloon, hatchback, SUV, pickup, bus, box truck and motorbike ---
+
+  // A car's body is a smooth surface swept along its length. At each point along the car
+  // its cross-section is a rounded box: from the sill to the top of the bonnet, boot or
+  // waistline, its width eased in toward the nose and tail so the corners are rounded in
+  // plan, and pinched up over each wheel to make the arches. The glasshouse on top is a
+  // second, narrower sweep from the windscreen's foot to the rear window's. Paint, glass,
+  // pillars, shut lines, trim and lamps are all patches of those two surfaces, or small
+  // parts set onto them, built once for each kind and shared by every car of that kind.
+  //
+  // Lengths are metres; z runs forward from the middle of the car, x to its left.
   const KINDS = {
     sedan: {
-      len: 4.6, width: 1.84, wb: 2.7, r: 0.36, g: 0.28, waist: 0.95,
-      upper: [[2.3, 0.45], [2.28, 0.68], [2.0, 0.82], [1.1, 0.93], [0, 0.97], [-1.3, 0.97], [-2.05, 0.93], [-2.28, 0.78], [-2.3, 0.5], [-2.2, 0.33]],
-      glass: [[1.02, 0.93], [0.32, 1.38], [-0.8, 1.4], [-1.55, 0.97]],
-      seat: [0.0, 0.4], seatY: 0.44, eye: 1.2,
+      len: 4.78, width: 1.84, wb: 2.8, r: 0.33, clear: 0.17, nose: 0.68, hood: 0.94, belt: 0.99, deck: 1.02, tail: 0.92,
+      hoodLen: 1.42, shield: 0.82, roofLen: 1.02, rearGlass: 0.66, roof: 1.45, roofW: 0.62, beltW: 0.75, quarter: 0.3,
+      doors: 4, seat: [0.02, 0.38], seatY: 0.44, eye: 1.2,
       stats: { top: 40, nitroTop: 58, engine: 15, nitroEngine: 32, brake: 34, grip: 18 },
     },
     hatch: {
-      len: 4.0, width: 1.76, wb: 2.5, r: 0.34, g: 0.27, waist: 0.96,
-      upper: [[2.0, 0.45], [1.98, 0.7], [1.7, 0.84], [0.95, 0.95], [0, 0.98], [-1.5, 0.98], [-1.95, 0.9], [-2.0, 0.55], [-1.9, 0.32]],
-      glass: [[0.97, 0.95], [0.32, 1.42], [-1.3, 1.45], [-1.88, 1.0]],
-      seat: [0.0, 0.38], seatY: 0.46, eye: 1.24,
+      len: 4.1, width: 1.78, wb: 2.56, r: 0.31, clear: 0.16, nose: 0.7, hood: 0.92, belt: 0.98, deck: 1.0, tail: 0.99,
+      hoodLen: 1.12, shield: 0.8, roofLen: 1.45, rearGlass: 0.34, roof: 1.48, roofW: 0.62, beltW: 0.73, quarter: 0.16,
+      doors: 4, seat: [0.0, 0.37], seatY: 0.46, eye: 1.24,
       stats: { top: 37, nitroTop: 54, engine: 14, nitroEngine: 30, brake: 34, grip: 18 },
     },
     suv: {
-      len: 4.7, width: 1.94, wb: 2.8, r: 0.42, g: 0.36, waist: 1.15,
-      upper: [[2.35, 0.6], [2.33, 0.9], [2.05, 1.06], [1.1, 1.14], [0, 1.16], [-1.8, 1.16], [-2.3, 1.1], [-2.35, 0.7], [-2.25, 0.41]],
-      glass: [[1.07, 1.14], [0.47, 1.68], [-1.85, 1.72], [-2.26, 1.18]],
-      seat: [0.1, 0.42], seatY: 0.64, eye: 1.48,
+      len: 4.78, width: 1.94, wb: 2.86, r: 0.38, clear: 0.24, nose: 0.9, hood: 1.11, belt: 1.17, deck: 1.19, tail: 1.17,
+      hoodLen: 1.28, shield: 0.8, roofLen: 1.98, rearGlass: 0.3, roof: 1.76, roofW: 0.72, beltW: 0.8, quarter: 0.2,
+      doors: 4, rails: true, seat: [0.1, 0.42], seatY: 0.64, eye: 1.48,
       stats: { top: 36, nitroTop: 52, engine: 13, nitroEngine: 28, brake: 31, grip: 16 },
     },
     pickup: {
-      len: 5.3, width: 1.96, wb: 3.3, r: 0.42, g: 0.36, waist: 1.17,
-      upper: [[2.65, 0.62], [2.62, 0.95], [2.3, 1.1], [1.4, 1.17], [0.2, 1.18], [-0.5, 1.12], [-2.5, 1.12], [-2.65, 1.05], [-2.65, 0.6], [-2.55, 0.41]],
-      glass: [[1.37, 1.17], [0.82, 1.72], [-0.22, 1.74], [-0.42, 1.18]],
-      bed: [-2.5, -0.6], seat: [0.5, 0.42], seatY: 0.68, eye: 1.52,
+      len: 5.36, width: 1.98, wb: 3.4, r: 0.39, clear: 0.26, nose: 0.96, hood: 1.15, belt: 1.21, deck: 1.21, tail: 1.18,
+      hoodLen: 1.36, shield: 0.72, roofLen: 1.0, rearGlass: 0.06, roof: 1.84, roofW: 0.74, beltW: 0.81, quarter: 0.05,
+      doors: 4, bed: true, seat: [0.5, 0.42], seatY: 0.68, eye: 1.52,
       stats: { top: 34, nitroTop: 50, engine: 12, nitroEngine: 26, brake: 29, grip: 15 },
     },
     bus: {
-      len: 10.5, width: 2.5, wb: 5.6, r: 0.5, g: 0.4, waist: 3.0, bus: true,
-      upper: [[5.25, 0.7], [5.25, 2.75], [5.0, 3.0], [0, 3.02], [-5.0, 3.0], [-5.25, 2.75], [-5.25, 0.7], [-5.15, 0.45]],
-      seat: [4.3, 0.72], seatY: 1.2, eye: 2.1,
+      len: 11, width: 2.55, wb: 5.9, r: 0.5, clear: 0.34, roof: 3.12, bus: true, front: 2.45,
+      seat: [4.45, 0.72], seatY: 1.2, eye: 2.1,
       stats: { top: 24, nitroTop: 32, engine: 6, nitroEngine: 12, brake: 22, grip: 14 },
+    },
+    truck: {
+      len: 7.4, width: 2.42, wb: 4.3, r: 0.48, clear: 0.42, roof: 3.55, truck: true, front: 1.45,
+      seat: [2.75, 0.55], seatY: 1.35, eye: 2.25,
+      stats: { top: 27, nitroTop: 36, engine: 7, nitroEngine: 14, brake: 24, grip: 14 },
     },
     moto: {
       len: 2.1, width: 0.8, wb: 1.44, r: 0.32, moto: true,
@@ -2590,162 +5510,790 @@
       stats: { top: 46, nitroTop: 66, engine: 22, nitroEngine: 40, brake: 32, grip: 20 },
     },
   };
-  const TRAFFIC_COLORS = [0xf2f2f2, 0xd9dcdf, 0x1d1f24, 0x2b2f38, 0x8b9096, 0x9aa0a8, 0x1f3f7a, 0x7a1d1d, 0x2f5d44, 0xb8a27a, 0x5a6b7d];
+  const TRAFFIC_COLORS = [0xf2f2f2, 0xd9dcdf, 0x1d1f24, 0x2b2f38, 0x8b9096, 0x9aa0a8, 0x1f3f7a, 0x7a1d1d, 0x2f5d44, 0xb8a27a, 0x5a6b7d, 0x3c4e63, 0x9a2f2f];
+  const BUS_COLORS = [0xd8dde2, 0x1f5fbf, 0xc0392b, 0x2c8a57];
+  const TRUCK_COLORS = [0xf2f2f2, 0xe6e1d3, 0x2b5d8a, 0xb03a2e];
   const cabinGlass = reflect(new THREE.MeshPhongMaterial({
-    color: 0x1f2b38, transparent: true, opacity: 0.55, shininess: 100, specular: 0x9fb4c8, depthWrite: false,
-  }), 0.4);
+    color: 0x1f2b38, transparent: true, opacity: 0.62, shininess: 110, specular: 0xb0c4d8, depthWrite: false,
+  }), 0.45);
   const darkGlass = reflect(new THREE.MeshPhongMaterial({ color: 0x18222d, shininess: 100, specular: 0x9fb4c8 }), 0.45);
   const seatMat = new THREE.MeshLambertMaterial({ color: 0x24262b });
+  seatMat.userData.noSnow = true; // inside the car
   const bedMat = new THREE.MeshLambertMaterial({ color: 0x1a1b1e });
   const steeringGeo = new THREE.TorusGeometry(0.17, 0.022, 8, 20);
+  // black plastic, rubber, chrome, number plates, grilles: one material, coloured per corner
+  const trimMat = reflect(new THREE.MeshPhongMaterial({ vertexColors: true, shininess: 60, specular: 0x555555, side: THREE.DoubleSide }), 0.25);
+  const wheelMat2 = reflect(new THREE.MeshPhongMaterial({ vertexColors: true, shininess: 50, specular: 0x666666, side: THREE.DoubleSide }), 0.3);
+  const TRIM = { black: 0x141517, plastic: 0x23252a, chrome: 0xd6dade, plate: 0xeeeeea, grille: 0x0c0d0f, liner: 0x0a0a0b, steel: 0x6d7177, red: 0xa01818 };
 
   for (const kind of Object.values(KINDS)) {
     kind.dims = { hl: kind.len / 2, hw: kind.width / 2, wb: kind.wb };
     kind.stats.eye = kind.eye;
-    if (kind.moto) continue;
-    const h = kind.len / 2;
-    const arch = 2 * kind.r + 0.06 - kind.g; // an arch clears the top of its wheel
-    const body = new THREE.Shape();
-    body.moveTo(-h + 0.1, kind.g + 0.05);
-    body.lineTo(-kind.wb / 2 - arch, kind.g);
-    body.absarc(-kind.wb / 2, kind.g, arch, Math.PI, 0, true);
-    body.lineTo(kind.wb / 2 - arch, kind.g);
-    body.absarc(kind.wb / 2, kind.g, arch, Math.PI, 0, true);
-    body.lineTo(h - 0.1, kind.g + 0.05);
-    body.splineThru(kind.upper.map(([x, y]) => new THREE.Vector2(x, y)));
-    kind.bodyGeo = extrudeAcross(body, kind.width, kind.bus ? 0.14 : 0.12);
-    if (kind.glass) {
-      const [front, roofFront, roofRear, rear] = kind.glass;
-      const glass = new THREE.Shape();
-      glass.moveTo(front[0], front[1]);
-      glass.lineTo(roofFront[0], roofFront[1]);
-      glass.lineTo(roofRear[0], roofRear[1]);
-      glass.lineTo(rear[0], rear[1]);
-      kind.glassGeo = extrudeAcross(glass, kind.width - 0.2, 0.15);
-      const roof = new THREE.Shape();
-      roof.moveTo(roofFront[0] + 0.06, roofFront[1] - 0.03);
-      roof.quadraticCurveTo((roofFront[0] + roofRear[0]) / 2, roofFront[1] + 0.09, roofRear[0] - 0.06, roofRear[1] - 0.03);
-      roof.lineTo(roofRear[0] + 0.02, roofRear[1] - 0.06);
-      roof.lineTo(roofFront[0] - 0.02, roofFront[1] - 0.06);
-      kind.roofGeo = extrudeAcross(roof, kind.width - 0.36, 0.06);
-      kind.roof = roofFront[1] + 0.05;
+  }
+
+  // --- shaping ---
+
+  const smoothBetween = (a, b, v) => smooth((v - a) / (b - a));
+
+  // Where the stations of a car's shape lie along it, and its outline from the side.
+  function carProfile(k) {
+    const zF = k.len / 2;
+    const zT = -k.len / 2;
+    const zA = zF - k.hoodLen; // foot of the windscreen
+    const zR1 = zA - k.shield; // top of the windscreen
+    const zR2 = zR1 - k.roofLen; // top of the rear window
+    const zC = zR2 - k.rearGlass; // foot of the rear window
+    const zB = zA - (zA - zC) * (k.doors === 4 ? 0.47 : 0.62); // the pillar between the doors
+    const wheelZ = [k.wb / 2, -k.wb / 2];
+    // the top of the lower body: bumper up to bonnet, waistline, boot lid down to the tail
+    const top = (z) => {
+      if (z > zA) {
+        const bonnet = k.hood + (k.belt - k.hood) * smooth((zF - 0.4 - z) / (k.hoodLen - 0.4));
+        return k.nose + (bonnet - k.nose) * smoothBetween(zF, zF - 0.42, z);
+      }
+      if (z > zC) return k.belt + (k.deck - k.belt) * (zA - z) / (zA - zC);
+      return k.tail + (k.deck - k.tail) * smoothBetween(zT, Math.min(zC, zT + 0.45), z);
+    };
+    // the bottom: the sill, lifted toward the bumpers and arched over each wheel
+    const arch = k.r + 0.07;
+    const bottom = (z) => {
+      let y = k.clear + 0.13 * smoothBetween(k.len / 2 - 0.55, k.len / 2, Math.abs(z));
+      for (const wz of wheelZ) {
+        const d = z - wz;
+        if (Math.abs(d) < arch) y = Math.max(y, k.r + Math.sqrt(arch * arch - d * d) * 0.97);
+      }
+      return y;
+    };
+    // the glasshouse: the windscreen rising to the roof, the roof, the rear window falling to the boot
+    const roofAt = (z) => {
+      if (z >= zA || z <= zC) return null;
+      const crown = k.roof + 0.018 * (1 - ((z - (zR1 + zR2) / 2) / (k.roofLen / 2 + 0.01)) ** 2);
+      if (z > zR1) {
+        const t = (zA - z) / k.shield;
+        return top(z) + (crown - top(z)) * (1 - (1 - t) ** 1.6);
+      }
+      if (z < zR2) {
+        const t = (z - zC) / Math.max(0.05, k.rearGlass);
+        return top(z) + (crown - top(z)) * (1 - (1 - t) ** 1.4);
+      }
+      return crown;
+    };
+    // half the width at z, rounded off toward each end in plan
+    const half = (z, w) => {
+      const u = Math.min(1, Math.abs(z) / (k.len / 2));
+      const e = z > 0 ? 7 : 8;
+      return w * Math.pow(Math.max(0, 1 - Math.pow(u, e)), 1 / e);
+    };
+    return { k, zF, zT, zA, zR1, zR2, zC, zB, wheelZ, top, bottom, roofAt, half };
+  }
+
+  // A point on the lower body at (z, t): t runs from the middle of the underside (0) out
+  // round the sill (0.12-0.2), up the side (0.2-0.7), over the shoulder (0.7-0.85) and in
+  // across the bonnet, waist or boot to the middle of the top (1). Returns [x, y] on the
+  // left side. `n` gives the boxy, evenly rounded section used for buses and trucks.
+  function lowerPoint(p, z, t, n = 0) {
+    const y0 = p.bottom(z);
+    const y1 = p.top(z);
+    const w = p.half(z, p.k.width / 2);
+    if (n) {
+      const phi = -Math.PI / 2 + Math.PI * t;
+      const c = Math.max(0, Math.cos(phi));
+      const s = Math.sin(phi);
+      const x = w * Math.pow(c, 2 / n) * (1 - 0.03 * Math.max(0, s) ** 1.5);
+      return [x, (y0 + y1) / 2 + ((y1 - y0) / 2) * Math.sign(s) * Math.pow(Math.abs(s), 2 / n)];
+    }
+    const h = Math.max(0.01, y1 - y0);
+    const rb = Math.min(0.08, h * 0.3, w * 0.45);
+    // the shoulder keeps its size over the wheel arches, where the side is cut short
+    const rs = Math.max(0.01, Math.min(0.12, (y1 - p.k.clear) * 0.38, w * 0.5, h - rb - 0.01));
+    const lean = Math.min(0.045, w * 0.08); // the sides lean in a little toward the top
+    const crown = Math.min(0.03, h * 0.1);
+    if (t < 0.12) return [(w - rb) * (t / 0.12), y0];
+    if (t < 0.2) {
+      const a = -Math.PI / 2 + (Math.PI / 2) * ((t - 0.12) / 0.08);
+      return [w - rb + rb * Math.cos(a), y0 + rb + rb * Math.sin(a)];
+    }
+    if (t < 0.7) {
+      const u = (t - 0.2) / 0.5;
+      // a gentle bulge at the middle of the side, where the wheels sit
+      return [w - lean * u * u + 0.012 * Math.sin(u * Math.PI), y0 + rb + (h - rb - rs) * u];
+    }
+    if (t < 0.85) {
+      const a = (Math.PI / 2) * ((t - 0.7) / 0.15);
+      const cx = w - lean - rs;
+      return [cx + rs * Math.cos(a), y1 - rs + rs * Math.sin(a)];
+    }
+    const u = (t - 0.85) / 0.15;
+    return [(w - lean - rs) * (1 - u), y1 + crown * Math.sin((u * Math.PI) / 2)];
+  }
+
+  // A point on the glasshouse at (z, t): the side glass leaning in from its foot on the
+  // shoulder (0) to the roof's edge (0.6), round the edge (0.6-0.8), across the roof (1).
+  function upperPoint(p, z, t) {
+    const yb = p.top(z) - 0.01;
+    const yr = p.roofAt(z) ?? yb;
+    const wb = p.half(z, p.k.beltW);
+    const wr = Math.min(wb, p.half(z, p.k.roofW) + 0.02);
+    const h = Math.max(0.001, yr - yb);
+    const rr = Math.min(0.1, h * 0.45, wr * 0.4);
+    if (t < 0.6) {
+      const u = t / 0.6;
+      return [wb + (wr - wb) * u, yb + (h - rr) * u];
+    }
+    if (t < 0.8) {
+      const a = (Math.PI / 2) * ((t - 0.6) / 0.2);
+      return [wr - rr + rr * Math.cos(a), yr - rr + rr * Math.sin(a)];
+    }
+    const u = (t - 0.8) / 0.2;
+    return [(wr - rr) * (1 - u), yr + 0.012 * Math.sin((u * Math.PI) / 2)];
+  }
+
+  // A patch of a swept surface over z0..z1 and t0..t1, both sides of the car (or `sides`),
+  // pushed `offset` metres out along its normal. Returns a BufferGeometry.
+  function surfacePatch(point, z0, z1, t0, t1, nz, nt, offset = 0, sides = [1, -1]) {
+    const positions = [];
+    const normals = [];
+    const uvs = [];
+    const index = [];
+    const e = 1e-3;
+    const pos = (z, t) => {
+      const [x, y] = point(z, t);
+      return [x, y, z];
+    };
+    for (const side of sides) {
+      const base = positions.length / 3;
+      for (let i = 0; i <= nz; i++) {
+        // closer together toward the ends of the patch, where a body curves round fastest
+        const z = z0 + (z1 - z0) * (0.5 - 0.5 * Math.cos((Math.PI * i) / nz));
+        for (let j = 0; j <= nt; j++) {
+          const t = t0 + ((t1 - t0) * j) / nt;
+          const p = pos(z, t);
+          const a = pos(z + e, t);
+          const b = pos(z - e, t);
+          const c = pos(z, Math.min(1, t + e));
+          const d = pos(z, Math.max(0, t - e));
+          // outward: (along t) x (along z)
+          const tz = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+          const tt = [c[0] - d[0], c[1] - d[1], c[2] - d[2]];
+          let nx = tt[1] * tz[2] - tt[2] * tz[1];
+          let ny = tt[2] * tz[0] - tt[0] * tz[2];
+          let nzz = tt[0] * tz[1] - tt[1] * tz[0];
+          const len = Math.hypot(nx, ny, nzz);
+          if (len < 1e-9) {
+            nx = 0;
+            ny = t > 0.5 ? 1 : -1;
+            nzz = 0;
+          } else {
+            nx /= len;
+            ny /= len;
+            nzz /= len;
+          }
+          positions.push(side * (p[0] + nx * offset), p[1] + ny * offset, p[2] + nzz * offset);
+          normals.push(side * nx, ny, nzz);
+          // u runs front to back on the left side and back to front on the right, so a
+          // picture on the panel reads left to right from either side
+          uvs.push(side > 0 ? 1 - i / nz : i / nz, j / nt);
+        }
+      }
+      for (let i = 0; i < nz; i++) {
+        for (let j = 0; j < nt; j++) {
+          const a = base + i * (nt + 1) + j;
+          const b = a + nt + 1;
+          const c = b + 1;
+          const d = a + 1;
+          if (side > 0) index.push(a, c, b, a, d, c);
+          else index.push(a, b, c, a, c, d);
+        }
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+    geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+    geo.setIndex(index);
+    return geo;
+  }
+
+  // Joins geometries into one, painting each with a colour if given (for the trim).
+  function mergeParts(list) {
+    const positions = [];
+    const normals = [];
+    const colors = [];
+    const uvs = [];
+    const tint = new THREE.Color();
+    for (const [geo0, color] of list) {
+      const geo = geo0.index ? geo0.toNonIndexed() : geo0;
+      if (!geo.attributes.normal) geo.computeVertexNormals();
+      positions.push(...geo.attributes.position.array);
+      normals.push(...geo.attributes.normal.array);
+      if (geo.attributes.uv) uvs.push(...geo.attributes.uv.array);
+      else for (let i = 0; i < geo.attributes.position.count; i++) uvs.push(0, 0);
+      tint.setHex(color ?? 0xffffff);
+      for (let i = 0; i < geo.attributes.position.count; i++) colors.push(tint.r, tint.g, tint.b);
+    }
+    const out = new THREE.BufferGeometry();
+    out.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    out.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+    out.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    out.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+    return out;
+  }
+
+  // A box, rounded box or ellipsoid placed at (x, y, z) and turned, as a geometry.
+  const placed = (geo, x, y, z, rx = 0, ry = 0, rz = 0) => geo.applyMatrix4(
+    new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(rx, ry, rz)).setPosition(x, y, z));
+  const boxAt = (w, h, d, x, y, z, rx, ry, rz) => placed(new THREE.BoxGeometry(w, h, d), x, y, z, rx, ry, rz);
+  const blobAt = (w, h, d, x, y, z, rx, ry, rz) => placed(new THREE.SphereGeometry(0.5, 10, 6).scale(w, h, d), x, y, z, rx, ry, rz);
+  const both = (make) => [make(1), make(-1)];
+
+  // How far forward (or back, with front false) the body reaches at a side offset x and
+  // height y: where to set lamps and grilles so they sit on its face.
+  function faceZ(p, x, y, front) {
+    const section = p.section || ((z, t) => lowerPoint(p, z, t));
+    const reachAt = (z) => {
+      let prev = section(z, 0);
+      for (let i = 1; i <= 48; i++) {
+        const cur = section(z, i / 48);
+        if ((prev[1] - y) * (cur[1] - y) <= 0 && cur[1] !== prev[1]) {
+          const f = (y - prev[1]) / (cur[1] - prev[1]);
+          return prev[0] + (cur[0] - prev[0]) * f;
+        }
+        prev = cur;
+      }
+      return 0;
+    };
+    let lo = 0;
+    let hi = p.k.len / 2;
+    for (let i = 0; i < 22; i++) {
+      const mid = (lo + hi) / 2;
+      if (reachAt(front ? mid : -mid) >= Math.abs(x)) lo = mid;
+      else hi = mid;
+    }
+    return front ? lo : -lo;
+  }
+
+  // --- wheels ---
+
+  // A tyre with rounded shoulders and a tread, on a five-spoke alloy with a brake disc
+  // behind it: one geometry per size, coloured per part. Its axle runs along x.
+  const wheelShapes = new Map();
+  function wheelGeometry(r, width, style = 'alloy') {
+    const key = `${r}|${width}|${style}`;
+    if (wheelShapes.has(key)) return wheelShapes.get(key);
+    const parts = [];
+    // tyre: a lathe of its cross-section round the axle
+    const rim = r * 0.64;
+    const profile = [];
+    const hw = width / 2;
+    for (let i = 0; i <= 8; i++) {
+      const a = (i / 8) * Math.PI;
+      profile.push(new THREE.Vector2(rim + (r - rim) * Math.sin(a) ** 0.35, -hw * Math.cos(a)));
+    }
+    const tyre = new THREE.LatheGeometry(profile, 20).rotateZ(Math.PI / 2);
+    parts.push([tyre, TRIM.black]);
+    if (style === 'steel') {
+      parts.push([new THREE.CylinderGeometry(rim, rim, width * 0.7, 20).rotateZ(Math.PI / 2), TRIM.steel]);
+      parts.push([new THREE.CylinderGeometry(rim * 0.35, rim * 0.35, width * 0.8, 10).rotateZ(Math.PI / 2), TRIM.chrome]);
     } else {
-      kind.roof = kind.waist;
+      // the barrel, dark inside, and the brake disc
+      parts.push([new THREE.CylinderGeometry(rim, rim, width * 0.85, 14, 1, true).rotateZ(Math.PI / 2), TRIM.plastic]);
+      parts.push([new THREE.CylinderGeometry(rim * 0.82, rim * 0.82, 0.03, 14).rotateZ(Math.PI / 2).translate(-width * 0.1, 0, 0), TRIM.steel]);
+      // the face: a ring, five spokes and a hub
+      const face = new THREE.Shape();
+      face.absarc(0, 0, rim, 0, Math.PI * 2, false);
+      const hole = new THREE.Path();
+      hole.absarc(0, 0, rim * 0.86, 0, Math.PI * 2, true);
+      face.holes.push(hole);
+      const ring = new THREE.ExtrudeGeometry(face, { depth: 0.035, bevelEnabled: false, curveSegments: 14 });
+      ring.rotateY(Math.PI / 2).translate(width * 0.34, 0, 0);
+      parts.push([ring, TRIM.chrome]);
+      for (let i = 0; i < 5; i++) {
+        const a = (i / 5) * Math.PI * 2;
+        const spoke = new THREE.BoxGeometry(0.03, rim * 0.78, rim * 0.22);
+        spoke.translate(0, rim * 0.46, 0);
+        spoke.rotateX(a);
+        spoke.translate(width * 0.35, 0, 0);
+        parts.push([spoke, TRIM.chrome]);
+      }
+      parts.push([new THREE.CylinderGeometry(rim * 0.22, rim * 0.24, 0.06, 12).rotateZ(Math.PI / 2).translate(width * 0.36, 0, 0), TRIM.chrome]);
+    }
+    const geo = mergeParts(parts);
+    wheelShapes.set(key, geo);
+    return geo;
+  }
+
+  // --- the parts of each kind, made once ---
+
+  function carParts(name) {
+    const k = KINDS[name];
+    if (k.parts) return k.parts;
+    if (k.bus) return (k.parts = busParts(k));
+    if (k.truck) return (k.parts = truckParts(k));
+    const p = carProfile(k);
+    const { zF, zT, zA, zR1, zR2, zC, zB } = p;
+    const L = (z, t) => lowerPoint(p, z, t);
+    const U = (z, t) => upperPoint(p, z, t);
+    const steps = (a, b, per) => Math.max(2, Math.round(Math.abs(b - a) / per));
+    const lower = (z0, z1, t0, t1, off = 0, sides) => surfacePatch(L, z0, z1, t0, t1, steps(z0, z1, 0.085), steps(t0, t1, 0.06), off, sides);
+    const upper = (z0, z1, t0, t1, off = 0, sides) => surfacePatch(U, z0, z1, t0, t1, steps(z0, z1, 0.1), steps(t0, t1, 0.07), off, sides);
+
+    // where the front doors are (the left one opens), and the rear doors' back edge
+    const doorFront = zA - 0.06;
+    const doorBack = zB;
+    const rearEnd = zC + (k.quarter || 0.2);
+    const doorTop = 0.8; // the lower body's t just over the shoulder, where the window starts
+    const doorLow = 0.2;
+
+    // --- paint: the whole lower body except the left front door, the roof and pillars
+    const paint = [
+      lower(zT, zF, 0, doorLow, 0, [1, -1]),
+      lower(zT, zF, doorTop, 1, 0, [1, -1]),
+      lower(zT, doorBack, doorLow, doorTop, 0, [1, -1]),
+      lower(doorFront, zF, doorLow, doorTop, 0, [1, -1]),
+      lower(doorBack, doorFront, doorLow, doorTop, 0, [-1]),
+      // the roof panel, slightly proud of the glass, with the windscreen header and rear edge
+      upper(zR2 - 0.05, zR1 + 0.06, 0.7, 1, 0.006),
+      // A pillars down the sides of the windscreen
+      upper(zR1, zA - 0.01, 0.56, 0.72, 0.005),
+    ];
+    if (k.rearGlass > 0.2) paint.push(upper(zC + 0.01, zR2, 0.56, 0.72, 0.005)); // C pillars
+    // the panel behind the rear side window
+    paint.push(upper(zC, rearEnd, 0, 0.62, 0.004));
+    // door mirrors on stalks, the housings in body colour
+    paint.push(...both((s) => blobAt(0.2, 0.11, 0.13, s * (k.beltW + 0.16), k.belt + 0.1, zA - 0.12)));
+    const paintGeo = mergeParts(paint.map((g) => [g]));
+    const leftDoor = mergeParts([[lower(doorBack, doorFront, doorLow, doorTop, 0, [1])]]);
+
+    // --- glass: the whole glasshouse, a little inside the pillars; the left front window opens with its door
+    const glassGeo = mergeParts([
+      [upper(zC, zA, 0.035, 1, -0.003, [-1])],
+      [upper(zC, doorBack, 0.035, 1, -0.003, [1])],
+      [upper(doorBack, zA, 0.6, 1, -0.003, [1])],
+    ].map(([g]) => [g]));
+    const doorGlass = mergeParts([[upper(doorBack + 0.03, zA - 0.02, 0.035, 0.6, -0.003, [1])]]);
+    // seen from far off: the same shape in a fraction of the triangles, roof and pillars painted
+    const coarse = (point, z0, z1, t0, t1, off = 0) => surfacePatch(point, z0, z1, t0, t1, steps(z0, z1, 0.4), steps(t0, t1, 0.17), off);
+    const paintFar = mergeParts([[coarse(L, zT, zF, 0, 1)], [coarse(U, zR2 - 0.05, zR1 + 0.06, 0.7, 1, 0.006)]]);
+    const glassFar = mergeParts([[coarse(U, zC, zA, 0, 1, -0.003)]]);
+
+    // --- trim: B pillar, window seals, shut lines, sills, bumpers, grille, plates, arch liners
+    const trim = [];
+    trim.push([upper(zB - 0.055, zB + 0.055, 0.02, 0.72, 0.006), TRIM.black]);
+    trim.push([upper(zC, zA, 0, 0.035, 0.004), TRIM.black]); // the seal along the foot of the windows
+    if (k.doors === 4) trim.push([upper(rearEnd - 0.04, rearEnd + 0.01, 0.02, 0.62, 0.007), TRIM.black]);
+    const seam = (z) => trim.push([lower(z - 0.006, z + 0.006, doorLow + 0.02, doorTop - 0.01, 0.003), TRIM.black]);
+    seam(doorFront + 0.01);
+    seam(doorBack);
+    if (k.doors === 4) seam(rearEnd - 0.02);
+    // bonnet and boot shut lines across the top
+    trim.push([lower(zF - 0.42, zF - 0.41, 0.72, 1, 0.003), TRIM.black]);
+    if (!k.bed && k.deck > 0) trim.push([lower(zC - 0.04, zC - 0.03, 0.72, 1, 0.003), TRIM.black]);
+    trim.push([lower(zT, zF, 0, 0.17, 0.004), TRIM.plastic]); // sills and under-bumpers in black plastic
+    trim.push([lower(zT, zT + 0.2, 0.17, 0.3, 0.004), TRIM.plastic]);
+    trim.push([lower(zF - 0.2, zF, 0.17, 0.27, 0.004), TRIM.plastic]);
+    // door handles
+    for (const z of k.doors === 4 ? [doorBack - 0.22, rearEnd - 0.25] : [doorBack - 0.22]) {
+      trim.push(...both((s) => [boxAt(0.03, 0.03, 0.16, s * (p.half(z, k.width / 2) - 0.02), k.belt - 0.12, z), TRIM.chrome]));
+    }
+    // front: grille with a chrome surround, lower intake, number plate, fog lamps
+    const grilleY = k.nose - 0.14;
+    const zFront = faceZ(p, 0, grilleY, true);
+    trim.push([boxAt(k.width * 0.4, 0.17, 0.06, 0, grilleY, zFront - 0.02), TRIM.grille]);
+    trim.push([boxAt(k.width * 0.42, 0.02, 0.07, 0, grilleY + 0.095, zFront - 0.02), TRIM.chrome]);
+    const lowY = k.clear + 0.24;
+    trim.push([boxAt(k.width * 0.5, 0.1, 0.06, 0, lowY, faceZ(p, 0, lowY, true) - 0.02), TRIM.grille]);
+    trim.push([boxAt(0.52, 0.12, 0.02, 0, lowY + 0.13, faceZ(p, 0, lowY + 0.13, true) + 0.005), TRIM.plate]);
+    // rear: plate, reflectors, exhaust
+    const plateY = k.bed ? k.tail - 0.42 : Math.min(k.tail, k.deck) - 0.3;
+    trim.push([boxAt(0.52, 0.12, 0.02, 0, plateY, faceZ(p, 0, plateY, false) - 0.005), TRIM.plate]);
+    trim.push([placed(new THREE.CylinderGeometry(0.035, 0.035, 0.2, 8).rotateX(Math.PI / 2), -k.width * 0.3, k.clear + 0.12, zT + 0.12), TRIM.chrome]);
+    // dark wheel-arch liners, so you cannot see in under the wings, and an undertray
+    for (const wz of p.wheelZ) {
+      trim.push(...both((s) => [placed(new THREE.CylinderGeometry(k.r + 0.07, k.r + 0.07, 0.36, 16, 1, true, -Math.PI / 2, Math.PI)
+        .rotateZ(Math.PI / 2), s * (k.width / 2 - 0.22), k.r, wz), TRIM.liner]));
+    }
+    trim.push([boxAt(k.width - 0.3, 0.06, k.wb - 0.3, 0, k.clear + 0.05, 0), TRIM.liner]);
+    // mirror stalks
+    trim.push(...both((s) => [boxAt(0.12, 0.04, 0.05, s * (k.beltW + 0.05), k.belt + 0.06, zA - 0.12), TRIM.black]));
+    if (k.rails) trim.push(...both((s) => [boxAt(0.05, 0.05, k.roofLen * 0.95, s * (k.roofW - 0.08), k.roof + 0.04, (zR1 + zR2) / 2), TRIM.plastic]));
+
+    // --- the pickup's load bed: inner walls and floor, a tailgate
+    if (k.bed) {
+      const bedFront = zC - 0.12;
+      const bedBack = zT + 0.06;
+      const inner = k.width / 2 - 0.1;
+      trim.push([boxAt(inner * 2, 0.04, bedFront - bedBack, 0, k.belt - 0.48, (bedFront + bedBack) / 2), TRIM.plastic]);
+      trim.push(...both((s) => [boxAt(0.04, 0.46, bedFront - bedBack, s * inner, k.belt - 0.25, (bedFront + bedBack) / 2), TRIM.plastic]));
+      trim.push([boxAt(inner * 2, 0.46, 0.04, 0, k.belt - 0.25, bedFront), TRIM.plastic]);
+    }
+
+    // --- lamps: headlamp lenses at the front corners, tail lamps wrapping the rear ones
+    const headY = p.top(zF - 0.3) - 0.07;
+    const headX = k.width * 0.32;
+    for (const s of [1, -1]) {
+      const z = faceZ(p, headX, headY, true);
+      trim.push([blobAt(0.42, 0.115, 0.18, s * headX, headY, z - 0.075, 0, s * 0.4, 0), 0x2b2f34]); // smoked lens over the lamps
+    }
+    const head = both((s) => blobAt(0.14, 0.075, 0.06, s * (headX - 0.06), headY, faceZ(p, headX - 0.06, headY, true) + 0.005));
+    head.push(...both((s) => blobAt(0.13, 0.075, 0.06, s * (headX + 0.09), headY + 0.005, faceZ(p, headX + 0.09, headY + 0.005, true) - 0.004)));
+    head.push(...both((s) => boxAt(0.3, 0.012, 0.03, s * headX, headY - 0.05, faceZ(p, headX, headY - 0.05, true) + 0.002, 0, s * 0.35, 0)));
+    head.push(...both((s) => blobAt(0.1, 0.07, 0.05, s * k.width * 0.36, lowY, faceZ(p, k.width * 0.36, lowY, true) - 0.005)));
+    const tailY = (k.bed ? k.tail : Math.min(k.tail, k.deck)) - 0.12;
+    const tailX = k.width * 0.36;
+    const tail = both((s) => blobAt(0.46, 0.12, 0.16, s * tailX, tailY, faceZ(p, tailX, tailY, false) + 0.05, 0, -s * 0.45, 0));
+    tail.push(...both((s) => boxAt(0.1, 0.04, 0.02, s * k.width * 0.33, k.clear + 0.24, faceZ(p, k.width * 0.33, k.clear + 0.24, false) - 0.006)));
+    // indicators: amber at the outer edge of each lamp cluster, front and back
+    const amber = (s) => [
+      blobAt(0.1, 0.07, 0.12, s * (headX + 0.25), headY - 0.02, faceZ(p, headX + 0.25, headY - 0.02, true) - 0.05, 0, s * 0.8, 0),
+      blobAt(0.1, 0.07, 0.12, s * (tailX + 0.23), tailY + 0.02, faceZ(p, tailX + 0.23, tailY + 0.02, false) + 0.05, 0, -s * 0.8, 0),
+      boxAt(0.02, 0.04, 0.12, s * (p.half(zA - 0.4, k.width / 2) + 0.005), k.nose - 0.05, zA - 0.4), // the repeater on the wing
+    ];
+
+    // --- inside: seats, dashboard, steering wheel
+    const seats = [];
+    const seatZ = k.seat[0] - 0.28;
+    for (const s of [1, -1]) {
+      seats.push(boxAt(0.5, 0.12, 0.5, s * 0.38, k.seatY, seatZ + 0.05));
+      seats.push(boxAt(0.48, 0.66, 0.12, s * 0.38, k.seatY + 0.36, seatZ - 0.22, -0.18));
+      seats.push(boxAt(0.26, 0.18, 0.1, s * 0.38, k.seatY + 0.78, seatZ - 0.27, -0.12));
+    }
+    if (k.doors === 4 && zB - zC > 0.7) {
+      seats.push(boxAt(k.width - 0.42, 0.12, 0.5, 0, k.seatY + 0.02, seatZ - 0.85));
+      seats.push(boxAt(k.width - 0.42, 0.62, 0.12, 0, k.seatY + 0.36, seatZ - 1.1, -0.15));
+    }
+    seats.push(boxAt(k.width - 0.3, 0.16, 0.36, 0, k.belt - 0.05, zA - 0.22));
+    const wheel = new THREE.TorusGeometry(0.17, 0.022, 8, 22).rotateX(-0.45);
+    seats.push(wheel.translate(k.seat[1], k.belt + 0.05, zA - 0.5));
+    const interiorGeo = mergeParts(seats.map((g) => [g, 0x2a2c31]));
+
+    return (k.parts = {
+      profile: p, paint: paintGeo, leftDoor, glass: glassGeo, doorGlass, trim: mergeParts(trim), paintFar, glassFar,
+      head: mergeParts(head.map((g) => [g])), tail: mergeParts(tail.map((g) => [g])),
+      amberL: mergeParts(amber(1).map((g) => [g])), amberR: mergeParts(amber(-1).map((g) => [g])),
+      doorBand: mergeParts([[lower(rearEnd, doorFront, 0.3, 0.62, 0.004)]]),
+      interior: interiorGeo, hinge: [p.half(doorFront, k.width / 2), doorFront],
+      wheel: wheelGeometry(k.r, k.r * 0.68, name === 'pickup' ? 'steel' : 'alloy'),
+      wheelX: k.width / 2 - k.r * 0.45, roofTop: k.roof,
+    });
+  }
+
+  // A city bus: a long rounded box on big wheels, a deep windscreen, a band of windows
+  // down each side, doors on the kerb side, and its destination lit up over the windscreen.
+  function busParts(k) {
+    const p = {
+      k, half: (z, w) => w * Math.pow(Math.max(0, 1 - Math.pow(Math.min(1, Math.abs(z) / (k.len / 2)), 14)), 1 / 14),
+      bottom: (z) => {
+        let y = k.clear;
+        for (const wz of [k.len / 2 - k.front, k.len / 2 - k.front - k.wb]) {
+          const d = z - wz;
+          const arch = k.r + 0.08;
+          if (Math.abs(d) < arch) y = Math.max(y, k.r + Math.sqrt(arch * arch - d * d));
+        }
+        return y;
+      },
+      top: () => k.roof,
+    };
+    p.wheelZ = [k.len / 2 - k.front, k.len / 2 - k.front - k.wb];
+    const S = (z, t) => lowerPoint(p, z, t, 9);
+    p.section = S;
+    const patch = (z0, z1, t0, t1, off = 0, sides) => surfacePatch(S, z0, z1, t0, t1, Math.max(2, Math.round((z1 - z0) / 0.2)), Math.max(2, Math.round((t1 - t0) / 0.04)), off, sides);
+    const zF = k.len / 2;
+    const zT = -k.len / 2;
+    // the t at a height on the side of this boxy section
+    const tAt = (y) => {
+      let lo = 0;
+      let hi = 1;
+      for (let i = 0; i < 30; i++) {
+        const mid = (lo + hi) / 2;
+        if (S(0, mid)[1] < y) lo = mid;
+        else hi = mid;
+      }
+      return lo;
+    };
+    const tLow = tAt(1.3);
+    const tHigh = tAt(2.62);
+    const paint = [patch(zT, zF, 0, tLow), patch(zT, zF, tHigh, 1), patch(zT, zT + 0.5, tLow, tHigh), patch(zF - 0.25, zF, tLow, tHigh)];
+    const glass = [];
+    const trim = [];
+    // windows down both sides, in panes with black frames between
+    for (let z = zT + 0.5; z < zF - 0.35; z += 1.45) {
+      const z1 = Math.min(z + 1.45, zF - 0.25);
+      glass.push(patch(z + 0.07, z1 - 0.07, tLow + 0.01, tHigh - 0.01, 0.002));
+      trim.push([patch(z - 0.07, z + 0.07, tLow, tHigh, 0.004), TRIM.black]);
+    }
+    trim.push([patch(zT, zF, tLow - 0.012, tLow, 0.005), TRIM.black]);
+    trim.push([patch(zT, zF, 0, tAt(0.75), 0.004), TRIM.plastic]); // a dark skirt along the bottom
+    // the windscreen, the destination sign, the rear window
+    glass.push(boxAt(k.width - 0.22, 1.55, 0.04, 0, 1.92, zF - 0.005));
+    trim.push([boxAt(k.width - 0.1, 0.06, 0.06, 0, 1.13, zF), TRIM.black]);
+    const sign = [boxAt(1.7, 0.26, 0.04, 0, 2.86, zF + 0.002)];
+    glass.push(boxAt(k.width - 0.6, 0.7, 0.04, 0, 2.2, zT + 0.005));
+    // doors on the kerb side (-x): glass leaves in black frames
+    for (const z of [zF - 1.35, 0.4]) {
+      glass.push(boxAt(0.04, 2.15, 1.1, -k.width / 2 - 0.004, 1.42, z));
+      trim.push([boxAt(0.05, 2.25, 0.07, -k.width / 2 - 0.006, 1.42, z), TRIM.black]);
+      trim.push([boxAt(0.05, 0.07, 1.2, -k.width / 2 - 0.006, 2.52, z), TRIM.black]);
+    }
+    // a roof pod for the air conditioning, wheel liners, bumpers
+    paint.push(boxAt(1.6, 0.28, 3.2, 0, k.roof + 0.14, -1));
+    for (const wz of p.wheelZ) {
+      trim.push(...both((s) => [placed(new THREE.CylinderGeometry(k.r + 0.08, k.r + 0.08, 0.45, 16, 1, true, -Math.PI / 2, Math.PI)
+        .rotateZ(Math.PI / 2), s * (k.width / 2 - 0.26), k.r, wz), TRIM.liner]));
+    }
+    trim.push([boxAt(k.width, 0.32, 0.14, 0, 0.5, zF + 0.02), TRIM.plastic]);
+    trim.push([boxAt(k.width, 0.32, 0.14, 0, 0.5, zT - 0.02), TRIM.plastic]);
+    trim.push([boxAt(0.6, 0.14, 0.02, 0, 0.42, zF + 0.1), TRIM.plate]);
+    trim.push([boxAt(0.6, 0.14, 0.02, 0, 0.9, zT - 0.01), TRIM.plate]);
+    const head = both((s) => blobAt(0.3, 0.16, 0.08, s * (k.width / 2 - 0.3), 0.85, zF + 0.01));
+    const tail = both((s) => boxAt(0.18, 0.6, 0.05, s * (k.width / 2 - 0.15), 1.05, zT - 0.01));
+    const amber = (s) => [boxAt(0.14, 0.1, 0.05, s * (k.width / 2 - 0.12), 1.05, zF + 0.01), boxAt(0.18, 0.12, 0.05, s * (k.width / 2 - 0.15), 1.45, zT - 0.01)];
+    // seats in rows, seen through the windows
+    const seats = [];
+    for (let z = zF - 2.6; z > zT + 1; z -= 0.85) {
+      for (const s of [1, -1]) {
+        seats.push(boxAt(0.95, 0.12, 0.45, s * 0.7, 0.95, z));
+        seats.push(boxAt(0.95, 0.65, 0.1, s * 0.7, 1.3, z - 0.22));
+      }
+    }
+    seats.push(boxAt(0.5, 0.6, 0.5, k.seat[1], 1.0, k.seat[0] - 0.3));
+    return {
+      profile: p, paint: mergeParts(paint.map((g) => [g])), glass: mergeParts(glass.map((g) => [g])), trim: mergeParts(trim),
+      head: mergeParts(head.map((g) => [g])), tail: mergeParts(tail.map((g) => [g])),
+      amberL: mergeParts(amber(1).map((g) => [g])), amberR: mergeParts(amber(-1).map((g) => [g])),
+      sign: mergeParts(sign.map((g) => [g])), interior: mergeParts(seats.map((g) => [g, 0x2f3a4a])),
+      wheel: wheelGeometry(k.r, 0.34, 'steel'), wheelX: k.width / 2 - 0.3, roofTop: k.roof + 0.28, wheelZ: p.wheelZ,
+    };
+  }
+
+  // A box truck: a cab with a big windscreen, and a tall cargo box behind it on a chassis.
+  function truckParts(k) {
+    const zF = k.len / 2;
+    const zT = -k.len / 2;
+    const cabBack = zF - 2.25;
+    const wheelZ = [zF - k.front, zF - k.front - k.wb];
+    // the cab: its own small rounded box
+    const cab = {
+      k: { ...k, width: k.width - 0.06 },
+      half: (z, w) => w * Math.pow(Math.max(0, 1 - Math.pow(Math.max(0, z - (cabBack + zF) / 2) / ((zF - cabBack) / 2), 6)), 1 / 6),
+      bottom: (z) => {
+        const d = z - wheelZ[0];
+        const arch = k.r + 0.08;
+        return Math.abs(d) < arch ? Math.max(0.55, k.r + Math.sqrt(arch * arch - d * d)) : 0.55;
+      },
+      top: (z) => 2.75 - 0.25 * smoothBetween(zF - 0.6, zF, z),
+    };
+    const C = (z, t) => lowerPoint(cab, z, t, 6);
+    cab.section = C;
+    const cabPatch = (z0, z1, t0, t1, off = 0, sides) => surfacePatch(C, z0, z1, t0, t1, Math.max(2, Math.round((z1 - z0) / 0.08)), Math.max(2, Math.round((t1 - t0) / 0.04)), off, sides);
+    const tAt = (z, y) => {
+      let lo = 0;
+      let hi = 1;
+      for (let i = 0; i < 30; i++) {
+        const mid = (lo + hi) / 2;
+        if (C(z, mid)[1] < y) lo = mid;
+        else hi = mid;
+      }
+      return lo;
+    };
+    const tWin = tAt(cabBack + 1, 1.62);
+    const tRoof = tAt(cabBack + 1, 2.55);
+    const paint = [cabPatch(cabBack, zF, 0, tWin), cabPatch(cabBack, zF, tRoof, 1), cabPatch(cabBack, cabBack + 0.45, tWin, tRoof)];
+    const glass = [cabPatch(cabBack + 0.48, zF - 0.02, tWin, tRoof, 0.002)];
+    glass.push(boxAt(k.width - 0.3, 0.95, 0.04, 0, 2.08, faceZ(cab, 0, 2.08, true) + 0.01, -0.08));
+    // the cargo box: tall, square-edged, on a dark chassis
+    const boxLen = cabBack - 0.15 - (zT + 0.1);
+    const boxZ = (cabBack - 0.15 + zT + 0.1) / 2;
+    const cargo = [boxAt(k.width, 2.55, boxLen, 0, 2.38, boxZ)];
+    const trim = [];
+    trim.push([boxAt(k.width + 0.02, 0.08, boxLen + 0.02, 0, 1.08, boxZ), TRIM.steel]);
+    trim.push([boxAt(k.width + 0.02, 0.08, boxLen + 0.02, 0, 3.66, boxZ), TRIM.steel]);
+    for (let z = zT + 0.1; z < cabBack - 0.15; z += 0.9) trim.push(...both((s) => [boxAt(0.02, 2.55, 0.04, s * (k.width / 2 + 0.005), 2.38, z), 0xc9ccd0]));
+    trim.push([boxAt(k.width - 0.1, 2.3, 0.03, 0, 2.3, zT + 0.09), 0xa9adb2]); // the roller door at the back
+    trim.push([boxAt(1.0, 0.35, k.len - 1.2, 0, 0.75, -0.2), TRIM.liner]); // chassis rails
+    trim.push([boxAt(k.width, 0.22, 0.15, 0, 0.6, zF + 0.04), TRIM.plastic]);
+    trim.push([boxAt(k.width * 0.55, 0.5, 0.04, 0, 1.2, faceZ(cab, 0, 1.2, true) + 0.005), TRIM.grille]);
+    trim.push([boxAt(0.52, 0.12, 0.02, 0, 0.6, zF + 0.13), TRIM.plate]);
+    trim.push([boxAt(0.52, 0.12, 0.02, 0, 0.75, zT - 0.02), TRIM.plate]);
+    trim.push(...both((s) => [boxAt(0.06, 0.38, 0.22, s * (k.width / 2 + 0.22), 2.0, zF - 0.55), TRIM.black])); // big mirrors
+    trim.push(...both((s) => [boxAt(0.26, 0.04, 0.04, s * (k.width / 2 + 0.1), 2.0, zF - 0.55), TRIM.black]));
+    for (const wz of wheelZ) {
+      trim.push(...both((s) => [placed(new THREE.CylinderGeometry(k.r + 0.08, k.r + 0.08, 0.4, 16, 1, true, -Math.PI / 2, Math.PI)
+        .rotateZ(Math.PI / 2), s * (k.width / 2 - 0.24), k.r, wz), TRIM.liner]));
+    }
+    trim.push([cabPatch(cabBack + 0.45, cabBack + 0.5, tWin, tRoof, 0.005), TRIM.black]);
+    trim.push([boxAt(k.width - 0.1, 2.2, 0.04, 0, 1.65, cabBack + 0.01), TRIM.black]); // the cab's back wall
+    trim.push([cabPatch(cabBack, zF, tWin - 0.01, tWin, 0.004), TRIM.black]);
+    const head = both((s) => blobAt(0.3, 0.16, 0.1, s * (k.width / 2 - 0.32), 0.95, faceZ(cab, k.width / 2 - 0.32, 0.95, true) - 0.02));
+    const tail = both((s) => boxAt(0.2, 0.14, 0.05, s * (k.width / 2 - 0.2), 0.95, zT - 0.03));
+    const amber = (s) => [boxAt(0.12, 0.1, 0.06, s * (k.width / 2 - 0.08), 0.95, faceZ(cab, k.width / 2 - 0.1, 0.95, true) - 0.02),
+      boxAt(0.14, 0.1, 0.05, s * (k.width / 2 - 0.45), 0.95, zT - 0.03)];
+    const seats = [boxAt(0.5, 0.6, 0.5, k.seat[1], 1.55, k.seat[0] - 0.3), boxAt(0.5, 0.6, 0.5, -k.seat[1], 1.55, k.seat[0] - 0.3), boxAt(k.width - 0.3, 0.2, 0.4, 0, 1.75, zF - 0.4)];
+    return {
+      profile: cab, paint: mergeParts(paint.map((g) => [g])), cargo: mergeParts(cargo.map((g) => [g])), glass: mergeParts(glass.map((g) => [g])),
+      trim: mergeParts(trim), head: mergeParts(head.map((g) => [g])), tail: mergeParts(tail.map((g) => [g])),
+      amberL: mergeParts(amber(1).map((g) => [g])), amberR: mergeParts(amber(-1).map((g) => [g])),
+      interior: mergeParts(seats.map((g) => [g, 0x2a2c31])), wheel: wheelGeometry(k.r, 0.3, 'steel'), wheelX: k.width / 2 - 0.3,
+      roofTop: 3.7, wheelZ, dual: true,
+    };
+  }
+
+  // --- assembling one vehicle ---
+
+  // All of a vehicle's lamps are one mesh. Each corner knows which lamp it belongs to (0 head,
+  // 1 tail, 2 left indicator, 3 right indicator), and the material colours it from that
+  // lamp's colour, so switching a lamp is changing one colour.
+  function lampGeometry(parts) {
+    if (parts.lamps) return parts.lamps;
+    const list = [parts.head, parts.tail, parts.amberL, parts.amberR];
+    const geo = mergeParts(list.map((g) => [g]));
+    const which = [];
+    list.forEach((g, n) => {
+      const count = g.index ? g.index.count : g.attributes.position.count;
+      for (let i = 0; i < count; i++) which.push(n);
+    });
+    geo.setAttribute('lamp', new THREE.Float32BufferAttribute(which, 1));
+    return (parts.lamps = geo);
+  }
+
+  function lampMaterial() {
+    const colors = [new THREE.Color(headlightMat.color.getHex()), new THREE.Color(tailIdle), new THREE.Color(AMBER_OFF), new THREE.Color(AMBER_OFF)];
+    const material = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    material.onBeforeCompile = (shader) => {
+      ['lampHead', 'lampTail', 'lampLeft', 'lampRight'].forEach((name, n) => { shader.uniforms[name] = { value: colors[n] }; });
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float lamp;\nvarying float vLamp;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvLamp = lamp;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform vec3 lampHead;\nuniform vec3 lampTail;\nuniform vec3 lampLeft;\nuniform vec3 lampRight;\nvarying float vLamp;')
+        .replace('#include <color_fragment>', '#include <color_fragment>\ndiffuseColor.rgb = vLamp < 0.5 ? lampHead : vLamp < 1.5 ? lampTail : vLamp < 2.5 ? lampLeft : lampRight;');
+    };
+    material.customProgramCacheKey = () => 'vehicle-lamps';
+    // stand-ins with a colour, so the lamps can be set like separate materials
+    const lamp = (color) => ({ color, userData: {} });
+    return { material, head: lamp(colors[0]), tail: lamp(colors[1]), left: lamp(colors[2]), right: lamp(colors[3]) };
+  }
+
+  // Wheels are drawn all together: one instanced mesh per wheel shape, filled each frame
+  // from the wheels of every vehicle near enough to see them.
+  const wheelPools = new Map(); // geometry -> { mesh, wheels }
+  function wheelSlot(geometry, holder, model) {
+    let pool = wheelPools.get(geometry);
+    if (!pool) {
+      const mesh = new THREE.InstancedMesh(geometry, wheelMat2, 900);
+      mesh.frustumCulled = false;
+      mesh.count = 0;
+      scene.add(mesh);
+      wheelPools.set(geometry, (pool = { mesh, wheels: [] }));
+    }
+    pool.wheels.push({ holder, model });
+  }
+
+  function updateWheelInstances() {
+    for (const pool of wheelPools.values()) {
+      let n = 0;
+      for (const { holder, model } of pool.wheels) {
+        const g = model.group;
+        if (!g.parent || !g.visible || (model.detail && !model.detail.visible) || n >= 900) continue;
+        holder.updateWorldMatrix(true, false);
+        pool.mesh.setMatrixAt(n++, holder.matrixWorld);
+      }
+      pool.mesh.count = n;
+      pool.mesh.instanceMatrix.needsUpdate = true;
     }
   }
 
+  const cargoMat = new THREE.MeshPhongMaterial({ color: 0xf4f4f2, shininess: 30, specular: 0x333333 });
+  const busSignMat = new THREE.MeshBasicMaterial({ color: 0xffa321 });
+  const headMats = []; // each vehicle's own headlamp material, lit with the lamps after dark
+  const AMBER_OFF = 0x5a3a08;
+  const AMBER_ON = 0xffa21a;
+
   function createBuiltCar(color, name) {
-    const kind = KINDS[name];
-    const { hl, hw } = kind.dims;
+    const k = KINDS[name];
+    const parts = carParts(name);
+    const { hl } = k.dims;
     const group = new THREE.Group();
-    const paint = reflect(new THREE.MeshPhongMaterial({ color, shininess: 90, specular: 0x777777 }), 0.2);
-    const tailMat = new THREE.MeshBasicMaterial({ color: 0x7a1010 });
-    // `cabin` is everything above the waistline, hidden as one in the inside view
-    const cabin = new THREE.Group();
+    const paint = reflect(new THREE.MeshPhongMaterial({ color, shininess: 95, specular: 0x8a8a8a }), 0.28);
+    const lamps = lampMaterial();
+    const { tail: tailMat, left: amberL, right: amberR, head: headMat } = lamps;
+    headMats.push(headMat);
+    const cabin = new THREE.Group(); // the glasshouse and roof, hidden for the view from the driver's seat
     group.add(cabin);
-    const add = (geo, mat, x, y, z, parent = group) => {
-      const mesh = new THREE.Mesh(geo, mat);
-      mesh.position.set(x, y, z);
-      parent.add(mesh);
-      return mesh;
+    // the small things (wheels, seats, indicators) are left out when the vehicle is far away
+    const detail = new THREE.Group();
+    group.add(detail);
+    const mesh = (geo, material, parent = group, shadow = false) => {
+      const m = new THREE.Mesh(geo, material);
+      m.castShadow = shadow;
+      parent.add(m);
+      return m;
     };
-    const box = (w, hgt, d, mat, x, y, z, parent = group) => {
-      const mesh = add(underGeo, mat, x, y, z, parent);
-      mesh.scale.set(w, hgt, d);
-      return mesh;
-    };
+    const body = mesh(parts.paint, paint, group, true);
+    const trim = mesh(parts.trim, trimMat, parts.paintFar ? detail : group);
+    const glass = mesh(parts.glass, cabinGlass, k.bus || k.truck ? group : cabin);
+    glass.renderOrder = 2; // after what is inside the car
+    mesh(lampGeometry(parts), lamps.material);
+    mesh(parts.interior, seatMat, detail);
+    const deform = [body, trim];
+    const glassParts = [glass];
+    if (parts.cargo) deform.push(mesh(parts.cargo, cargoMat, group, true));
+    if (parts.sign) mesh(parts.sign, busSignMat);
 
-    const body = add(kind.bodyGeo, paint, 0, 0, 0);
-    body.castShadow = true;
-    const deform = [body];
-    const glassParts = [];
-    let doors = [];
-    box(kind.width - 0.24, 0.3, kind.wb + 1, underMat, 0, kind.g + 0.18, 0); // closes off the wheel arches
-    const noseY = kind.upper[2][1] - 0.2;
-    for (const end of [1, -1]) {
-      box(kind.width - 0.1, 0.16, 0.14, underMat, 0, kind.g + 0.14, end * (hl - 0.03)); // bumper
-      box(0.5, 0.11, 0.03, hubMat, 0, kind.g + 0.32, end * (hl + 0.045)); // number plate
-      for (const side of [-1, 1]) {
-        const lamp = add(headlightGeo, end > 0 ? headlightMat : tailMat, side * (hw - 0.36), noseY, end * (hl - 0.02));
-        if (kind.bus) lamp.position.y = 0.95;
-      }
-    }
-    box(kind.bus ? 1.6 : 0.8, 0.12, 0.06, underMat, 0, noseY - 0.17, hl - 0.02); // grille
-
-    if (kind.bus) {
-      // dark window bands down both sides, a deep windscreen, a rear window, the door, the sign
-      for (const side of [-1, 1]) glassParts.push(box(0.05, 0.95, 8.9, darkGlass, side * hw, 2.05, -0.3));
-      glassParts.push(box(2.2, 1.25, 0.05, darkGlass, 0, 1.95, hl - 0.005));
-      glassParts.push(box(2.0, 0.8, 0.05, darkGlass, 0, 2.1, -hl + 0.005));
-      box(0.05, 2.0, 1.1, underMat, -hw, 1.45, 3.6);
-      box(1.7, 0.26, 0.05, new THREE.MeshBasicMaterial({ color: 0xffa321 }), 0, 2.78, hl);
-      box(kind.width + 0.02, 0.1, kind.len - 0.6, hubMat, 0, 1.1, 0); // waist stripe
-    } else {
-      const [front, roofFront, roofRear, rear] = kind.glass;
-      const glass = add(kind.glassGeo, cabinGlass, 0, 0, 0, cabin);
-      glass.renderOrder = 2; // after what is inside the car
-      glassParts.push(glass);
-      deform.push(add(kind.roofGeo, paint, 0, 0, 0, cabin));
-      const pillarX = (roofFront[0] + roofRear[0]) / 2 - 0.1; // the post between the doors
-      box(kind.width - 0.17, roofFront[1] - kind.waist, 0.09, paint, 0, (roofFront[1] + kind.waist) / 2, pillarX, cabin);
-      // what shows through the glass: seat backs, the dash and the wheel
-      const seatZ = kind.seat[0] - 0.3;
-      for (const side of [-1, 1]) {
-        box(0.46, 0.5, 0.12, seatMat, side * 0.4, kind.waist + 0.08, seatZ, cabin);
-        box(0.26, 0.16, 0.1, seatMat, side * 0.4, kind.waist + 0.4, seatZ, cabin);
-        box(0.14, 0.1, 0.16, paint, side * (hw + 0.06), kind.waist + 0.08, front[0] - 0.25); // door mirror
-      }
-      if (rear[0] < seatZ - 1.2) box(kind.width - 0.5, 0.42, 0.12, seatMat, 0, kind.waist + 0.04, seatZ - 0.95, cabin);
-      // front doors: panels standing just proud of the body, hinged at the front edge so they can swing open
-      const doorTop = kind.waist - 0.03;
-      const doorBottom = kind.g + 0.16;
-      doors = [1, -1].map((side) => {
-        const hinge = new THREE.Group();
-        hinge.position.set(side * (hw + 0.012), 0, front[0] - 0.3);
-        box(0.03, doorTop - doorBottom, 1.02, paint, 0, (doorTop + doorBottom) / 2, -0.53, hinge);
-        group.add(hinge);
-        return hinge;
-      });
-      box(kind.width - 0.4, 0.1, 0.42, seatMat, 0, kind.waist + 0.01, front[0] - 0.3, cabin);
-      const wheel = add(steeringGeo, seatMat, kind.seat[1], kind.waist + 0.1, front[0] - 0.55, cabin);
-      wheel.rotation.x = -0.45;
-      if (kind.bed) {
-        // the load bed: a dark floor let into the top of the body
-        box(kind.width - 0.3, 0.02, kind.bed[1] - kind.bed[0], bedMat, 0, kind.waist - 0.04, (kind.bed[0] + kind.bed[1]) / 2);
-      }
+    // the driver's door, hinged at its front edge so it can swing open
+    let door = null;
+    if (parts.leftDoor) {
+      const [hx, hz] = parts.hinge;
+      door = new THREE.Group();
+      door.position.set(hx, 0, hz);
+      const panel = mesh(parts.leftDoor.clone().translate(-hx, 0, -hz), paint, door);
+      const pane = mesh(parts.doorGlass.clone().translate(-hx, 0, -hz), cabinGlass, door);
+      pane.renderOrder = 2;
+      deform.push(panel);
+      glassParts.push(pane);
+      group.add(door);
     }
 
+    // wheels: the front pair hang from pivots so they can steer as well as spin
     const wheels = [];
     const frontPivots = [];
-    const size = kind.r / 0.38;
-    for (const zSide of [1, -1]) {
-      for (const xSide of [-1, 1]) {
+    const model = { group, detail };
+    const wheelZ = parts.wheelZ || [k.wb / 2, -k.wb / 2];
+    wheelZ.forEach((z, axle) => {
+      for (const side of [1, -1]) {
         const pivot = new THREE.Group();
-        pivot.position.set(xSide * (hw - 0.14 - (kind.bus ? 0.08 : 0)), kind.r, zSide * kind.wb / 2);
-        const wheel = new THREE.Mesh(wheelGeo, wheelMat);
-        wheel.scale.set(kind.bus ? 1.3 : 1, size, size);
-        wheel.add(new THREE.Mesh(hubGeo, hubMat));
+        pivot.position.set(side * parts.wheelX, k.r, z);
+        const wheel = new THREE.Object3D(); // drawn by the shared wheel mesh, see updateWheelInstances
         pivot.add(wheel);
-        group.add(pivot);
+        if (side < 0) wheel.rotation.y = Math.PI; // the rim faces outward on both sides
+        wheelSlot(parts.wheel, wheel, model);
+        if (parts.dual && axle === 1) {
+          const inner = new THREE.Object3D();
+          inner.position.x = -0.32;
+          wheel.add(inner);
+          wheelSlot(parts.wheel, inner, model);
+        }
+        detail.add(pivot);
         wheels.push(wheel);
-        if (zSide === 1) frontPivots.push(pivot);
+        if (axle === 0) frontPivots.push(pivot);
       }
-    }
+    });
 
     const flame = new THREE.Mesh(
       new THREE.ConeGeometry(0.28, 1.6, 10),
       new THREE.MeshBasicMaterial({ color: 0xff9a1f, transparent: true, opacity: 0.85 })
     );
     flame.rotation.x = -Math.PI / 2; // tip points backwards
-    flame.position.set(0, kind.g + 0.2, -hl - 0.75);
+    flame.position.set(0, k.clear + 0.2, -hl - 0.75);
     flame.visible = false;
     group.add(flame);
 
     scene.add(group);
-    return {
-      group, wheels, frontPivots, tailMat, flame, cabin, kind: name, dims: kind.dims, stats: kind.stats,
-      seat: kind.seat, seatY: kind.seatY, roof: kind.roof, deform, glassParts, door: doors[0],
-    };
+    model.body = body;
+    model.glassMesh = glass;
+    return Object.assign(model, {
+      wheels, frontPivots, tailMat, amberL, amberR, headMat, flame, cabin, kind: name, dims: k.dims, stats: k.stats,
+      seat: k.seat, seatY: k.seatY, roof: parts.roofTop, deform, glassParts, door, paint, parts,
+    });
   }
 
   // A motorbike: two wheels, forks that steer, tank, seat, engine and exhaust.
@@ -2818,6 +6366,7 @@
     if (kind === true) kind = 'sports';
     if (kind === 'moto') return createMotorbike(color);
     if (kind === 'sports' && carTemplate) return createModelCar(color, true);
+    if (vehicleTemplates[kind]) return createModelVehicle(color, kind); // the bus and the truck
     return createBuiltCar(color, kind === 'sports' ? 'sedan' : kind);
   }
 
@@ -2874,22 +6423,188 @@
     model.steeringWheel = wheel;
   }
 
+  // ---------- Vehicle lights ----------
+
+  // Your own vehicle's lights are yours to work, by key or by typing a command in the
+  // console: headlamps (automatic, on, full beam or off), the indicators and hazard lights,
+  // emergency lights with a siren, and the brake lamps. Traffic signals its own turns and
+  // lane changes.
+  const lights = { head: 'auto', indicator: null, emergency: false, brakes: false };
+  const HEAD_MODES = ['auto', 'on', 'high', 'off'];
+  let flashers = null; // red and blue lamps behind the grille, for a car with no light bar
+
+  function setLights(change, quiet = false) {
+    Object.assign(lights, change);
+    if (quiet) return;
+    const parts = [];
+    parts.push(`Headlights ${lights.head === 'high' ? 'full beam' : lights.head}`);
+    if (lights.indicator) parts.push(lights.indicator === 'hazard' ? 'hazards on' : `${lights.indicator} indicator`);
+    if (lights.emergency) parts.push('emergency lights');
+    if (lights.brakes) parts.push('brake lamps held on');
+    showToast(parts.join(' · '));
+  }
+
+  function toggleIndicator(which) {
+    setLights({ indicator: lights.indicator === which ? null : which });
+  }
+
+  // Red and blue strobes for any car without a police light bar: a pair behind the grille
+  // and a pair on the dashboard.
+  function addFlashers(model) {
+    const red = new THREE.MeshBasicMaterial({ color: 0x400808 });
+    const blue = new THREE.MeshBasicMaterial({ color: 0x081040 });
+    const group = new THREE.Group();
+    const { hl } = model.dims;
+    for (const [x, mat] of [[0.22, red], [-0.22, blue]]) {
+      const grille = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.06, 0.04), mat);
+      grille.position.set(x, (model.stats.eye || 1.2) - 0.62, hl + 0.01);
+      const dash = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.06, 0.08), mat);
+      dash.position.set(x, (model.stats.eye || 1.2) - 0.22, (model.seat ? model.seat[0] : 0) + 0.62);
+      group.add(grille, dash);
+    }
+    model.group.add(group);
+    return { group, red, blue, model };
+  }
+
+  // Far-off vehicles drop their small parts: wheels, seats and indicators are a few pixels
+  // at that distance, and leaving them out saves hundreds of draw calls.
+  function updateVehicleDetail() {
+    const eye = camera.position;
+    const near = (m) => {
+      if (!m.detail) return;
+      const p = m.group.position;
+      const d2 = (p.x - eye.x) ** 2 + (p.z - eye.z) ** 2;
+      m.detail.visible = d2 < 150 * 150;
+      // past 70 m the body is the coarse shell, doors and all (unless it is dented: that shape is its own)
+      const parts = m.parts;
+      if (!parts || !parts.paintFar || m.body.userData.pristine || m.doorOpen) return;
+      const far = d2 > 70 * 70;
+      m.body.geometry = far ? parts.paintFar : parts.paint;
+      m.glassMesh.geometry = far ? parts.glassFar : parts.glass;
+      if (m.door) m.door.visible = !far;
+    };
+    for (const c of traffic) near(c.model);
+    for (const c of highwayTraffic) near(c.model);
+    for (const v of idleCars) near(v.model);
+    for (const p of police) near(p.model);
+    if (player && player.detail) {
+      player.detail.visible = true;
+      if (player.paintFar !== undefined || (player.parts && player.parts.paintFar && !player.body.userData.pristine)) {
+        player.body.geometry = player.parts.paint;
+        player.glassMesh.geometry = player.parts.glass;
+        if (player.door) player.door.visible = true;
+      }
+    }
+  }
+
+  // Every frame: blink the indicators, flash the emergency lights, set the headlamps.
+  function updateVehicleLights(dt) {
+    updateVehicleDetail();
+    const blink = Math.floor(clock * 2.6) % 2 === 0;
+    const signal = (model, indicator) => {
+      if (!model.amberL) return;
+      const left = blink && (indicator === 'left' || indicator === 'hazard');
+      const right = blink && (indicator === 'right' || indicator === 'hazard');
+      model.amberL.color.setHex(left ? AMBER_ON : AMBER_OFF);
+      model.amberR.color.setHex(right ? AMBER_ON : AMBER_OFF);
+    };
+    for (const c of traffic) signal(c.model, c.model.indicator);
+    for (const c of highwayTraffic) signal(c.model, c.target !== c.lane ? 'right' : null);
+    for (const v of idleCars) if (v.model.indicator) signal(v.model, v.model.indicator);
+
+    // headlamps on every vehicle follow the daylight
+    const lit = headlightMat.color.getHex();
+    for (const material of headMats) if (!material.userData.mine) material.color.setHex(lit);
+
+    const driving = mode === 'car' && player;
+    if (!driving) {
+      if (flashers) flashers.group.visible = false;
+      return;
+    }
+    signal(player, lights.indicator);
+    if (player.headMat) {
+      player.headMat.userData.mine = true;
+      const on = lights.head === 'on' || lights.head === 'high' || (lights.head === 'auto' && lampsOnNow > 0.5);
+      let color = lights.head === 'off' ? 0x6d6d66 : on ? (lights.head === 'high' ? 0xffffff : 0xfff6dc) : lit;
+      // emergency: the headlamps flash in turn
+      if (lights.emergency && Math.floor(clock * 6) % 2 === 0) color = 0x6d6d66;
+      player.headMat.color.setHex(color);
+    }
+    if (headBeam) {
+      const beam = lights.head === 'off' ? 0 : lights.head === 'high' ? 2.8 : lights.head === 'on' ? 1.5 : lampsOnNow * 1.5;
+      headBeam.intensity = beam;
+      headBeam.angle = lights.head === 'high' ? 0.42 : 0.55;
+      headBeam.distance = lights.head === 'high' ? 140 : 75;
+      if (player.beam) {
+        player.beam.material = playerBeamMat;
+        playerBeamMat.opacity = Math.min(1, beam / 1.5) * 0.7;
+        player.beam.scale.set(1, 1, lights.head === 'high' ? 1.6 : 1);
+      }
+    }
+    if (lights.brakes) player.tailMat.color.setHex(0xff2a2a);
+
+    // emergency lights: the light bar if it has one, strobes if not
+    const strobe = Math.floor(clock * 7) % 2 === 0;
+    if (player.bar) {
+      player.bar[0].color.setHex(lights.emergency && strobe ? 0xff2020 : 0x400808);
+      player.bar[1].color.setHex(lights.emergency && !strobe ? 0x2060ff : 0x081040);
+    } else if (lights.emergency) {
+      if (!flashers || flashers.model !== player) {
+        if (flashers) flashers.group.parent.remove(flashers.group);
+        flashers = addFlashers(player);
+      }
+      flashers.group.visible = true;
+      flashers.red.color.setHex(strobe ? 0xff2020 : 0x400808);
+      flashers.blue.color.setHex(strobe ? 0x081040 : 0x2060ff);
+    } else if (flashers) {
+      flashers.group.visible = false;
+    }
+    void dt;
+  }
+  const playerBeamMat = beamMat.clone();
+
+  // The police look: a light bar on the roof, a dark band with POLICE along the doors,
+  // and a push bar on the front.
+  const policeBand = new THREE.MeshPhongMaterial({
+    shininess: 80, specular: 0x666666,
+    map: canvasTexture(512, 128, (g, w, h) => {
+      g.fillStyle = '#0f1724';
+      g.fillRect(0, 0, w, h);
+      g.fillStyle = '#2a64d8';
+      g.fillRect(0, h - 22, w, 10);
+      g.fillStyle = '#ffffff';
+      g.font = 'bold 72px system-ui, sans-serif';
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      g.fillText('POLICE', w / 2, h / 2 - 8);
+    }),
+  });
   function addPoliceLook(model) {
     const red = new THREE.MeshBasicMaterial({ color: 0xff2020 });
     const blue = new THREE.MeshBasicMaterial({ color: 0x2060ff });
-    [[0.35, red], [-0.35, blue]].forEach(([x, mat]) => {
-      const lamp = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.16, 0.3), mat);
-      lamp.position.set(x, model.roof + 0.1, -0.25);
+    const roof = model.roof;
+    const base = new THREE.Mesh(new THREE.BoxGeometry(1.25, 0.07, 0.32), trimMat);
+    base.geometry.setAttribute('color', new THREE.Float32BufferAttribute(new Array(base.geometry.attributes.position.count * 3).fill(0.08), 3));
+    base.position.set(0, roof + 0.05, -0.2);
+    model.group.add(base);
+    [[0.33, red], [-0.33, blue]].forEach(([x, mat]) => {
+      const lamp = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.12, 0.26), mat);
+      lamp.position.set(x, roof + 0.14, -0.2);
       model.group.add(lamp);
     });
+    const white = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.1, 0.24), new THREE.MeshBasicMaterial({ color: 0xf4f4f4 }));
+    white.position.set(0, roof + 0.13, -0.2);
+    model.group.add(white);
     model.bar = [red, blue];
-    // black-and-white livery: a dark band along the doors
-    const stripe = new THREE.Mesh(
-      new THREE.BoxGeometry(model.dims.hw * 2 + 0.03, 0.3, 2.3),
-      new THREE.MeshLambertMaterial({ color: 0x14181f })
-    );
-    stripe.position.set(0, 0.68, -0.2);
-    model.group.add(stripe);
+    if (model.parts && model.parts.doorBand) {
+      const band = new THREE.Mesh(model.parts.doorBand, policeBand);
+      model.group.add(band);
+    }
+    // a push bar on the nose
+    const { hl } = model.dims;
+    const bar = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.36, 0.06), new THREE.MeshLambertMaterial({ color: 0x15171a }));
+    bar.position.set(0, 0.62, hl + 0.06);
+    model.group.add(bar);
   }
 
   // Cars nobody is driving: parked ones, and any car the player has left somewhere.
@@ -2904,14 +6619,14 @@
       minX: x - hx, maxX: x + hx, minZ: z - hz, maxZ: z + hz, minY: y - 0.5, maxY: y + model.roof + 0.2, top, owner: model,
       car: { x, z, h, hl: model.dims.hl, hw: model.dims.hw }, // its true outline, for walking and driving round it
     };
-    colliders.push(box);
+    addCollider(box);
     idleCars.push({ model, x, y, z, h, box });
   }
 
   function addParkedCars() {
     const kinds = ['sedan', 'sedan', 'sedan', 'hatch', 'hatch', 'hatch', 'suv', 'suv', 'pickup', 'sports'];
     for (const bay of bays) {
-      if (Math.random() > 0.3) continue;
+      if (Math.random() > (bay.x < -300 ? 0.08 : 0.3)) continue;
       bay.taken = true;
       const kind = pick(kinds);
       const parked = createCar(pick(kind === 'sports' ? SPORTS_COLORS : TRAFFIC_COLORS), kind);
@@ -3008,6 +6723,7 @@
       signal.x = roadCenter(signal.i) + (rx - dx) * (JUNCTION + 0.7);
       signal.z = roadCenter(signal.j) + (rz - dz) * (JUNCTION + 0.7);
       signal.turn = Math.atan2(-dx, -dz);
+      signal.box = addPost(signal.x, signal.z, 0.16, KERB, 6, { signal: k });
       post.position.set(signal.x, KERB, signal.z);
       post.rotation.y = signal.turn;
       SIGNAL_PARTS.forEach((part, p) => part.at.forEach((at, a) => {
@@ -3050,6 +6766,7 @@
   function breakSignal(k, dirX, dirZ) {
     const signal = signals[k];
     signal.broken = true;
+    if (signal.box) removeCollider(signal.box);
     SIGNAL_PARTS.forEach((part, p) => {
       part.at.forEach((at, a) => signalMeshes[p].setMatrixAt(k * part.at.length + a, hidden));
       signalMeshes[p].instanceMatrix.needsUpdate = true;
@@ -3122,7 +6839,8 @@
   const traffic = [];
   const STOP_LINE = CELL - JUNCTION - 5.2; // where a vehicle's nose stops for a red light
   const PASSING_LANE = -ROAD_WIDTH / 4; // the inner lane, as an offset from the outer one
-  const TRAFFIC_MIX = [['sedan', 30], ['hatch', 24], ['suv', 18], ['pickup', 10], ['moto', 9], ['bus', 5], ['sports', 4]];
+  const TRAFFIC_MIX = [['sedan', 28], ['hatch', 22], ['suv', 18], ['pickup', 9], ['moto', 8], ['bus', 5], ['truck', 5], ['sports', 4]];
+  const colorFor = (kind) => pick(kind === 'sports' ? SPORTS_COLORS : kind === 'bus' ? BUS_COLORS : kind === 'truck' ? TRUCK_COLORS : TRAFFIC_COLORS);
 
   function carrotPoint(c) {
     if (c.phase === 'road') {
@@ -3162,8 +6880,8 @@
       if (Math.hypot(c.cx - START.x, c.cz - START.z) < 30) continue;
       if (traffic.some((o) => Math.hypot(o.x - c.cx, o.z - c.cz) < 16)) continue;
       const kind = pickKind();
-      c.model = createCar(pick(kind === 'sports' ? SPORTS_COLORS : TRAFFIC_COLORS), kind);
-      if (kind === 'bus') c.cruise = rand(7, 9);
+      c.model = createCar(colorFor(kind), kind);
+      if (kind === 'bus' || kind === 'truck') c.cruise = rand(7, 9);
       Object.assign(c, { x: c.cx, z: c.cz, h: Math.atan2(DIRS[c.d][0], DIRS[c.d][1]) });
       c.driver = addDriver(c.model);
       addBeam(c.model);
@@ -3203,6 +6921,7 @@
     c.u = 0;
     c.side = right ? PASSING_LANE : 0;
     c.phase = 'turn';
+    c.model.indicator = c.d2 === c.d ? null : right ? 'right' : 'left';
   }
 
   // Only one vehicle crosses a junction at a time, so paths never cross inside one. The
@@ -3246,7 +6965,10 @@
         const du = Math.min(1 - c.u, amount / c.len);
         c.u += du;
         amount -= du * c.len;
-        if (c.u >= 1 - 1e-6) Object.assign(c, { i: c.ni, j: c.nj, d: c.d2, t: JUNCTION, phase: 'road' });
+        if (c.u >= 1 - 1e-6) {
+          Object.assign(c, { i: c.ni, j: c.nj, d: c.d2, t: JUNCTION, phase: 'road' });
+          c.model.indicator = null;
+        }
         else break;
       }
     }
@@ -3263,6 +6985,14 @@
     if (car.y < 1.5 && mode !== 'heli') {
       const dims = mode === 'car' ? player.dims : { hl: 0.5, hw: 0.4 }; // on foot, bike or horse: something narrow
       list.push({ x: car.x, z: car.z, h: car.heading, speed: Math.hypot(car.vx, car.vz), ...dims });
+    }
+    // people off the pavement: fighting, running, walking back, or lying in the road
+    for (const w of walkers) {
+      if (w.state === 'walk') continue;
+      const p = w.group.position;
+      if (p.y > 0.6) continue;
+      const lying = !onFeet(w);
+      list.push({ x: p.x, z: p.z, h: w.group.rotation.y, speed: 0, hl: lying ? 1 : 0.35, hw: lying ? 0.45 : 0.35 });
     }
     return list;
   }
@@ -3483,6 +7213,132 @@
     }
   }
 
+  // ---------- Highway traffic ----------
+
+  // Traffic on the highway keeps to its lanes at highway speed, closes up behind slower
+  // vehicles and pulls out to pass them when the next lane is clear, and stops for
+  // anything in the way, you included. Each one drives into a tunnel at one end and comes
+  // back out of the tunnel at the other.
+  const HIGHWAY_CARS = 30;
+  const highwayTraffic = [];
+
+  function spawnHighwayTraffic() {
+    const spacing = (HIGHWAY.end * 2) / (HIGHWAY_CARS / 6);
+    for (let n = 0; n < HIGHWAY_CARS; n++) addHighwayCar(n % 6, -HIGHWAY.end + (Math.floor(n / 6) + rand(0.1, 0.9)) * spacing);
+  }
+
+  // One vehicle on the highway, in lane `index` at x.
+  function addHighwayCar(index, x) {
+    {
+      const lane = highwayLanes[index];
+      const kind = pickKind();
+      const model = createCar(colorFor(kind), kind);
+      const slow = kind === 'bus' || kind === 'truck';
+      const c = {
+        model, lane: index, x, z: lane.z, dir: lane.dir,
+        speed: 22, cruise: slow ? rand(18, 22) : rand(24, 33), shift: 0, target: index, stunned: 0,
+      };
+      c.h = c.dir > 0 ? Math.PI / 2 : -Math.PI / 2;
+      c.driver = addDriver(model);
+      addBeam(model);
+      c.box = { minX: 0, maxX: 0, minZ: 0, maxZ: 0, maxY: model.roof + 0.2, owner: model, highway: c, car: { x: 0, z: 0, h: 0, ...model.dims } };
+      trafficBoxes.push(c.box);
+      highwayTraffic.push(c);
+    }
+  }
+
+  // The gap ahead of a vehicle in lane `lane`: to the next vehicle there, or to you.
+  function highwayGap(c, lane) {
+    const z = highwayLanes[lane].z;
+    let gap = 200;
+    let speed = 99;
+    for (const o of highwayTraffic) {
+      if (o === c || Math.abs(o.z - z) > 2.6) continue;
+      const d = (o.x - c.x) * c.dir - (o.model.dims.hl + c.model.dims.hl);
+      if (d > -1 && d < gap) {
+        gap = d;
+        speed = o.speed;
+      }
+    }
+    // the player, on foot or on wheels, standing or driving in the lane
+    if (car.y < 2 && Math.abs(car.z - z) < 2.6 && Math.abs(car.x) < HIGHWAY.end) {
+      const d = (car.x - c.x) * c.dir - c.model.dims.hl - (mode === 'car' ? player.dims.hl : 0.5);
+      if (d > -1.5 && d < gap) {
+        gap = d;
+        speed = Math.max(0, (car.vx || 0) * c.dir);
+      }
+    }
+    return { gap, speed };
+  }
+
+  // Is lane `lane` free from `back` metres behind to `front` metres ahead of c?
+  function laneFree(c, lane, back, front) {
+    const z = highwayLanes[lane].z;
+    for (const o of highwayTraffic) {
+      if (o === c || Math.abs(o.z - z) > 2.8) continue;
+      const d = (o.x - c.x) * c.dir;
+      if (d > -back && d < front) return false;
+    }
+    return !(car.y < 2 && Math.abs(car.z - z) < 3 && (car.x - c.x) * c.dir > -back && (car.x - c.x) * c.dir < front);
+  }
+
+  function updateHighwayTraffic(dt) {
+    for (const c of highwayTraffic) {
+      const m = c.model;
+      c.stunned = Math.max(0, c.stunned - dt);
+      const { gap, speed: lead } = highwayGap(c, c.target);
+      // keep two seconds back from whatever is ahead, closing up gently
+      const safe = 6 + c.speed * 1.6;
+      let want = c.cruise;
+      if (gap < safe) want = Math.min(want, lead + (gap - 6) * 0.6);
+      if (gap < 4) want = 0;
+      if (c.stunned > 0 || c.jacked) want = 0;
+      if (m.flats && m.flats.length) want = Math.min(want, 9);
+      want = Math.max(0, want);
+      c.speed = approach(c.speed, want, (want < c.speed ? 9 : 2.5) * dt);
+
+      // stuck behind something slower: look for a clear lane alongside, the faster one first
+      c.laneTimer = (c.laneTimer || 0) - dt;
+      if (c.laneTimer <= 0 && c.target === c.lane && gap < safe + 15 && lead < c.cruise - 3) {
+        c.laneTimer = 2;
+        const options = [c.lane - 2, c.lane + 2].filter((k) => k >= 0 && k < 6);
+        for (const k of options.sort((a, b) => a - b)) {
+          if (laneFree(c, k, 14, 30)) {
+            c.target = k;
+            break;
+          }
+        }
+      }
+      // ease across into the target lane, and drift back toward the slow lane when it is clear
+      const goalZ = highwayLanes[c.target].z;
+      const dz = goalZ - c.z;
+      const sideways = Math.max(-1.6, Math.min(1.6, dz * 1.2)) * Math.min(1, c.speed / 6);
+      c.z += sideways * dt;
+      if (Math.abs(dz) < 0.05) {
+        c.z = goalZ;
+        c.lane = c.target;
+        if (c.laneTimer <= 0 && c.lane + 2 < 6 && laneFree(c, c.lane + 2, 20, 50) && Math.random() < 0.01) c.target = c.lane + 2;
+      }
+      c.x += c.dir * c.speed * dt;
+      // through the tunnel at one end and out of the other
+      if (c.x * c.dir > HIGHWAY.end) c.x -= c.dir * HIGHWAY.end * 2;
+
+      c.h = Math.atan2(c.dir * c.speed, sideways) || c.h;
+      if (c.speed < 0.5) c.h = c.dir > 0 ? Math.PI / 2 : -Math.PI / 2;
+      m.group.position.set(c.x, 0.04, c.z);
+      m.group.rotation.set(0, c.h, flatLean(m));
+      for (const wheel of m.wheels) wheel.rotation.x += (m.spin || 1) * (c.speed / 0.38) * dt;
+      m.tailMat.color.setHex(want < c.speed - 0.3 || c.speed < 0.1 ? 0xff2a2a : tailIdle);
+      const near = Math.abs(c.x - car.x) < 140 && Math.abs(c.z - car.z) < 140;
+      if (c.driver) c.driver.visible = near;
+      m.group.visible = Math.abs(c.x) < HIGHWAY.portal + 230;
+
+      const [hx, hz] = footprint(m, c.h);
+      Object.assign(c.box, { minX: c.x - hx, maxX: c.x + hx, minZ: c.z - hz, maxZ: c.z + hz });
+      Object.assign(c.box.car, { x: c.x, z: c.z, h: c.h });
+    }
+  }
+
   // --- drivers ---
 
   const frameQ = new THREE.Quaternion();
@@ -3524,13 +7380,12 @@
 
   // Someone at the wheel (or on the saddle): one of the pedestrian avatars, seated, or a
   // plain figure if those did not load. A bus's driver is hidden behind its dark glass.
-  function addDriver(model) {
-    if (model.kind === 'bus') return null;
+  function addDriver(model, chosen = null) {
     const figure = new THREE.Group();
     const seat = model.seat || [-0.2, 0.38];
     model.group.add(figure);
     if (npcTemplates.length) {
-      const template = pick(npcTemplates);
+      const template = chosen || pick(npcTemplates);
       const body = THREE.SkeletonUtils.clone(template.scene);
       figure.userData.template = template; // so the same person can be turned out onto the road
       figure.add(body);
@@ -3723,7 +7578,7 @@
             ? new THREE.QuaternionKeyframeTrack(`${t.bone}.quaternion`, clip.times, t.values)
             : new THREE.VectorKeyframeTrack(`${t.bone}.position`, clip.times, t.values))));
         }
-        npcTemplates.push({ scene: gltf.scene, clips });
+        npcTemplates.push({ scene: gltf.scene, clips, female: !!entry.female });
         ready();
       }, (error) => {
         console.warn(`Pedestrian model ${entry.name} failed to load.`, error);
@@ -3741,10 +7596,15 @@
       const mixer = new THREE.AnimationMixer(body);
       const walk = mixer.clipAction(template.clips.walk);
       const idle = mixer.clipAction(template.clips.idle);
+      const run = template.clips.run ? mixer.clipAction(template.clips.run) : null;
       walk.play();
       idle.play();
+      if (run) {
+        run.play();
+        run.setEffectiveWeight(0);
+      }
       walk.time = Math.random(); // out of step with one another
-      return { group, skin: { mixer, walk, idle }, stride: 4.2, isPerson: true };
+      return { group, skin: { mixer, walk, idle, run }, stride: 4.2, isPerson: true, running: 0, female: template.female };
     }
     const model = buildHuman({
       shirt: pick(shirtMats),
@@ -3782,7 +7642,7 @@
   function spawnWalkers(count, create, minSpeed, maxSpeed) {
     for (let n = 0; n < count; n++) {
       const block = pick(cityBlocks);
-      const half = rand(27.7, 29.4);
+      const half = rand(28, 28.7); // the middle of the footpath, clear of shop fronts and posts
       const w = create();
       Object.assign(w, {
         cx: block.x,
@@ -3801,20 +7661,25 @@
     }
   }
 
-  const onFeet = (w) => w.state === 'walk' || w.state === 'stagger' || w.state === 'goto';
+  const onFeet = (w) => ['walk', 'stagger', 'goto', 'stumble', 'stunned', 'chase', 'fight', 'flee'].includes(w.state);
 
   // Hurts a pedestrian or dog. (dirX, dirZ) is the way the blow was travelling. Light hits
   // make them stagger; a hard knock or low health puts them on the ground, and they get
   // back up and limp on if they still have health left. Returns true if they went down.
   function hurtWalker(w, damage, dirX, dirZ, knockDown = false) {
     if (!onFeet(w)) return false;
+    if (w.away) setPavementGoal(w, w.group.position.x, w.group.position.z); // once up, home from here
+    w.group.rotation.x = w.group.rotation.z = 0;
+    w.pose = null;
+    w.actMove = 0;
+    w.fight = null;
     w.health -= w.isPerson ? damage : 0; // dogs are only ever bowled over
     const facing = w.group.rotation.y;
     // pushed along the way they face: they pitch forward; otherwise they go over backwards
     w.tipSign = dirX * Math.sin(facing) + dirZ * Math.cos(facing) >= 0 ? 1 : -1;
     w.dying = w.health <= 0;
     if (w.dying || knockDown || w.health < 40 || !w.isPerson) {
-      w.state = 'fall';
+      startFall(w, dirX, dirZ, knockDown ? 1.35 : 1); // bowled over goes down quicker
       return true;
     }
     w.state = 'stagger';
@@ -3822,27 +7687,664 @@
     return false;
   }
 
+  // --- going down like a person, not a plank ---
+
+  // Shot, knocked out or killed, nobody tips over stiff. The knees go first and the body
+  // drops onto them (or, knocked backwards, down onto its seat as the feet slide out),
+  // slumps, and then goes over: face down past the knees, or back flat on the ground, the
+  // head lolling to one side and the arms flopping where they land. Each moment says
+  // where the hips, knees and feet are; the limbs are pointed to join them up and the
+  // body pitched and placed to put the hips there. Played backwards it gets them up again.
+  const COLLAPSE = { 1: [0.42, 0.6, 1.18, 1.5], [-1]: [0.48, 0.62, 1.12, 1.45] }; // knees gone, slumped, down, settled
+  const collapseEnd = (dir) => COLLAPSE[dir][3];
+  const limp = (x, y, z) => new THREE.Vector3(x, y, z).normalize();
+  // where the arms come to rest, face down (1) or on the back (-1); x is the body's left
+  const LIMP = {
+    1: { armL: limp(0.3, -0.93, 0.1), foreL: limp(0.12, -0.95, 0.1), armR: limp(-0.42, -0.88, 0.06), foreR: limp(-0.05, -0.85, 0.12) },
+    [-1]: { armL: limp(0.85, -0.42, -0.05), foreL: limp(0.62, 0.25, 0.02), armR: limp(-0.8, -0.5, -0.05), foreR: limp(-0.75, -0.2, 0.02) },
+  };
+  const legFrom = new THREE.Vector3();
+  const legTo = new THREE.Vector3();
+
+  // Thigh, shin and foot lengths, the ankle's height and so the hip's, in metres, from the bones.
+  function measureLegs(group, thigh, knee, foot, otherFoot, toe) {
+    group.updateMatrixWorld(true);
+    thigh.getWorldPosition(legFrom);
+    knee.getWorldPosition(legTo);
+    const upper = legFrom.distanceTo(legTo);
+    foot.getWorldPosition(legFrom);
+    const lower = legFrom.distanceTo(legTo);
+    const low = legFrom.y;
+    otherFoot.getWorldPosition(legFrom);
+    group.getWorldPosition(legTo);
+    const ankle = Math.max(0.05, Math.min(0.13, Math.min(low, legFrom.y) - legTo.y));
+    let toeLength = 0.12;
+    if (toe) {
+      foot.getWorldPosition(legFrom);
+      toe.getWorldPosition(legTo);
+      toeLength = legFrom.distanceTo(legTo);
+    }
+    // standing, the ball of the foot is on the ground: the line from ankle to it slopes down
+    const flat = Math.acos(Math.max(0, Math.min(1, (ankle - 0.03) / toeLength)));
+    return { upper, lower, ankle, flat, foot: toeLength + 0.04, hip: ankle + upper + lower };
+  }
+
+  // The body `t` seconds into going down: over forwards (`dir` 1) or backwards (-1), the
+  // head turning to `side` (±1). Gives the pose (trunk and head turns, and each limb's
+  // direction in the body's own frame), the pitch of the whole body, and where its feet
+  // (its origin) are, ahead of and above where it stood.
+  function collapseAt(t, dir, side, legs) {
+    const [t1, t2, t3, t4] = COLLAPSE[dir];
+    const { upper, lower, ankle, hip } = legs;
+    let pitch; let spine; let neck; let turn = 0; let lean = 0; let flop = 0;
+    let hf; let hy; let thighA; let shinA; // the hips ahead and up; thigh and shin from straight down, forward +
+    let footA; // the feet: flat to begin with, then pointed back along the shins under the body
+    if (dir > 0) {
+      let s; // the shins folding forward about the ankles till the knees meet the ground
+      let a; // the thighs, leaning forward as the hips sink
+      if (t < t1) {
+        const e = smooth(t / t1);
+        s = (Math.PI / 2) * e;
+        a = 0.15 * e + 0.45 * Math.sin(Math.PI * e);
+        pitch = 0.12 * e;
+        spine = 0.35 * e;
+        neck = 0.45 * e;
+      } else if (t < t2) {
+        // on the knees, the head and shoulders sagging
+        const e = smooth((t - t1) / (t2 - t1));
+        s = Math.PI / 2;
+        a = 0.15 - 0.1 * e;
+        pitch = 0.12 + 0.13 * e;
+        spine = 0.35 + 0.2 * e;
+        neck = 0.45 + 0.15 * e;
+      } else {
+        // over the knees and down on the face, gathering speed
+        const v = Math.min(1, (t - t2) / (t3 - t2));
+        const g = v * v;
+        s = Math.PI / 2;
+        a = 0.05 - 1.5 * g;
+        pitch = 0.25 + 1.3 * v ** 1.7;
+        spine = 0.55 * (1 - g);
+        neck = 0.6 - 0.75 * g;
+        turn = side * 1.1 * g;
+        lean = side * 0.12 * g;
+        flop = g;
+        if (t > t3) spine -= 0.08 * Math.sin(Math.PI * Math.min(1, (t - t3) / (t4 - t3))); // the thump
+      }
+      // the feet roll from flat to pointed back under him, up on the toes as they go over
+      const flat = legs.flat || Math.PI / 2;
+      footA = -s + flat - (flat - 0.4) * smooth((s / (Math.PI / 2) - 0.3) / 0.7);
+      const heel = Math.max(ankle, (legs.foot || 0.15) * Math.cos(footA) + 0.03);
+      const kf = lower * Math.sin(s);
+      const ky = heel + lower * Math.cos(s);
+      hf = kf - upper * Math.sin(a);
+      hy = ky + upper * Math.cos(a);
+      thighA = a;
+      shinA = -s;
+    } else {
+      let af; // the feet, sliding out in front
+      if (t < t1) {
+        const e = smooth(t / t1);
+        af = 0.5 * e * e;
+        hf = -0.1 * e - 0.06 * Math.sin(Math.PI * e);
+        hy = hip + (0.13 - hip) * e;
+        pitch = -0.25 * e;
+        spine = 0.3 * e;
+        neck = 0.5 * e;
+      } else if (t < t2) {
+        // sat on the ground, slumped
+        const e = smooth((t - t1) / (t2 - t1));
+        af = 0.5 + 0.04 * e;
+        hf = -0.1;
+        hy = 0.13;
+        pitch = -0.25 - 0.15 * e;
+        spine = 0.3 - 0.05 * e;
+        neck = 0.5;
+      } else {
+        // back over and flat, the legs sliding straight
+        const v = Math.min(1, (t - t2) / (t3 - t2));
+        const g = v * v;
+        af = 0.54 + 0.3 * smooth(v);
+        hf = -0.1;
+        hy = 0.13 + 0.01 * g;
+        pitch = -0.4 - 1.15 * g;
+        spine = 0.25 * (1 - g);
+        neck = 0.5 - 0.62 * g;
+        turn = side * 0.9 * g;
+        lean = side * 0.1 * g;
+        flop = g;
+        if (t > t3) neck += 0.12 * Math.sin(Math.PI * Math.min(1, (t - t3) / (t4 - t3))); // the head knocks the ground
+      }
+      // the knee where thigh and shin meet, bent forward of the line from hip to ankle
+      const dx = af - hf;
+      const dy = ankle - hy;
+      const d = Math.min(upper + lower - 1e-3, Math.hypot(dx, dy));
+      const bend = Math.acos(Math.max(-1, Math.min(1, (upper * upper + d * d - lower * lower) / (2 * upper * d))));
+      thighA = Math.atan2(dx, -dy) + bend;
+      const kf = hf + upper * Math.sin(thighA);
+      const ky = hy - upper * Math.cos(thighA);
+      shinA = Math.atan2(af - kf, ky - ankle);
+      footA = shinA + (legs.flat || Math.PI / 2) - 0.35 * flop; // on the heels, toes up, falling slack at the end
+    }
+    const trail = dir > 0 ? -0.45 * Math.min(1, pitch / 0.5) : 0.15;
+    const elbow = dir > 0 ? trail * 0.4 : 0.9; // sat down, the hands fall in the lap
+    // a limb at `angle` from straight down in the world is at angle + pitch in the body
+    const limb = (angle, x) => new THREE.Vector3(x, -Math.cos(angle + pitch), Math.sin(angle + pitch)).normalize();
+    const rest = LIMP[dir];
+    const flopped = (key, hang) => {
+      // mirrored when the head goes the other way
+      const mirror = side < 0 ? { armL: 'armR', armR: 'armL', foreL: 'foreR', foreR: 'foreL' }[key] : key;
+      const to = rest[mirror].clone();
+      if (side < 0) to.x = -to.x;
+      return hang.lerp(to, flop).normalize();
+    };
+    return {
+      pitch,
+      hf: hf - hip * Math.sin(pitch), // where the origin (the feet, standing) ends up
+      hy: hy - hip * Math.cos(pitch),
+      keys: { spine, neck, headTurn: turn, lean, twist: -lean },
+      aim: {
+        legL: limb(thighA, 0.06), kneeL: limb(shinA, 0.04), legR: limb(thighA, -0.06), kneeR: limb(shinA, -0.04),
+        // limp: hanging, and trailing a little behind as the body pitches forward (nobody
+        // out cold puts a hand out to save himself)
+        armL: flopped('armL', limb(trail, dir > 0 ? 0.2 : 0.3)), foreL: flopped('foreL', limb(elbow, 0.12)),
+        armR: flopped('armR', limb(trail, dir > 0 ? -0.2 : -0.3)), foreR: flopped('foreR', limb(elbow, -0.12)),
+        footL: limb(footA, 0.05), footR: limb(footA, -0.05),
+      },
+    };
+  }
+
+  // A pedestrian starts going down where it stands, the way the blow sends it.
+  function startFall(w, dirX, dirZ, rate = 1) {
+    const g = w.group;
+    const facing = g.rotation.y;
+    w.tipSign = dirX * Math.sin(facing) + dirZ * Math.cos(facing) >= 0 ? 1 : -1;
+    w.state = 'fall';
+    w.tip = 0;
+    w.ct = 0;
+    w.fallRate = rate;
+    w.side = Math.random() < 0.5 ? 1 : -1;
+    w.pose = null;
+    g.rotation.x = g.rotation.z = 0;
+    const y = w.away ? groundAt(g.position.x, g.position.z, g.position.y + 0.5) : w.gy;
+    w.fallAt = { x: g.position.x, y, z: g.position.z, h: facing };
+    w.placed = null;
+    if (w.skin && !w.legs) {
+      const r = walkerRig(w);
+      w.legs = measureBody(g, (key) => r[key] && r[key].bone);
+    }
+    w.plan = null;
+  }
+
+  // Places a falling, lying or rising pedestrian `w.ct` seconds into its collapse.
+  function placeCollapse(w) {
+    const at = w.fallAt;
+    if (w.placed && w.placed.ct === w.ct && w.placed.x === at.x && w.placed.z === at.z) return; // lying still
+    w.placed = { ct: w.ct, x: at.x, z: at.z };
+    const c = collapseAt(w.ct, w.tipSign, w.side, w.legs);
+    w.group.position.set(at.x + Math.sin(at.h) * c.hf, at.y + c.hy, at.z + Math.cos(at.h) * c.hf);
+    w.group.rotation.set(c.pitch, at.h, 0);
+    w.pose = { keys: c.keys, aim: c.aim, weight: 1, lying: true, brace: w.dying ? 0 : w.tipSign, at };
+  }
+
+  // Middle of a body lying on the ground (where a kick lands), or of one standing.
+  function bodyCentre(w) {
+    const g = w.group;
+    const up = w.legs ? w.legs.hip + 0.2 : 1.1;
+    return { x: g.position.x + Math.sin(g.rotation.y) * Math.sin(g.rotation.x) * up, z: g.position.z + Math.cos(g.rotation.y) * Math.sin(g.rotation.x) * up };
+  }
+
+  // --- getting up again ---
+
+  // Bends a two-bone limb (thigh, shin and ankle; or upper arm, forearm and wrist) so its
+  // end gets to `target` in the world, the knee or elbow out toward `pole`.
+  const reachRoot = new THREE.Vector3();
+  const reachMid = new THREE.Vector3();
+  const reachEnd = new THREE.Vector3();
+  const reachLine = new THREE.Vector3();
+  const reachBend = new THREE.Vector3();
+  const reachGoal = new THREE.Vector3();
+  const reachDir = new THREE.Vector3();
+  function reachFor(upper, mid, end, target, pole, weight = 1) {
+    if (!upper || !mid || !end || weight <= 0) return;
+    upper.getWorldPosition(reachRoot);
+    mid.getWorldPosition(reachMid);
+    end.getWorldPosition(reachEnd);
+    const l1 = reachRoot.distanceTo(reachMid);
+    const l2 = reachMid.distanceTo(reachEnd);
+    reachLine.copy(target).sub(reachRoot);
+    const d = Math.max(Math.abs(l1 - l2) + 1e-3, Math.min(l1 + l2 - 1e-3, reachLine.length()));
+    reachLine.normalize();
+    const along = (l1 * l1 + d * d - l2 * l2) / (2 * d);
+    const out = Math.sqrt(Math.max(0, l1 * l1 - along * along));
+    reachBend.copy(pole).addScaledVector(reachLine, -pole.dot(reachLine));
+    if (reachBend.lengthSq() < 1e-8) reachBend.set(0, 1, 0);
+    reachBend.normalize();
+    reachGoal.copy(reachRoot).addScaledVector(reachLine, d); // as near the target as the limb reaches
+    reachDir.copy(reachLine).multiplyScalar(along).addScaledVector(reachBend, out).normalize();
+    aimTowards(upper, mid, scene, reachDir, weight);
+    mid.getWorldPosition(reachMid);
+    reachDir.copy(reachGoal).sub(reachMid).normalize();
+    aimTowards(mid, end, scene, reachDir, weight);
+  }
+
+  // Points about someone down at `at` ({ x, y, z, h }): x to their left, f ahead, y up.
+  function fromFacing(at, x, f, y, out) {
+    const s = Math.sin(at.h);
+    const c = Math.cos(at.h);
+    return out.set(at.x + c * x + s * f, at.y + y, at.z - s * x + c * f);
+  }
+  function toFacing(at, v) {
+    const s = Math.sin(at.h);
+    const c = Math.cos(at.h);
+    const dx = v.x - at.x;
+    const dz = v.z - at.z;
+    return [dx * c - dz * s, dx * s + dz * c, v.y - at.y];
+  }
+
+  // How a body is built, in metres: legs (see measureLegs), the trunk from hips to
+  // shoulders, and the arm to the wrist.
+  function measureBody(group, bone) {
+    const need = ['legL', 'legR', 'kneeL', 'footL', 'footR', 'armL', 'armR', 'foreL', 'handL'];
+    if (need.some((key) => !bone(key))) return null;
+    const body = measureLegs(group, bone('legL'), bone('kneeL'), bone('footL'), bone('footR'), bone('toeL'));
+    const at = (key) => bone(key).getWorldPosition(new THREE.Vector3());
+    const hips = at('legL').add(at('legR')).multiplyScalar(0.5);
+    const shoulders = at('armL').add(at('armR')).multiplyScalar(0.5);
+    body.torso = hips.distanceTo(shoulders);
+    body.arm = at('armL').distanceTo(at('foreL')) + at('foreL').distanceTo(at('handL'));
+    return body;
+  }
+
+  // Where a body lying (or going down) at `at` is now: its hips and pitch from how it is
+  // placed, its feet and hands from the bones; the get-up starts from exactly there.
+  const sampled = new THREE.Vector3();
+  function sampleBody(group, bone, at, legs, keys) {
+    group.updateMatrixWorld(true);
+    const origin = toFacing(at, group.position);
+    const pitch = group.rotation.x;
+    const p = (key) => toFacing(at, bone(key).getWorldPosition(sampled));
+    const footA = ['L', 'R'].map((s) => {
+      const foot = p(`foot${s}`);
+      const toe = bone(`toe${s}`) ? p(`toe${s}`) : [foot[0], foot[1] + 0.1, foot[2]];
+      return Math.atan2(toe[1] - foot[1], foot[2] - toe[2]);
+    });
+    return {
+      hip: [origin[1] + legs.hip * Math.sin(pitch), origin[2] + legs.hip * Math.cos(pitch)],
+      pitch,
+      feet: [p('footL'), p('footR')],
+      footA,
+      hands: [p('handL'), p('handR')],
+      keys: { spine: 0, neck: 0, headTurn: 0, lean: 0, twist: 0, ...keys },
+      w: 1,
+    };
+  }
+
+  // The way up, as a list of moments eased one into the next. Each places the hips (and
+  // the pitch of the body), both feet (and which way the toes point), both hands, and the
+  // trunk and head. Face down (`dir` 1) he gets his hands under his shoulders, pushes up,
+  // draws his knees in onto all fours, brings one foot through to kneel on the other
+  // knee, pushes up off that knee with a hand on it, and stands. On his back (-1) he sits
+  // up leaning on his hands, draws his feet in, rocks forward onto hands and feet, pushes
+  // up off his knees, and stands. Then he looks himself over and brushes the dust off his
+  // legs and shoulder before he walks on.
+  function getUpPlan(dir, start, b) {
+    const { upper: U, lower: L, ankle: A, hip: H, torso: T, arm: R } = b;
+    const F = b.flat || Math.PI / 2; // a foot flat on the ground
+    const keys = [{ t: 0, ...start }];
+    const zero = { spine: 0, neck: 0, headTurn: 0, lean: 0, twist: 0 };
+    const at = (t, change) => {
+      const last = keys[keys.length - 1];
+      keys.push({ ...last, ...change, keys: { ...last.keys, ...(change.keys || {}) }, t });
+    };
+    const hang = (f, hipY) => [[0.21, f + 0.05, hipY + T - R * 0.97], [-0.21, f + 0.05, hipY + T - R * 0.97]];
+    let stand; // where he ends up on his feet
+    let t;
+    if (dir > 0) {
+      const hf = start.hip[0];
+      const plant = hf + T - 0.04; // hands flat under the shoulders
+      const hq = A + U * 0.96; // the hips on all fours
+      const pq = Math.acos(Math.max(-0.3, Math.min(0.3, (R * 0.9 + 0.06 - hq) / T))); // trunk about level, shoulders over the hands
+      const kq = plant - 0.06 - T * Math.sin(pq); // knees, and hips, under that
+      stand = kq + U * 0.95; // where the front foot goes down
+      const kneelY = A + U;
+      at(0.4, { hands: [[0.26, plant, 0.075], [-0.26, plant, 0.075]], keys: { ...zero, neck: -0.35 } }); // comes to: hands under him, head up
+      at(0.9, { hip: [hf, 0.19], pitch: 1.08, keys: { spine: -0.12, neck: -0.25 } }); // pushes up on his arms
+      at(1.45, { hip: [kq, hq], pitch: pq, feet: [[0.1, kq - L, A], [-0.1, kq - L, A]], footA: [-1.17, -1.17], keys: { spine: 0.1, neck: -0.15 } }); // knees in: all fours
+      at(1.85, { hip: [kq - 0.03, hq], pitch: pq - 0.25, feet: [[0.1, kq - L, A], [-0.13, kq + 0.08, 0.28]], footA: [-1.17, 0.9] }); // one knee drawn up under him
+      at(2.3, { hip: [kq + 0.02, kneelY], pitch: 0.32, feet: [[0.1, kq - L + 0.02, A], [-0.13, stand, A]], footA: [-1.17, F],
+        hands: [[0.16, kq + 0.1, A + U * 0.6], [-0.13, stand - 0.04, A + L + 0.07]], keys: { spine: 0.2, neck: 0.1 } }); // on one knee, a hand on the other
+      at(2.9, { hip: [kq + U * 0.5, H * 0.78], pitch: 0.42, feet: [[0.1, kq - L + 0.12, A + 0.04], [-0.13, stand, A]], footA: [-0.75, F],
+        hands: [[0.2, kq + U * 0.5 + 0.05, H * 0.55], [-0.12, stand - 0.1, A + L + 0.12]], keys: { spine: 0.25, neck: 0.15 } }); // pushing up off the knee
+      at(3.35, { hip: [stand - 0.06, H * 0.96], pitch: 0.12, feet: [[0.11, stand - 0.18, A + 0.1], [-0.12, stand, A]], footA: [F - 0.3, F],
+        hands: hang(stand - 0.06, H * 0.96), keys: { spine: 0.08, neck: 0.05 } }); // up, the back foot coming through
+      t = 3.7;
+    } else {
+      const hb = start.hip[0];
+      stand = hb + 0.36;
+      at(0.45, { hands: [[0.34, hb - 0.08, 0.075], [-0.34, hb - 0.08, 0.075]], keys: { ...zero, neck: 0.35 } }); // head up, hands to the ground beside him
+      at(1.05, { hip: [hb, 0.14], pitch: -0.3, feet: [[0.11, hb + 0.62, A], [-0.11, hb + 0.62, A]], footA: [2.4, 2.4],
+        hands: [[0.27, hb - 0.24, 0.075], [-0.27, hb - 0.24, 0.075]], keys: { spine: 0.3, neck: 0.2 } }); // sits up, leaning back on his hands
+      at(1.6, { hip: [hb + 0.02, 0.14], pitch: 0.4, feet: [[0.12, stand, A], [-0.12, stand, A]], footA: [F, F],
+        hands: [[0.3, hb + 0.3, 0.075], [-0.3, hb + 0.3, 0.075]], keys: { spine: 0.35, neck: 0.2 } }); // feet drawn in, hands down in front
+      at(2.2, { hip: [hb + 0.18, 0.35], pitch: 1.05, hands: [[0.24, hb + 0.6, 0.075], [-0.24, hb + 0.6, 0.075]], keys: { spine: 0.3, neck: 0.1 } }); // rocks forward onto hands and feet
+      at(2.75, { hip: [hb + 0.3, H * 0.66], pitch: 0.55, hands: [[0.13, hb + 0.5, A + L * 0.9], [-0.13, hb + 0.5, A + L * 0.9]], keys: { spine: 0.25, neck: 0.15 } }); // hands on his knees, pushing up
+      t = 3.25;
+    }
+    // standing
+    at(t, { hip: [stand, H], pitch: 0, feet: [[0.11, stand, A], [-0.11, stand, A]], footA: [F, F], hands: hang(stand, H), keys: zero });
+    const dustFrom = t;
+    // looks himself over and brushes the dust off: the thighs, a hand and then the other,
+    // then the chest and shoulder
+    const top = H * 0.97; // the wrists (the fingers reach further down the thighs)
+    const low = H * 0.8;
+    const front = stand + 0.2;
+    const loose = hang(stand, H)[0];
+    at(t + 0.3, { pitch: 0.12, hands: [[0.12, front, top], [-0.12, front, top]], keys: { spine: 0.45, neck: 0.5 } });
+    at(t + 0.55, { hands: [[0.12, front + 0.03, low], [-0.12, front, top]] });
+    at(t + 0.8, { hands: [[0.12, front, top], [-0.12, front + 0.03, low]] });
+    at(t + 1.05, { hands: [[0.12, front + 0.03, low], [-0.12, front, top]] });
+    at(t + 1.3, { pitch: 0.03, hands: [loose, [0.1, stand + 0.17, H + T * 0.78]], keys: { spine: 0.1, neck: 0.35, twist: 0.25, headTurn: 0.35 } });
+    at(t + 1.5, { hands: [loose, [0.2, stand + 0.12, H + T * 0.88]] });
+    at(t + 1.7, { hands: [loose, [0.08, stand + 0.18, H + T * 0.72]] });
+    at(t + 2.15, { pitch: 0, hands: hang(stand, H), keys: zero });
+    at(t + 2.45, { w: 0 }); // and back to himself
+    return { keys, stand, dustFrom, end: t + 2.45 };
+  }
+
+  // The plan at `g` seconds: each moment eased into the next.
+  function getUpAt(plan, g) {
+    const ks = plan.keys;
+    let i = 1;
+    while (i < ks.length - 1 && ks[i].t < g) i++;
+    const a = ks[i - 1];
+    const b = ks[i];
+    const k = smooth((g - a.t) / Math.max(1e-3, b.t - a.t));
+    const mix = (x, y) => x + (y - x) * k;
+    const mix3 = (p, q) => [mix(p[0], q[0]), mix(p[1], q[1]), mix(p[2], q[2])];
+    const keys = {};
+    for (const key of Object.keys(b.keys)) keys[key] = mix(a.keys[key] || 0, b.keys[key]);
+    return {
+      hip: [mix(a.hip[0], b.hip[0]), mix(a.hip[1], b.hip[1])],
+      pitch: mix(a.pitch, b.pitch),
+      feet: [mix3(a.feet[0], b.feet[0]), mix3(a.feet[1], b.feet[1])],
+      footA: [mix(a.footA[0], b.footA[0]), mix(a.footA[1], b.footA[1])],
+      hands: [mix3(a.hands[0], b.hands[0]), mix3(a.hands[1], b.hands[1])],
+      keys,
+      w: mix(a.w, b.w),
+    };
+  }
+
+  // Sets a body getting up: where it is placed and pitched, and its pose (trunk and head
+  // turns, and feet and hands reached for).
+  function getUpPose(plan, g, at, legs, group) {
+    const s = getUpAt(plan, g);
+    fromFacing(at, 0, s.hip[0] - legs.hip * Math.sin(s.pitch), s.hip[1] - legs.hip * Math.cos(s.pitch), group.position);
+    group.rotation.set(s.pitch, at.h, 0);
+    return { keys: s.keys, ik: { at, feet: s.feet, footA: s.footA, hands: s.hands, w: s.w }, weight: s.w, lying: true, hipF: s.hip[0] };
+  }
+
+  // Reaches the feet and hands of a pose to where it wants them, and points the toes.
+  const reachTarget = new THREE.Vector3();
+  const reachPole = new THREE.Vector3();
+  const reachQ = new THREE.Quaternion();
+  const toeDir = new THREE.Vector3();
+  function applyReach(group, bone, ik) {
+    const w = ik.w;
+    if (w <= 0.001) return;
+    group.getWorldQuaternion(reachQ);
+    const pole = (x, y, z) => reachPole.set(x, y, z).applyQuaternion(reachQ);
+    const s = Math.sin(ik.at.h);
+    const c = Math.cos(ik.at.h);
+    // knees bend forward and up whichever way the body lies: forward when standing or
+    // kneeling, up when sitting or flat
+    const knee = (sign) => reachPole.set(c * sign * 0.12 + s, 0.4, -s * sign * 0.12 + c);
+    ['L', 'R'].forEach((side, i) => {
+      const sign = i ? -1 : 1;
+      const [x, f, y] = ik.feet[i];
+      reachFor(bone(`leg${side}`), bone(`knee${side}`), bone(`foot${side}`), fromFacing(ik.at, x, f, y, reachTarget), knee(sign), w);
+      if (bone(`toe${side}`)) {
+        const a = ik.footA[i];
+        const lx = sign * 0.04;
+        toeDir.set(c * lx + s * Math.sin(a), -Math.cos(a), -s * lx + c * Math.sin(a)).normalize();
+        aimTowards(bone(`foot${side}`), bone(`toe${side}`), scene, toeDir, w);
+      }
+    });
+    ['L', 'R'].forEach((side, i) => {
+      const sign = i ? -1 : 1;
+      const [x, f, y] = ik.hands[i];
+      reachFor(bone(`arm${side}`), bone(`fore${side}`), bone(`hand${side}`), fromFacing(ik.at, x, f, y, reachTarget), pole(sign * 0.8, -0.15, -0.55), w);
+      // a hand on the ground lies flat, fingers forward and a little out
+      if (y < 0.2 && bone(`finger${side}`)) {
+        const lx = sign * 0.35;
+        toeDir.set(c * lx + s, -0.12, -s * lx + c).normalize();
+        aimTowards(bone(`hand${side}`), bone(`finger${side}`), scene, toeDir, w * smooth((0.2 - y) / 0.1));
+      }
+    });
+  }
+
+  // Going down conscious, the hands go out to break the fall: each reaches for the
+  // ground just ahead of (or, going over backwards, behind) its shoulder once it can.
+  const braceAt = new THREE.Vector3();
+  function braceHands(group, bone, at, dir) {
+    group.getWorldQuaternion(reachQ);
+    const s = Math.sin(at.h);
+    const c = Math.cos(at.h);
+    ['L', 'R'].forEach((side, i) => {
+      const sign = i ? -1 : 1;
+      const shoulder = bone(`arm${side}`);
+      const fore = bone(`fore${side}`);
+      const hand = bone(`hand${side}`);
+      if (!shoulder || !fore || !hand) return;
+      shoulder.getWorldPosition(braceAt);
+      const arm = braceAt.distanceTo(fore.getWorldPosition(reachMid)) + reachMid.distanceTo(hand.getWorldPosition(reachEnd));
+      const height = braceAt.y - at.y;
+      const k = smooth((arm * 1.3 - height) / (arm * 0.5));
+      if (k <= 0) return;
+      const ahead = dir * 0.2;
+      const lx = sign * 0.1;
+      braceAt.x += c * lx + s * ahead;
+      braceAt.z += -s * lx + c * ahead;
+      braceAt.y = at.y + 0.075;
+      reachFor(shoulder, fore, hand, braceAt, reachPole.set(sign * 0.8, -0.15, -0.55).applyQuaternion(reachQ), k);
+      if (bone(`finger${side}`)) {
+        const fx = sign * 0.35;
+        toeDir.set(c * fx + s * dir, -0.12, -s * fx + c * dir).normalize();
+        aimTowards(hand, bone(`finger${side}`), scene, toeDir, k);
+      }
+    });
+  }
+
+  // A pose on top of a pedestrian's clips, in the same terms as the hero's: each limb
+  // turned about an axis of the body's own frame (x its left, y up, z forward).
+  const WALKER_BONES = {
+    spine: 'Bip01_Spine', legL: 'Bip01_L_Thigh', kneeL: 'Bip01_L_Calf', legR: 'Bip01_R_Thigh', kneeR: 'Bip01_R_Calf',
+    armL: 'Bip01_L_UpperArm', foreL: 'Bip01_L_Forearm', armR: 'Bip01_R_UpperArm', foreR: 'Bip01_R_Forearm',
+    spine2: 'Bip01_Spine2', neck: 'Bip01_Neck', handL: 'Bip01_L_Hand', handR: 'Bip01_R_Hand', footL: 'Bip01_L_Foot', footR: 'Bip01_R_Foot',
+    toeL: 'Bip01_L_Toe0', toeR: 'Bip01_R_Toe0', fingerL: 'Bip01_L_Finger2', fingerR: 'Bip01_R_Finger2',
+  };
+  function walkerRig(w) {
+    if (!w.rig) {
+      w.rig = {};
+      for (const [key, name] of Object.entries(WALKER_BONES)) {
+        const bone = w.group.getObjectByName(name);
+        if (bone) w.rig[key] = { bone, base: new THREE.Quaternion(), out: null };
+      }
+    }
+    return w.rig;
+  }
+
+  function poseWalker(w, pose) {
+    walkerRig(w);
+    // as for the hero: start each frame from what the clip last gave each bone
+    for (const e of Object.values(w.rig)) {
+      if (e.out && e.bone.quaternion.equals(e.out)) e.bone.quaternion.copy(e.base);
+      else e.base.copy(e.bone.quaternion);
+    }
+    if (pose) {
+      const r = w.rig;
+      const g = w.group;
+      const turn = (e, ax, ay, az, angle) => {
+        if (e && angle && Math.abs(angle) > 1e-4) turnJoint(e.bone, g, ax, ay, az, angle);
+      };
+      turn(r.spine, 1, 0, 0, pose.spine);
+      turn(r.legR, 1, 0, 0, pose.legR);
+      turn(r.legR, 0, 0, 1, -(pose.legSplay || 0));
+      turn(r.kneeR, 1, 0, 0, pose.kneeR);
+      turn(r.legL, 1, 0, 0, pose.legL);
+      turn(r.legL, 0, 0, 1, pose.legSplay || 0);
+      turn(r.kneeL, 1, 0, 0, pose.kneeL);
+      turn(r.armR, 1, 0, 0, pose.armR);
+      turn(r.armR, 0, 0, 1, -(pose.armSplay || 0));
+      turn(r.foreR, 1, 0, 0, pose.foreR);
+      turn(r.armL, 1, 0, 0, pose.armL);
+      turn(r.armL, 0, 0, 1, pose.armSplay || 0);
+      turn(r.foreL, 1, 0, 0, pose.foreL);
+      // a fight pose: keys for the body, and limbs pointed
+      if (pose.keys) {
+        const k = pose.keys;
+        const wgt = pose.weight ?? 1;
+        const moving = !pose.lying && (w.actMove || 0) > 0.3;
+        const legs = moving ? 0.25 : 1;
+        turn(r.spine, 1, 0, 0, (k.spine || 0) * wgt);
+        turn(r.spine2, 0, 1, 0, (k.twist || 0) * wgt);
+        turn(r.spine, 0, 0, 1, (k.lean || 0) * wgt);
+        turn(r.neck, 1, 0, 0, (k.neck || 0) * wgt);
+        turn(r.neck, 0, 1, 0, (k.headTurn || 0) * wgt);
+        turn(r.legL, 1, 0, 0, (k.legL || 0) * wgt * legs);
+        turn(r.kneeL, 1, 0, 0, (k.kneeL || 0) * wgt * legs);
+        turn(r.legR, 1, 0, 0, (k.legR || 0) * wgt * legs);
+        turn(r.kneeR, 1, 0, 0, (k.kneeR || 0) * wgt * legs);
+        turn(r.legL, 0, 0, 1, (k.legSplay || 0) * wgt * legs);
+        turn(r.legR, 0, 0, 1, -(k.legSplay || 0) * wgt * legs);
+        for (const [key, child] of AIMED) {
+          const dir = pose.aim && pose.aim[key];
+          if (!dir || !r[key] || !r[child] || ((key.startsWith('leg') || key.startsWith('knee')) && moving)) continue;
+          aimTowards(r[key].bone, r[child].bone, g, dir, wgt);
+        }
+        const bone = (key) => r[key] && r[key].bone;
+        if (pose.ik) applyReach(g, bone, pose.ik);
+        if (pose.brace) braceHands(g, bone, pose.at, pose.brace);
+      }
+    }
+    for (const e of Object.values(w.rig)) {
+      if (!e.out) e.out = new THREE.Quaternion();
+      e.out.copy(e.bone.quaternion);
+    }
+  }
+
+  // A point on a walker's round of the block, `s` metres along it, `h` out from the
+  // middle of the block (the round grows or shrinks as a whole, so corners stay joined).
+  const loopAt = { x: 0, z: 0, edge: 0 };
+  const loopAhead = { x: 0, z: 0, edge: 0 };
+  function loopPoint(w, s, h, out) {
+    const side = w.half * 2;
+    const lap = side * 4;
+    s = ((s % lap) + lap) % lap;
+    const edge = Math.floor(s / side);
+    const r = ((s % side) - w.half) * (h / w.half);
+    const [dx, dz] = DIRS[edge];
+    out.x = w.cx + dx * r + dz * h;
+    out.z = w.cz + dz * r - dx * h;
+    out.edge = edge;
+    return out;
+  }
+
+  // Is there something solid at (x, z) a person standing at height y would walk into?
+  function walkerBlocked(x, z, y) {
+    for (const box of collidersNear(x, z, 0.4)) {
+      if ((box.minY ?? -Infinity) > y + 1.5 || (box.top ?? box.maxY ?? Infinity) <= y + STEP_UP) continue;
+      if (boxContact(box, x, z, 0.32)) return true;
+    }
+    if (mode === 'car' && player && Math.abs(car.y - y) < 1.5) {
+      const { hl, hw } = player.dims;
+      const reach = hl + hw;
+      const box = { minX: car.x - reach, maxX: car.x + reach, minZ: car.z - reach, maxZ: car.z + reach, car: { x: car.x, z: car.z, h: car.heading, hl, hw } };
+      if (boxContact(box, x, z, 0.32)) return true;
+    }
+    return false;
+  }
+
+  // How far in or out of its usual line a walker should be: to the right of anyone in
+  // its way ahead (they do the same, so people pass each other), and wherever the next
+  // half metre is clear of anything solid. Null when there is no way past at all.
+  function walkerWay(w) {
+    const sign = Math.sign(w.speed) || 1;
+    const base = loopPoint(w, w.s, w.half, loopAt);
+    const [dx, dz] = DIRS[base.edge];
+    const fx = dx * sign;
+    const fz = dz * sign;
+    const nx = dz; // outward, toward the road
+    const nz = -dx;
+    const me = w.group.position;
+    let want = 0;
+    let nearest = 3.4;
+    const consider = (x, z) => {
+      const along = (x - me.x) * fx + (z - me.z) * fz;
+      if (along < 0.05 || along > nearest) return;
+      const lat = (x - base.x) * nx + (z - base.z) * nz;
+      if (Math.abs(lat - (w.dodge || 0)) > 0.8) return;
+      nearest = along;
+      want = lat - sign * 0.72; // pass them on this walker's right
+    };
+    for (const o of walkers) {
+      if (o === w || !onFeet(o)) continue;
+      const q = o.group.position;
+      if (Math.abs(q.x - me.x) > 3.6 || Math.abs(q.z - me.z) > 3.6 || Math.abs(q.y - me.y) > 1) continue;
+      consider(q.x, q.z);
+    }
+    if (mode === 'foot' && !hero.dead) consider(car.x, car.z);
+    for (const t of [0, 0.15, -0.15, 0.3, -0.3, 0.45, -0.45, 0.6, -0.6, 0.8, -0.8, 1]) {
+      const lat = Math.max(-0.9, Math.min(1, want + t));
+      const at = loopPoint(w, w.s + sign * 0.5, w.half + lat, loopAhead);
+      if (!walkerBlocked(at.x, at.z, w.gy)) return lat;
+    }
+    return null;
+  }
+
   function updateWalkers(dt) {
     for (const w of walkers) {
       const g = w.group;
       if (w.state === 'walk') {
+        // Round the block, keeping clear of posts, trees, benches and the like and stepping
+        // aside for people (see walkerWay); with the way shut, it waits.
+        let step = w.speed * dt;
+        if (g.visible) {
+          w.lookT = (w.lookT || 0) - dt;
+          if (w.lookT <= 0) {
+            w.lookT = rand(0.12, 0.22);
+            w.want = walkerWay(w);
+          }
+          if (w.want === null) step = 0;
+        } else {
+          w.want = 0;
+        }
+        w.dodge = approach(w.dodge || 0, w.want ?? w.dodge ?? 0, 1.6 * dt);
         const side = w.half * 2;
         const lap = side * 4;
-        w.s = (((w.s + w.speed * dt) % lap) + lap) % lap;
-        const edge = Math.floor(w.s / side);
-        const r = (w.s % side) - w.half;
-        const [dx, dz] = DIRS[edge];
+        w.s = (((w.s + step) % lap) + lap) % lap;
         // edge 0 runs +x along the block's -z side, then each edge turns right
+        const p = loopPoint(w, w.s, w.half + w.dodge, loopAt);
+        const [dx, dz] = DIRS[p.edge];
         const sign = Math.sign(w.speed);
-        g.position.set(w.cx + dx * r + dz * w.half, w.gy, w.cz + dz * r - dx * w.half);
+        g.position.set(p.x, w.gy, p.z);
         g.rotation.set(0, Math.atan2(dx * sign, dz * sign), 0);
-        w.phase += Math.abs(w.speed) * w.stride * dt;
+        w.paused = step === 0;
+        w.phase += Math.abs(step) * w.stride;
+      } else if (updateFighter(w, dt)) {
+        // squared up to the hero, or running from him (see updateFighter)
+      } else if (updateJacked(w, dt)) {
+        // the driver whose car was taken (see updateJacked)
       } else {
         w.timer -= dt;
         if (w.state === 'stagger') {
           // a flinch away from the blow, then carry on
           g.rotation.x = w.tipSign * Math.sin((1 - Math.max(0, w.timer) / 0.7) * Math.PI) * 0.22;
-          if (w.timer <= 0) w.state = w.away ? 'goto' : 'walk';
+          if (w.timer <= 0) {
+            w.state = w.afterStagger || (w.away ? 'goto' : 'walk');
+            if (w.state === 'flee') w.timer = rand(7, 11);
+            w.afterStagger = null;
+          }
         } else if (w.state === 'goto') {
           // off its pavement (turned out of a car): walk back to it, then carry on round
           const dx = w.tx - g.position.x;
@@ -3853,23 +8355,64 @@
             w.state = 'walk';
           } else {
             const step = Math.min(d, 2.3 * dt);
-            g.position.x += (dx / d) * step;
-            g.position.z += (dz / d) * step;
-            g.position.y = w.gy - (w.gy - w.baseY) * Math.min(1, d / 2); // up the kerb at the end
+            if (d > 2) stepWalker(w, (dx / d) * step, (dz / d) * step);
+            else {
+              g.position.x += (dx / d) * step;
+              g.position.z += (dz / d) * step;
+              g.position.y = w.gy - (w.gy - w.baseY) * Math.min(1, d / 2); // up the kerb at the end
+            }
             g.rotation.set(0, Math.atan2(dx, dz), 0);
           }
         } else if (w.state === 'fall') {
-          w.tip = Math.min(1, w.tip + (0.9 + 4 * w.tip) * dt); // slow to start, then drops
+          if (w.legs) {
+            // knees, then the ground (see collapseAt)
+            w.ct += dt * (w.fallRate || 1);
+            w.tip = Math.min(1, w.ct / collapseEnd(w.tipSign));
+          } else {
+            w.tip = Math.min(1, w.tip + (0.9 + 4 * w.tip) * dt); // slow to start, then drops
+          }
           if (w.tip >= 1) {
             w.state = w.dying ? 'dead' : 'down';
             w.timer = w.dying ? 30 : rand(4, 7);
           }
         } else if (w.state === 'down') {
-          if (w.timer <= 0) w.state = 'rise';
+          if (w.timer <= 0) {
+            w.state = 'rise';
+            if (w.legs && w.legs.torso && w.fallAt) {
+              // up step by step from just as they lie (see getUpPlan)
+              const r = walkerRig(w);
+              w.plan = getUpPlan(w.tipSign, sampleBody(g, (key) => r[key] && r[key].bone, w.fallAt, w.legs, w.pose && w.pose.keys), w.legs);
+              w.g = 0;
+            }
+          }
         } else if (w.state === 'rise') {
-          w.tip = Math.max(0, w.tip - 0.8 * dt);
-          if (w.tip <= 0) {
+          let up;
+          if (w.plan) {
+            w.g += dt;
+            up = w.g >= w.plan.end;
+            if (!up) w.pose = getUpPose(w.plan, w.g, w.fallAt, w.legs, g);
+          } else {
+            // up the way they went down
+            if (w.legs) w.ct = Math.max(0, w.ct - dt * 0.75);
+            w.tip = w.legs ? w.ct / collapseEnd(w.tipSign) : Math.max(0, w.tip - 0.8 * dt);
+            up = w.tip <= 0;
+          }
+          if (up) {
             w.state = w.away ? 'goto' : 'walk';
+            if (w.legs && w.fallAt) {
+              const stand = fromFacing(w.fallAt, 0, w.plan ? w.plan.stand : 0, 0, new THREE.Vector3());
+              g.position.copy(stand);
+              g.rotation.set(0, w.fallAt.h, 0);
+              w.pose = null;
+              w.baseY = w.fallAt.y;
+              if (w.plan) {
+                // a step or so from their path: back to it
+                w.away = true;
+                setPavementGoal(w, stand.x, stand.z);
+                w.state = 'goto';
+              }
+              w.plan = null;
+            }
             if (w.isPerson && !w.limping) {
               w.limping = true; // hurt: slower from now on
               w.speed *= 0.6;
@@ -3879,25 +8422,42 @@
           // 'dead': after a while the body is cleared and someone new walks another street
           const block = pick(cityBlocks);
           Object.assign(w, { cx: block.x, gy: block.y, cz: block.z, s: Math.random() * w.half * 8,
-            health: 100, state: 'walk', tip: 0, dying: false, limping: false, away: false });
+            health: 100, state: 'walk', tip: 0, ct: 0, dying: false, limping: false, away: false, pose: null, fallAt: null });
           w.speed = rand(1.1, 1.8) * Math.sign(w.speed);
         }
-        if (w.state !== 'stagger' && w.state !== 'goto') {
-          g.rotation.x = w.tipSign * w.tip * Math.PI / 2;
-          g.position.y = (w.away ? w.baseY : w.gy) + 0.14 * w.tip; // lying on the ground, not sunk into it
+        if (w.state !== 'stagger' && w.state !== 'goto' && w.state !== 'walk') {
+          if (w.plan) {
+            // placed by its get-up (above)
+          } else if (w.legs && w.fallAt) {
+            placeCollapse(w);
+          } else {
+            g.rotation.x = w.tipSign * w.tip * Math.PI / 2;
+            g.position.y = (w.away ? w.baseY : w.gy) + 0.14 * w.tip; // lying on the ground, not sunk into it
+          }
         }
       }
 
+      // in a scene or after a car they move as they are moved, legs at the pace they really go
+      const scripted = ['act', 'stumble', 'stunned', 'chase', 'fight', 'flee'].includes(w.state);
       const walking = w.state === 'walk' || w.state === 'goto';
-      w.moving += ((walking ? 1 : 0) - w.moving) * Math.min(1, 8 * dt);
+      const pace = scripted ? w.actSpeed || 0 : w.state === 'goto' ? 2.3 : Math.abs(w.speed);
+      w.moving += ((scripted ? w.actMove || 0 : walking && !(w.state === 'walk' && w.paused) ? 1 : 0) - w.moving) * Math.min(1, 10 * dt);
+      w.running = (w.running || 0) + ((Math.abs(pace) > 3 ? 1 : 0) - (w.running || 0)) * Math.min(1, 6 * dt);
       if (w.skin) {
         // only people near the player are drawn and animated
         g.visible = Math.abs(g.position.x - car.x) < 140 && Math.abs(g.position.z - car.z) < 140;
         if (g.visible) {
-          w.skin.walk.setEffectiveWeight(w.moving);
+          const run = w.skin.run ? w.running : 0;
+          w.skin.walk.setEffectiveWeight(w.moving * (1 - run));
+          if (w.skin.run) {
+            w.skin.run.setEffectiveWeight(w.moving * run);
+            w.skin.run.timeScale = Math.max(0.6, Math.abs(pace) / 4.3); // the run clip covers about 4.3 m/s at this size
+          }
           w.skin.idle.setEffectiveWeight(1 - w.moving);
-          w.skin.walk.timeScale = (w.state === 'goto' ? 2.3 : Math.abs(w.speed)) / 1.45; // feet in step with the ground
-          w.skin.mixer.update(dt);
+          // feet in step with the ground (a negative pace steps backwards)
+          w.skin.walk.timeScale = Math.sign(pace || 1) * Math.max(0.45, Math.abs(pace) / 1.45);
+          if (!((w.state === 'dead' || w.state === 'down') && w.legs)) w.skin.mixer.update(dt); // lying still
+          if (w.pose || w.rig) poseWalker(w, w.pose);
         }
       } else if (w.isPerson) {
         animateGait(w, w.phase, w.moving, 0, dt);
@@ -4078,7 +8638,7 @@
       const x = a.homeX + rand(-40, 40);
       const z = a.homeZ + rand(-40, 40);
       if (naturalHeight(x, z) < 3) continue;
-      terrain(x, z);
+      terrainExact(x, z);
       if (roadDist < 10) continue;
       a.tx = x;
       a.tz = z;
@@ -4097,7 +8657,7 @@
         do {
           x = rand(b.minX, b.maxX);
           z = rand(b.minZ, b.maxZ);
-        } while (naturalHeight(x, z) < 6 || (terrain(x, z), roadDist < 12));
+        } while (naturalHeight(x, z) < 6 || (terrainExact(x, z), roadDist < 12));
         const a = {
           ...createAnimal(sp), sp, x, z, y: 0, homeX: x, homeZ: z, h: Math.random() * 6,
           speed: 0, phase: 0, pause: rand(0, 5), fleeing: 0, down: 0,
@@ -4155,6 +8715,7 @@
       a.z += Math.cos(a.h) * a.speed * dt;
       a.y = terrain(a.x, a.z);
       a.group.position.set(a.x, a.y, a.z);
+      a.group.visible = (a.x - camera.position.x) ** 2 + (a.z - camera.position.z) ** 2 < 230 * 230;
       a.group.rotation.y = a.h;
 
       // diagonal legs move together; the stride lengthens with speed
@@ -4360,7 +8921,7 @@
 
       // one circle against buildings, trees, parked cars and traffic
       let touching = false;
-      for (const box of colliders.concat(trafficBoxes)) {
+      for (const box of collidersNear(p.x, p.z, 1.4).concat(trafficBoxes)) {
         if ((box.minY ?? -Infinity) > 1.5) continue; // overhead, police stay on the ground
         const touch = boxContact(box, p.x, p.z, 1.4);
         if (!touch) continue;
@@ -4406,6 +8967,20 @@
     }
   }
 
+  // Everyone on their feet near the player's car, as a small box it bumps against when it
+  // only creeps into them (faster, it knocks them down: see checkPedestrianHits).
+  function peopleBoxes() {
+    if (mode !== 'car' || Math.hypot(car.vx, car.vz) >= 3) return [];
+    const list = [];
+    for (const w of walkers) {
+      if (!onFeet(w)) continue;
+      const p = w.group.position;
+      if (Math.abs(p.x - car.x) > 6 || Math.abs(p.z - car.z) > 6 || Math.abs(p.y - car.y) > 1.5) continue;
+      list.push({ minX: p.x - 0.3, maxX: p.x + 0.3, minZ: p.z - 0.3, maxZ: p.z + 0.3, maxY: p.y + 1.8 });
+    }
+    return list;
+  }
+
   // Running into a pedestrian knocks them down and adds a star.
   function checkPedestrianHits(playerSpeed) {
     if (playerSpeed < 3) return;
@@ -4429,10 +9004,10 @@
 
   // ---------- Map, waypoint and route ----------
 
-  // One picture of the whole world (city and hills) is drawn once at a pixel per metre.
-  // The round minimap shows the part around the player; the full map shows all of it and
-  // takes clicks to set a waypoint. Seen from above with +z up the screen, +x runs left.
-  const MAP_WORLD = { minX: -520, maxX: 540, minZ: -300, maxZ: 880 };
+  // One picture of the whole world is drawn once at a pixel per metre. The round minimap
+  // shows the part around the player; the full map shows all of it and takes clicks to set
+  // a waypoint. Seen from above with +z up the screen, +x runs left.
+  const MAP_WORLD = { minX: -800, maxX: 800, minZ: -620, maxZ: 940 };
   const MAP_VIEW = 240; // metres across the minimap
   const mapCanvas = $('map');
   const mapCtx = mapCanvas.getContext('2d');
@@ -4453,24 +9028,53 @@
     g.fillStyle = '#5f9a55';
     g.fillRect(0, 0, mapBase.width, mapBase.height);
 
-    // hills: paler toward each summit
-    for (const hill of HILLS) {
-      const shade = g.createRadialGradient(baseX(hill.x), baseY(hill.z), hill.r * 0.1, baseX(hill.x), baseY(hill.z), hill.r);
-      shade.addColorStop(0, 'rgba(196,186,140,0.9)');
-      shade.addColorStop(1, 'rgba(120,150,95,0)');
-      g.fillStyle = shade;
-      g.beginPath();
-      g.arc(baseX(hill.x), baseY(hill.z), hill.r, 0, Math.PI * 2);
-      g.fill();
+    // the land: hills paler toward their tops, the lake and its beaches
+    const picture = g.getImageData(0, 0, mapBase.width, mapBase.height);
+    const px = picture.data;
+    for (let y = 0; y < mapBase.height; y += 2) {
+      for (let x = 0; x < mapBase.width; x += 2) {
+        const wx = MAP_WORLD.maxX - x;
+        const wz = MAP_WORLD.maxZ - y;
+        const h = terrain(wx, wz);
+        const edge = lakeEdge(wx, wz);
+        let c = null;
+        if (edge < 0) c = [62, 120, 168];
+        else if (edge < 9) c = [214, 196, 150];
+        else if (h > 1) {
+          const k = Math.min(1, h / 70);
+          c = [95 + 110 * k, 154 + 32 * k, 85 + 60 * k];
+        }
+        if (!c) continue;
+        for (let dy = 0; dy < 2; dy++) {
+          for (let dx = 0; dx < 2; dx++) {
+            const i = ((y + dy) * mapBase.width + x + dx) * 4;
+            px[i] = c[0];
+            px[i + 1] = c[1];
+            px[i + 2] = c[2];
+          }
+        }
+      }
     }
-    g.strokeStyle = '#3d424b';
-    g.lineWidth = 11;
-    g.lineJoin = g.lineCap = 'round';
-    g.beginPath();
-    g.moveTo(baseX(hillRoad[0].x), baseY(HALF - 2));
-    for (const p of hillRoad) g.lineTo(baseX(p.x), baseY(p.z));
-    g.stroke();
+    g.putImageData(picture, 0, 0);
 
+    // roads beyond the grid, and the highway
+    g.lineJoin = g.lineCap = 'round';
+    g.strokeStyle = '#3d424b';
+    for (const road of ribbons) {
+      g.lineWidth = road.half * 2;
+      g.beginPath();
+      road.points.forEach((p, i) => g[i ? 'lineTo' : 'moveTo'](baseX(p.x), baseY(p.z)));
+      g.stroke();
+    }
+    g.fillStyle = '#3d424b';
+    g.fillRect(baseX(HIGHWAY.end), baseY(HIGHWAY.z + HIGHWAY.half), HIGHWAY.end * 2, HIGHWAY.half * 2);
+    g.fillStyle = '#e9c46a';
+    g.fillRect(baseX(HIGHWAY.end), baseY(HIGHWAY.z) - 1, HIGHWAY.end * 2, 2);
+    g.beginPath();
+    g.arc(baseX(-38), baseY(510), 13, 0, Math.PI * 2);
+    g.fill();
+
+    // the city: its roads, and each block coloured by what it holds
     g.fillStyle = '#3d424b';
     g.fillRect(baseX(HALF), baseY(HALF), WORLD, WORLD);
     g.font = 'bold 34px system-ui, sans-serif';
@@ -4482,7 +9086,10 @@
         const y = baseY(blockCenter(bz));
         const isLot = PARKING_LOTS.some(([lx, lz]) => lx === bx && lz === bz);
         const isParkade = bx === PARKADE[0] && bz === PARKADE[1];
-        g.fillStyle = isLot ? '#2c5fa8' : isParkade ? '#1b3f73' : '#a9aeb6';
+        const district = districtOf(bx, bz);
+        g.fillStyle = isLot ? '#2c5fa8' : isParkade ? '#1b3f73'
+          : bx === STATION_BLOCK[0] && bz === STATION_BLOCK[1] ? '#b9bec6'
+            : district === 'houses' ? '#9cc28a' : district === 'towers' ? '#9097a2' : district === 'industrial' ? '#b3aa98' : '#a9aeb6';
         g.fillRect(x - BLOCK_SIZE / 2, y - BLOCK_SIZE / 2, BLOCK_SIZE, BLOCK_SIZE);
         if (isLot || isParkade) {
           g.fillStyle = '#fff';
@@ -4494,9 +9101,41 @@
     g.fillStyle = '#e9c46a';
     g.fillRect(baseX(roadCenter(FLYOVER_TO) - JUNCTION), baseY(roadCenter(FLYOVER_ROW)) - 4,
       roadCenter(FLYOVER_TO) - roadCenter(FLYOVER_FROM) - JUNCTION * 2, 8);
+
+    // the mall and its car park
+    g.fillStyle = '#2c5fa8';
+    g.fillRect(baseX(MALL_LOT.maxX), baseY(MALL_LOT.maxZ), MALL_LOT.maxX - MALL_LOT.minX, MALL_LOT.maxZ - MALL_LOT.minZ);
+    g.fillStyle = '#c9b48a';
+    g.fillRect(baseX(MALL.maxX), baseY(MALL.maxZ), MALL.maxX - MALL.minX, MALL.maxZ - MALL.minZ);
+    g.fillStyle = '#fff';
+    g.fillText('P', baseX((MALL_LOT.minX + MALL_LOT.maxX) / 2), baseY((MALL_LOT.minZ + MALL_LOT.maxZ) / 2));
+
+    // the metro: a blue line with its stations
+    g.strokeStyle = '#fff';
+    g.lineWidth = 9;
+    g.beginPath();
+    metroLine.forEach((p, i) => g[i ? 'lineTo' : 'moveTo'](baseX(p.x), baseY(p.z)));
+    g.stroke();
+    g.strokeStyle = '#1f6fd6';
+    g.lineWidth = 5;
+    g.stroke();
+    for (const st of STATIONS) {
+      const p = metroPoint(st.s);
+      g.fillStyle = '#1f6fd6';
+      g.beginPath();
+      g.arc(baseX(p.x), baseY(p.z), 11, 0, Math.PI * 2);
+      g.fill();
+      g.fillStyle = '#fff';
+      g.font = 'bold 14px system-ui, sans-serif';
+      g.fillText('M', baseX(p.x), baseY(p.z) + 1);
+    }
+
     g.fillStyle = '#fff';
     g.font = 'bold 22px system-ui, sans-serif';
     g.fillText('LOOKOUT', baseX(HILLS[0].x), baseY(HILLS[0].z) - 34);
+    g.fillText('LAKE', baseX(430), baseY(480));
+    g.fillText('MALL', baseX(-420), baseY(30));
+    g.fillText('HIGHWAY', baseX(-420), baseY(HIGHWAY.z + 26));
   }
 
   // --- waypoint and route ---
@@ -4505,55 +9144,13 @@
   let route = []; // [x, y, z] points from the player to the waypoint, along the roads
   let routeTimer = 0;
   let wayBeacon = null;
-  const HILL_GATE = { x: roadCenter(4), z: roadCenter(BLOCKS) }; // where the hill road leaves the city
-  const inHills = (z) => z > HALF + 6;
 
-  function nearestOnHillRoad(x, z) {
-    let best = 0;
-    let bestDist = Infinity;
-    hillRoad.forEach((p, i) => {
-      const d = (p.x - x) ** 2 + (p.z - z) ** 2;
-      if (d < bestDist) {
-        bestDist = d;
-        best = i;
-      }
-    });
-    return best;
-  }
-
-  // Works out the way from the player to the waypoint: along the street grid in the city
-  // (to the nearest crossing, along one street, then along the other) and up or down the
-  // hill road when either end is out in the hills.
+  // Works out the way from the player to the waypoint along the roads: the shortest path
+  // through the road network from the nearest point on it to the one nearest the waypoint.
   function planRoute() {
+    const path = findPath(nearestNode(car.x, car.z), nearestNode(waypoint.x, waypoint.z));
     const points = [[car.x, car.y, car.z]];
-    const street = (x, z) => points.push([x, 0, z]);
-    const cityLeg = (from, to) => {
-      const ax = roadCenter(roadIndex(from.x));
-      const az = roadCenter(roadIndex(from.z));
-      const bx = roadCenter(roadIndex(to.x));
-      const bz = roadCenter(roadIndex(to.z));
-      street(ax, az);
-      if (ax !== bx && az !== bz) street(bx, az);
-      street(bx, bz);
-    };
-    const hillLeg = (from, to) => {
-      const step = from <= to ? 1 : -1;
-      for (let i = from; i !== to + step; i += step) points.push([hillRoad[i].x, hillRoad[i].h, hillRoad[i].z]);
-    };
-    const here = { x: car.x, z: car.z };
-    const startInHills = inHills(car.z);
-    const endInHills = inHills(waypoint.z);
-    if (startInHills && endInHills) {
-      hillLeg(nearestOnHillRoad(car.x, car.z), nearestOnHillRoad(waypoint.x, waypoint.z));
-    } else if (endInHills) {
-      cityLeg(here, HILL_GATE);
-      hillLeg(0, nearestOnHillRoad(waypoint.x, waypoint.z));
-    } else if (startInHills) {
-      hillLeg(nearestOnHillRoad(car.x, car.z), 0);
-      cityLeg(HILL_GATE, waypoint);
-    } else {
-      cityLeg(here, waypoint);
-    }
+    for (const node of path) points.push([node.x, node.y, node.z]);
     points.push([waypoint.x, groundAt(waypoint.x, waypoint.z, 200), waypoint.z]);
     route = points;
 
@@ -4790,8 +9387,30 @@
   const OVERLAY_BONES = {
     spine: 'Spine', armR: 'RightArm', foreR: 'RightForeArm', armL: 'LeftArm', foreL: 'LeftForeArm',
     legR: 'RightUpLeg', kneeR: 'RightLeg', legL: 'LeftUpLeg', kneeL: 'LeftLeg', handR: 'RightHand',
+    spine2: 'Spine2', neck: 'Neck', handL: 'LeftHand', footR: 'RightFoot', footL: 'LeftFoot',
+    toeR: 'RightToeBase', toeL: 'LeftToeBase', fingerL: 'LeftHandMiddle1', fingerR: 'RightHandMiddle1',
   };
-  const POSE_KEYS = ['spine', 'armR', 'foreR', 'armL', 'foreL', 'legR', 'kneeR', 'legL', 'kneeL', 'legSplay', 'armSplay'];
+  const POSE_KEYS = ['spine', 'armR', 'foreR', 'armL', 'foreL', 'legR', 'kneeR', 'legL', 'kneeL', 'legSplay', 'armSplay',
+    'twist', 'neck', 'headTurn', 'lean', 'crouch'];
+  // limbs that a fight pose points, each with the joint it points at
+  const AIMED = [['armL', 'foreL'], ['foreL', 'handL'], ['armR', 'foreR'], ['foreR', 'handR'], ['legR', 'kneeR'], ['kneeR', 'footR'], ['legL', 'kneeL'], ['kneeL', 'footL'],
+    ['footR', 'toeR'], ['footL', 'toeL']];
+
+  // Swings `bone` so it points from its joint toward its `child` joint along `dir` (in the
+  // frame of `frame`), by `weight` of the way from where the animation has it.
+  function aimTowards(bone, child, frame, dir, weight) {
+    if (!bone || !child || weight <= 0) return;
+    bone.getWorldPosition(aimFrom);
+    child.getWorldPosition(aimTo);
+    aimTo.sub(aimFrom).normalize();
+    frame.getWorldQuaternion(frameQ);
+    aimWant.copy(dir).applyQuaternion(frameQ);
+    if (weight < 1) aimWant.lerp(aimTo, 1 - weight).normalize();
+    jointTurn.setFromUnitVectors(aimTo, aimWant);
+    bone.parent.getWorldQuaternion(jointParentQ);
+    jointQ.copy(jointParentQ).multiply(bone.quaternion).premultiply(jointTurn);
+    bone.quaternion.copy(jointParentQ.invert()).multiply(jointQ);
+  }
 
   function loadHeroSkin() {
     if (!THREE.GLTFLoader || !window.HERO_GLB || !window.HERO_CLIPS) return;
@@ -4834,7 +9453,7 @@
       const bones = {};
       for (const [key, name] of Object.entries(OVERLAY_BONES)) {
         const bone = root.getObjectByName(name);
-        bones[key] = { bone, base: new THREE.Quaternion(), out: null };
+        if (bone) bones[key] = { bone, base: new THREE.Quaternion(), out: null };
       }
 
       // weapons float at the right hand, pointing along the aim (+z is forward)
@@ -4886,21 +9505,24 @@
     const m = hero.model;
     const onFoot = mode === 'foot';
     const speed = Math.hypot(car.vx, car.vz);
-    const airborne = onFoot && !hero.climb && car.y > groundAt(car.x, car.z, car.y) + 0.05;
+    const airborne = onFoot && !hero.climb && !act && car.y > groundAt(car.x, car.z, car.y) + 0.05;
     const moving = onFoot && !hero.climb && !airborne && speed > 0.3;
 
     // --- base clips: stand and breathe, walk, or run, cross-faded by speed
     const run = moving ? Math.max(0, Math.min(1, (speed - WALK_SPEED) / (RUN_SPEED - WALK_SPEED))) : 0;
     const goal = { idle: moving ? 0 : 1, walk: moving ? 1 - run : 0, run: moving ? run : 0 };
+    if (hero.shuffle && !moving) Object.assign(goal, { idle: 0.6, walk: 0.4 }); // small steps round on the spot
     const fade = Math.min(1, 9 * dt);
     for (const name of ['idle', 'walk', 'run']) {
       k.weights[name] += (goal[name] - k.weights[name]) * fade;
       k.actions[name].setEffectiveWeight(k.weights[name]);
     }
     // keep the feet in step with the ground speed
-    k.actions.walk.timeScale = Math.max(0.8, Math.min(1.7, speed / 1.55));
-    k.actions.run.timeScale = Math.max(0.8, Math.min(1.6, speed / 4.6));
-    k.mixer.update(dt);
+    // (backwards when he backs off or reels back from a shove)
+    const backwards = hero.backward && moving ? -1 : 1;
+    k.actions.walk.timeScale = (hero.shuffle && !moving ? 0.7 : Math.max(0.6, Math.min(1.7, speed / 1.55))) * backwards;
+    k.actions.run.timeScale = Math.max(0.8, Math.min(1.6, speed / 4.6)) * backwards;
+    if (!(hero.dead && hero.ct >= collapseEnd(hero.fallDir || 1))) k.mixer.update(dt); // a body lies still
 
     // --- extra pose on top of the clip
     const want = Object.fromEntries(POSE_KEYS.map((key) => [key, 0]));
@@ -4931,10 +9553,43 @@
     } else if (airborne && hero.jetpack) {
       Object.assign(want, { legR: 0.3, legL: 0.2, kneeR: 0.35, kneeL: 0.5, armSplay: 0.35, spine: 0.15 });
     } else if (airborne) {
-      // a leap: one knee driven up, the other leg trailing, arms thrown forward
-      Object.assign(want, { legR: -0.9, kneeR: 1.3, legL: 0.3, kneeL: 0.7, armR: -0.5, armL: -0.9, foreL: -0.5 });
+      // a leap: one knee driven up, the other leg trailing, arms thrown forward; dropping
+      // from high up, he flails, arms wheeling over his head and legs running on air
+      const leap = { legR: -0.9, kneeR: 1.3, legL: 0.3, kneeL: 0.7, armR: -0.5, armL: -0.9, foreL: -0.5 };
+      const f = clock * 8.5;
+      const flail = {
+        armR: -2.3 + 0.8 * Math.sin(f), armL: -2.3 + 0.8 * Math.sin(f + 2.6), armSplay: 0.75 + 0.3 * Math.sin(f * 0.6),
+        foreR: -0.5 - 0.4 * Math.sin(f + 1), foreL: -0.5 - 0.4 * Math.sin(f + 3.6),
+        legR: -0.6 + 0.55 * Math.sin(f * 0.9), kneeR: 0.8 + 0.5 * Math.sin(f * 0.9 + 1.3),
+        legL: -0.6 + 0.55 * Math.sin(f * 0.9 + Math.PI), kneeL: 0.8 + 0.5 * Math.sin(f * 0.9 + Math.PI + 1.3),
+        legSplay: 0.15, spine: -0.15, neck: 0.3,
+      };
+      const falling = hero.jetpack ? 0 : smooth((-car.vy - 5) / 5);
+      for (const key of new Set([...Object.keys(leap), ...Object.keys(flail)])) want[key] = (leap[key] || 0) * (1 - falling) + (flail[key] || 0) * falling;
     }
-    if (onFoot && !hero.climb) {
+    const fighting = hero.fightPose && onFoot && !act && !hero.dead && !hero.down && !hero.climb;
+    const fallen = onFoot && !act && hero.collapse && (hero.dead || hero.down);
+    if (hero.fade && (fallen || !onFoot)) hero.fade = null;
+    if (hero.fade) {
+      hero.fade.w -= dt / 0.35;
+      if (hero.fade.w <= 0) hero.fade = null;
+    }
+    if (fallen) {
+      // going down, lying, or getting up (the limbs are pointed below)
+      Object.assign(want, hero.collapse.keys);
+    } else if (hero.fade) {
+      for (const [key, v] of Object.entries(hero.fade.keys)) want[key] = v * hero.fade.w;
+    } else if (act && act.heroPose) {
+      // in a scene at a vehicle: sitting, climbing in or out, hauling, shoving, reeling
+      Object.assign(want, act.heroPose);
+    } else if (fighting) {
+      // squared up: the guard and the moves (legs only while standing his ground)
+      const g = hero.fight.guard;
+      const legs = moving ? 0.25 : 1;
+      for (const [key, v] of Object.entries(hero.fightPose.keys)) {
+        want[key] = v * g * (key.startsWith('leg') || key.startsWith('knee') || key === 'crouch' ? legs : 1);
+      }
+    } else if (onFoot && !hero.climb) {
       if (hero.weapon !== 'fist') {
         want.armR = -Math.PI / 2 - hero.pitch + 0.12; // straight out along the aim
         want.foreR = 0;
@@ -4945,9 +9600,14 @@
         want.spine = 0.12 * reach;
       }
     }
-    const ease = Math.min(1, 16 * dt);
-    for (const key of POSE_KEYS) k.pose[key] += (want[key] - k.pose[key]) * ease;
-    k.root.position.y = mode === 'horse' && !horse.model.morph ? 0.14 : 0; // the built-in saddle sits higher than his hips
+    if (hero.landing > 0 && onFoot && !fallen) {
+      // taking a hard landing on bent knees
+      const l = Math.min(1, hero.landing / 0.35);
+      Object.assign(want, { kneeL: want.kneeL + 1.1 * l, kneeR: want.kneeR + 1.1 * l, legL: want.legL - 0.7 * l, legR: want.legR - 0.7 * l, spine: want.spine + 0.45 * l, crouch: want.crouch + 0.3 * l, armSplay: 0.3 * l });
+    }
+    const ease = fallen ? Math.min(1, 25 * dt) : Math.min(1, (fighting ? 30 : 16) * dt);
+    for (const key of POSE_KEYS) k.pose[key] += ((want[key] || 0) - k.pose[key]) * ease;
+    k.root.position.y = (mode === 'horse' && !horse.model.morph ? 0.14 : 0) - k.pose.crouch; // the built-in saddle sits higher than his hips
 
     // The mixer only rewrites a bone when its clip value changes, so a bone we turned last
     // frame may still hold our result. Start again from what the clip last gave it.
@@ -4971,6 +9631,36 @@
     turnBone(b.armL, 1, 0, 0, p.armL);
     turnBone(b.armL, 0, 0, 1, p.armSplay);
     turnBone(b.foreL, 1, 0, 0, p.foreL);
+    // shoulders turning, a lean to the side, the head
+    turnBone(b.spine2, 0, 1, 0, p.twist);
+    turnBone(b.spine, 0, 0, 1, p.lean);
+    turnBone(b.neck, 1, 0, 0, p.neck);
+    turnBone(b.neck, 0, 1, 0, p.headTurn);
+    if (fallen) {
+      const c = hero.collapse;
+      if (c.ik) {
+        applyReach(m.group, heroBone, c.ik); // getting up: feet and hands where they go
+      } else {
+        // going down: a moment's blend from whatever he was doing (flailing in the air, say)
+        const since = hero.down ? hero.down.t : hero.dead ? hero.dead.t : 1;
+        const w = Math.min(1, since / 0.15);
+        for (const [key, child] of AIMED) {
+          const dir = c.aim[key];
+          if (dir && b[key].bone && b[child].bone) aimTowards(b[key].bone, b[child].bone, m.group, dir, w);
+        }
+        if (c.brace) braceHands(m.group, heroBone, c.at, c.brace);
+      }
+    } else if (hero.fade) {
+      for (const [key, child, dir] of hero.fade.arms) aimTowards(b[key].bone, b[child].bone, m.group, dir, hero.fade.w);
+    }
+    // a fight pose points the arms (and for a kick, the legs) where the move needs them
+    if (fighting && hero.fight.guard > 0.01) {
+      for (const [key, child] of AIMED) {
+        const dir = hero.fightPose.aim[key];
+        if (!dir || ((key.startsWith('leg') || key.startsWith('knee')) && moving)) continue;
+        aimTowards(b[key].bone, b[child].bone, m.group, dir, hero.fight.guard);
+      }
+    }
     // in a car nothing shows below the window line, so the legs are tucked out of sight
     const tucked = mode === 'car' && !player.moto ? 0.01 : 1;
     b.legR.bone.scale.setScalar(tucked);
@@ -4998,19 +9688,26 @@
     const ground = groundAt(car.x, car.z, car.y);
     if (car.y > ground + 0.02) {
       // ground falling gently away (a downhill slope, a kerb): stay on it rather than fall
-      if (car.vy <= 0.5 && car.y - ground < 0.3) {
+      // (but not the last few centimetres of a real fall)
+      if (car.vy <= 0.5 && car.vy > -3 && car.y - ground < 0.3) {
         car.y = ground;
         car.vy = 0;
+        car.fallTop = null;
         return false;
       }
+      car.fallTop = Math.max(car.fallTop ?? car.y, car.y);
       car.vy -= GRAVITY * dt;
       car.y += car.vy * dt;
       if (car.y <= ground) {
         car.y = ground;
         car.vy = 0;
+        const drop = car.fallTop - ground;
+        car.fallTop = null;
+        landed(drop);
       }
       return true;
     }
+    car.fallTop = null;
     // remember how fast the surface is carrying us upward, so a ramp launches us off its end
     car.vy = dt > 0 ? Math.max(0, Math.min(14, (ground - car.y) / dt)) : 0;
     car.y = ground;
@@ -5063,7 +9760,7 @@
   }
 
   function pushHeroOut(radius) {
-    for (const box of colliders.concat(trafficBoxes, policeBoxes)) {
+    for (const box of solidsNear(car.x, car.z, radius)) {
       if (!blocksPlayer(box)) continue;
       const touch = boxContact(box, car.x, car.z, radius);
       if (!touch) continue;
@@ -5091,7 +9788,14 @@
     const length = Math.hypot(mx, mz);
     const shift = held('ShiftLeft', 'ShiftRight');
     const flying = hero.jetpack && car.y > groundAt(car.x, car.z, car.y) + 0.02;
-    const pace = flying ? JETPACK_SPEED : shift ? RUN_SPEED : WALK_SPEED;
+    // running costs breath, and out of it he walks. Breaking into a run ends a fight at
+    // once (only a blow already on its way is let finish); squared up, he steps lighter.
+    const swinging = hero.fight.move && !hero.fight.move.landed;
+    const canRun = shift && length > 0 && !hero.exhausted && hero.landing <= 0 && !swinging && !hero.fight.react;
+    const fighting = !canRun && hero.fight.guard > 0.6;
+    const busy = !canRun && (hero.fight.move || hero.fight.react) ? 0.35 : 1; // little ground covered mid-punch
+    const pace = (flying ? JETPACK_SPEED : canRun ? RUN_SPEED : fighting ? WALK_SPEED * 0.8 : WALK_SPEED) * busy;
+    hero.sprinting = canRun && length > 0 && !flying;
     if (length > 0) {
       mx = (mx / length) * pace;
       mz = (mz / length) * pace;
@@ -5101,6 +9805,22 @@
     car.x += mx * dt;
     car.z += mz * dt;
     pushHeroOut(0.4);
+    // people, dogs and animals are solid: he cannot walk through them
+    const shove = (x, z, y, reach) => {
+      const dx = car.x - x;
+      const dz = car.z - z;
+      const d = Math.hypot(dx, dz);
+      if (d > 0.01 && d < reach && Math.abs(y - car.y) < 1.2) {
+        car.x += (dx / d) * (reach - d);
+        car.z += (dz / d) * (reach - d);
+      }
+    };
+    for (const w of walkers) {
+      if (!onFeet(w)) continue;
+      const p = w.group.position;
+      shove(p.x, p.z, p.y, w.isPerson ? 0.6 : 0.55);
+    }
+    for (const a of animals) if (a.down <= 0) shove(a.x, a.z, a.y, 0.45 + a.sp.girth);
 
     clampToWorld();
 
@@ -5131,13 +9851,16 @@
 
     // The body turns to face the way it is moving, whichever way the camera looks. With a
     // weapon out, or mid-punch, it squares up to the crosshair instead.
+    updateHeroFight(dt, length > 0, canRun);
     const aiming = hero.weapon !== 'fist' || hero.punch > 0;
-    const heading = aiming ? hero.yaw : length > 0 ? Math.atan2(mx, mz) : hero.facing;
+    // squared up for a fight he keeps facing his man (updateHeroFight turns him)
+    const squared = hero.fight.guard > 0.4 && (hero.fight.move || hero.fight.react || length === 0);
+    const heading = aiming ? hero.yaw : squared ? hero.facing : length > 0 ? Math.atan2(mx, mz) : hero.facing;
     hero.facing += wrapAngle(heading - hero.facing) * Math.min(1, 12 * dt);
 
     const m = hero.model;
     m.group.position.set(car.x, car.y, car.z);
-    m.group.rotation.y = hero.facing;
+    m.group.rotation.set(0, hero.facing, 0); // upright, whatever came before
     const moving = length > 0 ? 1 : 0;
     hero.run += ((pace === RUN_SPEED ? 1 : 0) - hero.run) * Math.min(1, 7 * dt);
     hero.phase += moving * (9 + 4 * hero.run) * dt;
@@ -5168,7 +9891,7 @@
     let best = null;
     let bestDist = 4.5;
     const consider = (v, kind) => {
-      if (Math.abs((v.y || 0) - car.y) > 2) return;
+      if (v.busy || Math.abs((v.y || 0) - car.y) > 2) return;
       const d = Math.hypot(v.x - car.x, v.z - car.z);
       if (d < bestDist) {
         bestDist = d;
@@ -5188,13 +9911,22 @@
     $('weapon').parentElement.hidden = next !== 'foot';
   }
 
-  // --- getting in ---
+  // --- getting in and out ---
 
-  // Taking a vehicle is a short sequence, not an instant swap: it is made to stop, the
-  // hero steps to the driver's door, the door swings open, whoever is driving is pulled out
-  // and shoved clear, and only then does the hero get in and the door close behind him.
-  let entering = null; // { v, kind, t, wait, fromX, fromZ, total, cleared } while it is happening
+  // Getting into a vehicle, getting out, and being dragged out are short animated scenes,
+  // not instant swaps. Everyone moves the way a person does: they walk where they go with
+  // their feet in step with the ground (backwards when they back off), turn on the seat
+  // with their legs swinging over the sill, put a hand up to the roof, duck under it and
+  // stand up, and stagger back on their feet when shoved. Places are worked out in the
+  // vehicle's own frame (x to its left, z forward), so the same moves fit every kind.
+  let act = null; // the hero's scene at a vehicle, while it lasts
   const swingingDoors = []; // vehicles whose door is on its way shut
+  const WALK_PACE = 1.6; // m/s: an unhurried walk, which the walk clip matches step for step
+  const CHASE_SECONDS = 20;
+  const CHASE_SPEED = 5.4; // m/s: a flat-out sprint
+  const STUNNED_SECONDS = 2;
+  const SLOW_ENOUGH = 2.2; // m/s: a car crawling this slowly can be caught and opened
+  let nextTrafficId = 100000;
 
   function doorSpot(v, out) {
     const { hw } = v.model.dims;
@@ -5210,68 +9942,509 @@
     if (model.door) model.door.rotation.y = -1.2 * open;
   }
 
-  // Take the nearest car: parked, abandoned, or one driving past.
-  function enterVehicle() {
-    const found = nearestVehicle();
-    if (!found || entering) return;
-    const hasDriver = found.kind === 'traffic' && !!found.v.driver;
-    entering = { ...found, t: 0, wait: 0, fromX: car.x, fromZ: car.z, total: hasDriver ? 1.15 : 0.6, cleared: !hasDriver };
-    if (found.kind === 'traffic') found.v.jacked = true; // it brakes to a stop
-    car.vx = car.vz = 0;
-  }
-
-  function updateEntering(dt) {
-    const e = entering;
-    const { v, kind } = e;
-    const model = v.model;
-    if (kind === 'traffic' && Math.abs(v.speed) > 1.2) {
-      // still rolling: wait for it, and give up if it gets away
-      e.wait += dt;
-      if (e.wait > 3 || Math.hypot(v.x - car.x, v.z - car.z) > 13) {
-        v.jacked = false;
-        entering = null;
-      }
-      return;
-    }
-    if (e.t === 0) {
-      e.fromX = car.x;
-      e.fromZ = car.z;
-    }
-    e.t += dt;
-    // step to the door and face the vehicle
-    const [dx, dz] = doorSpot(v, 0.55);
-    const k = Math.min(1, e.t / 0.3);
-    car.x = e.fromX + (dx - e.fromX) * k;
-    car.z = e.fromZ + (dz - e.fromZ) * k;
-    hero.facing = hero.yaw = Math.atan2(v.x - car.x, v.z - car.z);
-    hero.model.group.position.set(car.x, car.y, car.z);
-    hero.model.group.rotation.y = hero.facing;
-    setDoor(model, Math.max(0, Math.min(1, (e.t - 0.15) / 0.3)));
-    if (!e.cleared && e.t > 0.5) {
-      e.cleared = true;
-      throwOutDriver(v);
-    }
-    if (e.t < e.total) return;
-
-    entering = null;
-    if (kind === 'idle') {
-      idleCars.splice(idleCars.indexOf(v), 1);
-      colliders.splice(colliders.indexOf(v.box), 1);
-    } else {
-      traffic.splice(traffic.indexOf(v), 1);
-      trafficBoxes.splice(trafficBoxes.indexOf(v.box), 1);
-      if (v.driver) model.group.remove(v.driver);
-    }
-    swingingDoors.push(model);
-    drive(model, v.x, v.y || 0, v.z, v.h);
-  }
-
   function updateDoors(dt) {
     for (let n = swingingDoors.length - 1; n >= 0; n--) {
       const model = swingingDoors[n];
       setDoor(model, Math.max(0, (model.doorOpen || 0) - 3.5 * dt));
       if (model.doorOpen <= 0) swingingDoors.splice(n, 1);
     }
+  }
+
+  // A point in a vehicle's frame, in the world: [x, z].
+  const toWorld = (v, lx, lz) => [v.x + lx * Math.cos(v.h) + lz * Math.sin(v.h), v.z - lx * Math.sin(v.h) + lz * Math.cos(v.h)];
+  const toLocal = (v, x, z) => {
+    const dx = x - v.x;
+    const dz = z - v.z;
+    return [dx * Math.cos(v.h) - dz * Math.sin(v.h), dx * Math.sin(v.h) + dz * Math.cos(v.h)];
+  };
+  const between = (u, a, b) => smooth((u - a) / (b - a));
+  const bell = (u, a, b) => Math.sin(Math.max(0, Math.min(1, (u - a) / (b - a))) * Math.PI);
+
+  // Where someone sits at the wheel: the place of their feet-level root in the vehicle's
+  // frame. The hero and the drivers are built a little differently.
+  function seatedAt(model, isHero) {
+    const seat = model.seat || [-0.2, 0.38];
+    return isHero
+      ? { x: seat[1], y: model.stats.eye - 1.66, z: seat[0] - 0.1 }
+      : { x: seat[1], y: (model.seatY || 0.44) - 0.9, z: seat[0] - 0.12 };
+  }
+  // the road just outside the driver's door, where you stand to get in or out
+  const besideDoor = (model, isHero) => ({ x: model.dims.hw + 0.42, z: seatedAt(model, isHero).z + 0.05 });
+  // where someone stands to open the door and haul out whoever is inside: by its rear edge
+  const atDoorEdge = (model) => ({ x: model.dims.hw + 0.62, z: seatedAt(model, true).z - 0.85 });
+  // The haul and the shove. Whoever is hauling steps back as the other climbs out, then
+  // the two swap places, the one hauled out swung round to the outside and the one hauling
+  // into the doorway, so the shove sends him out into the road, clear of the car and the
+  // open door (which stands forward of the doorway).
+  const HAUL = {
+    back: (model) => ({ x: model.dims.hw + 0.95, z: seatedAt(model, true).z - 1.05 }), // the hauler, a step back
+    out: (model) => ({ x: model.dims.hw + 1.45, z: seatedAt(model, true).z - 0.35 }), // where the hauled one is swung to
+    inside: (model) => ({ x: model.dims.hw + 0.47, z: seatedAt(model, true).z - 0.3 }), // the hauler, in the doorway
+  };
+
+  // A body between the seat (u = 0: sitting at the wheel, facing forward) and the road
+  // outside the door (u = 1: standing, facing out). On the way he turns on the seat, the
+  // legs swing out over the sill, one foot then the other goes down to the road, a hand goes
+  // up to the roof's edge, he ducks under it, and stands.
+  function seatMove(model, u, isHero) {
+    const seated = seatedAt(model, isHero);
+    const outside = besideDoor(model, isHero);
+    const slide = between(u, 0.22, 0.7);
+    const rise = between(u, 0.42, 0.92);
+    const hands = 1 - between(u, 0, 0.22); // off the wheel
+    return {
+      x: seated.x + (outside.x - seated.x) * slide,
+      y: seated.y * (1 - rise),
+      z: seated.z + (outside.z - seated.z) * slide,
+      yaw: (Math.PI / 2) * between(u, 0, 0.36),
+      pose: {
+        legL: -1.45 * (1 - between(u, 0.4, 0.86)), kneeL: 1.35 * (1 - between(u, 0.45, 0.9)),
+        legR: -1.45 * (1 - between(u, 0.5, 0.94)), kneeR: 1.35 * (1 - between(u, 0.55, 0.97)),
+        spine: -0.1 * hands + 0.5 * bell(u, 0.28, 0.95),
+        armL: -1.1 * hands - 1.8 * bell(u, 0.25, 0.85), foreL: -0.4 * hands - 0.6 * bell(u, 0.25, 0.85),
+        armR: -1.1 * hands + 0.3 * bell(u, 0.3, 0.8), foreR: -0.4 * hands - 0.3 * bell(u, 0.3, 0.8),
+        legSplay: 0.12 * bell(u, 0.3, 0.9),
+      },
+    };
+  }
+
+  // Places the hero at a point of seatMove, in the world.
+  function heroAtSeat(v, u) {
+    const m = seatMove(v.model, u, true);
+    const [x, z] = toWorld(v, m.x, m.z);
+    car.x = x;
+    car.z = z;
+    car.y = (v.y || 0) + m.y;
+    hero.facing = v.h + m.yaw;
+    act.heroPose = m.pose;
+  }
+
+  // ... and a driver.
+  function npcAtSeat(w, v, u) {
+    const m = seatMove(v.model, u, false);
+    const [x, z] = toWorld(v, m.x, m.z);
+    w.group.position.set(x, (v.y || 0) + m.y, z);
+    w.group.rotation.set(0, v.h + m.yaw, 0);
+    w.pose = m.pose;
+    w.actMove = 0;
+    w.baseY = v.y || 0;
+  }
+
+  // Walks the hero toward (x, z), turning to face the way he goes, or backing up facing
+  // `face`. His feet keep pace with the ground. True once he is there.
+  function heroWalk(dt, x, z, pace = WALK_PACE, back = false, face = 0) {
+    const dx = x - car.x;
+    const dz = z - car.z;
+    const d = Math.hypot(dx, dz);
+    if (d < 0.04) return true;
+    const step = Math.min(d, pace * dt);
+    car.x += (dx / d) * step;
+    car.z += (dz / d) * step;
+    car.vx = ((dx / d) * step) / dt;
+    car.vz = ((dz / d) * step) / dt;
+    car.y = groundAt(car.x, car.z, car.y + 0.3);
+    hero.backward = back;
+    turnHero(back ? face : Math.atan2(dx, dz), dt);
+    return false;
+  }
+  const turnHero = (heading, dt, rate = 10) => {
+    hero.facing += wrapAngle(heading - hero.facing) * Math.min(1, rate * dt);
+  };
+
+  // The same for a pedestrian, kept out of walls; `pace` below zero walks backwards.
+  function npcWalk(w, dt, x, z, pace = WALK_PACE, back = false, face = 0) {
+    const g = w.group;
+    const dx = x - g.position.x;
+    const dz = z - g.position.z;
+    const d = Math.hypot(dx, dz);
+    if (d < 0.05) {
+      w.actMove = 0;
+      return true;
+    }
+    const step = Math.min(d, pace * dt);
+    stepWalker(w, (dx / d) * step, (dz / d) * step);
+    w.actMove = 1;
+    w.actSpeed = back ? -step / dt : step / dt;
+    const want = back ? face : Math.atan2(dx, dz);
+    g.rotation.set(0, g.rotation.y + wrapAngle(want - g.rotation.y) * Math.min(1, 10 * dt), 0);
+    return false;
+  }
+
+  // Turning on the spot: small shuffling steps, not a glide.
+  function npcTurn(w, dt, heading) {
+    const g = w.group;
+    const left = wrapAngle(heading - g.rotation.y);
+    g.rotation.set(0, g.rotation.y + left * Math.min(1, 8 * dt), 0);
+    w.actMove = Math.min(0.45, Math.abs(left) * 1.5);
+    w.actSpeed = 0.8;
+  }
+
+  // A way round to a spot beside the driver's door: straight there if he is already on that
+  // side, otherwise by way of the nearer corner, so he never walks through the vehicle.
+  function routeToDoor(v, spot) {
+    const [lx, lz] = toLocal(v, car.x, car.z);
+    const { hl, hw } = v.model.dims;
+    const route = [];
+    if (lx < hw + 0.2) {
+      const end = lz >= 0 ? hl + 0.9 : -hl - 0.9;
+      if (lx < -hw - 0.2) route.push([-hw - 0.9, end]); // from the far side: along it first
+      route.push([hw + 0.9, end]);
+    }
+    route.push([spot.x, spot.z]);
+    return route;
+  }
+
+  // The driver of a vehicle the hero is taking: no longer a figure at the wheel but a
+  // pedestrian, starting from the seat.
+  function driverOut(v) {
+    const figure = v.driver;
+    v.model.group.remove(figure);
+    v.driver = null;
+    const template = figure.userData.template;
+    if (!template) return null;
+    const w = createPerson(template);
+    w.template = template;
+    setPavementGoal(w, v.x, v.z);
+    Object.assign(w, {
+      speed: rand(1.3, 1.7), phase: 0, health: 85, state: 'act', timer: 0, tip: 0, tipSign: -1, dying: false, moving: 0,
+      away: true, baseY: v.y || 0, stolen: v.model, actMove: 0, actSpeed: 0, pose: null,
+    });
+    w.group.rotation.order = 'YXZ';
+    scene.add(w.group);
+    walkers.push(w);
+    npcAtSeat(w, v, 0);
+    return w;
+  }
+
+  // Take the nearest vehicle: parked, abandoned, or one driving past.
+  function enterVehicle() {
+    const found = nearestVehicle();
+    if (!found || act) return;
+    const { v, kind } = found;
+    if (kind === 'traffic') v.jacked = true; // it brakes to a stop
+    v.busy = true;
+    car.vx = car.vz = 0;
+    act = { kind: 'in', v, vkind: kind, phase: 'wait', t: 0, heroPose: null, npc: null, driver: !!v.driver };
+    if (v.model.moto) act.phase = 'mount'; // a motorbike is simply straddled
+  }
+
+  // Getting out: the door opens, he turns on the seat and climbs out, and walks clear as
+  // it swings shut. A motorbike is just stepped off.
+  function exitVehicle() {
+    const moving = Math.hypot(car.vx, car.vz) > 3;
+    if (moving || car.y > groundAt(car.x, car.z, car.y) + 0.02) {
+      showToast('Stop the car to get out', true);
+      return;
+    }
+    if (player.moto) {
+      const parked = releasePlayerCar();
+      parked.busy = false;
+      const stepOut = parked.model.dims.hw + 1.1;
+      car.x += Math.cos(car.heading) * stepOut;
+      car.z -= Math.sin(car.heading) * stepOut;
+      hero.yaw = hero.facing = car.heading;
+      hero.model.group.position.set(car.x, car.y, car.z);
+      updateCamera(0, 0, true);
+      return;
+    }
+    const parked = releasePlayerCar();
+    act = { kind: 'out', v: parked, phase: 'open', t: 0, heroPose: null };
+    heroAtSeat(parked, 0);
+  }
+
+  // The car the hero was driving becomes a parked car, its lamps back to normal; the hero
+  // is on foot (though a scene may still be moving him). Returns its parked entry.
+  function releasePlayerCar() {
+    if (insideView) setInsideView(false);
+    player.flame.visible = false;
+    player.tailMat.color.setHex(0x7a1010);
+    if (player.headMat) player.headMat.userData.mine = false;
+    if (player.beam) {
+      player.beam.material = beamMat;
+      player.beam.scale.set(1, 1, 1);
+    }
+    player.indicator = lights.indicator === 'hazard' ? 'hazard' : null;
+    if (player.bar) {
+      player.bar[0].color.setHex(0x400808);
+      player.bar[1].color.setHex(0x081040);
+    }
+    if (player.amberL && !player.indicator) {
+      player.amberL.color.setHex(AMBER_OFF);
+      player.amberR.color.setHex(AMBER_OFF);
+    }
+    setLights({ indicator: null, emergency: false, brakes: false }, true);
+    scene.add(hero.model.group);
+    player.group.rotation.set(0, car.heading, 0);
+    addIdleCar(player, car.x, car.y, car.z, car.heading);
+    const parked = idleCars[idleCars.length - 1];
+    parked.busy = true;
+    player = null;
+    car.boosting = false;
+    hero.yaw = car.heading;
+    hero.pitch = 0;
+    car.vx = car.vz = 0;
+    setMode('foot');
+    updateCamera(0, 0, true);
+    return parked;
+  }
+
+  // The hero's scene, a step at a time.
+  function updateAct(dt) {
+    const a = act;
+    const v = a.v;
+    const model = v.model;
+    a.t += dt;
+    hero.backward = false;
+    hero.shuffle = false;
+    car.vx = car.vz = 0;
+    const next = (phase) => {
+      a.phase = phase;
+      a.t = 0;
+    };
+    const npc = a.npc;
+
+    if (a.kind === 'in') {
+      if (a.phase === 'mount') {
+        if (v.driver) {
+          // the rider is pulled off and shoved away from the bike
+          const w = driverOut(v);
+          if (w) {
+            const [x, z] = toWorld(v, 0.8, 0);
+            w.group.position.set(x, v.y || 0, z);
+            w.pose = null;
+            shoveWalker(w, Math.cos(v.h), -Math.sin(v.h), 3);
+          }
+        }
+        finishGettingIn();
+        return;
+      }
+      if (a.phase === 'wait') {
+        a.heroPose = null;
+        if (a.vkind === 'traffic' && Math.abs(v.speed) > 0.4) {
+          // still rolling: wait for it to stop, and give up if it gets away
+          if (a.t > 3 || Math.hypot(v.x - car.x, v.z - car.z) > 13) {
+            v.jacked = false;
+            v.busy = false;
+            act = null;
+          }
+          return;
+        }
+        a.route = routeToDoor(v, a.driver ? atDoorEdge(model) : besideDoor(model, true));
+        next('walk');
+      }
+      if (a.phase === 'walk') {
+        const [x, z] = toWorld(v, ...a.route[0]);
+        // a jog for the way round, a walk for the last few steps to the door
+        let left = Math.hypot(x - car.x, z - car.z);
+        for (let k = 1; k < a.route.length; k++) left += Math.hypot(a.route[k][0] - a.route[k - 1][0], a.route[k][1] - a.route[k - 1][1]);
+        if (heroWalk(dt, x, z, left > 2.2 ? 3.6 : WALK_PACE)) {
+          a.route.shift();
+          if (!a.route.length) next('open');
+        }
+      } else if (a.phase === 'open') {
+        // reach for the handle and swing the door wide
+        const [hx, hz] = toWorld(v, model.dims.hw, seatedAt(model, true).z + 0.3);
+        turnHero(Math.atan2(hx - car.x, hz - car.z), dt, 12);
+        const reach = between(a.t, 0, 0.2) * (1 - between(a.t, 0.45, 0.6));
+        a.heroPose = { armR: -1.2 * reach, foreR: -0.3 * reach, spine: 0.08 * reach };
+        setDoor(model, between(a.t, 0.15, 0.55));
+        if (a.t >= 0.6) next(a.driver ? 'pull' : 'toSeat');
+      } else if (a.phase === 'pull') {
+        // reach in, take hold, and haul: he climbs out as he is pulled, the hero backing off
+        if (!a.npc) a.npc = driverOut(v);
+        const u = smooth(Math.min(1, a.t / 1.2));
+        if (a.npc && a.npc.state === 'act') npcAtSeat(a.npc, v, u);
+        const grip = between(a.t, 0, 0.3);
+        const haul = between(a.t, 0.35, 1.0);
+        a.heroPose = { armR: -1.35 * grip + 0.35 * haul, armL: -1.2 * grip + 0.3 * haul, foreR: -0.2 - 0.8 * haul, foreL: -0.2 - 0.8 * haul, spine: 0.2 * grip - 0.1 * haul };
+        if (a.t > 0.35) {
+          const back = HAUL.back(model);
+          const [x, z] = toWorld(v, back.x, back.z);
+          const [fx, fz] = toWorld(v, besideDoor(model, false).x, besideDoor(model, false).z);
+          heroWalk(dt, x, z, 0.8, true, Math.atan2(fx - car.x, fz - car.z));
+        }
+        if (a.t >= 1.25) next(a.npc && a.npc.state === 'act' ? 'swing' : 'toSeat');
+      } else if (a.phase === 'swing') {
+        // still holding him, the hero swings him round to the outside and takes the doorway
+        const out = HAUL.out(model);
+        const inside = HAUL.inside(model);
+        const [nx, nz] = toWorld(v, out.x, out.z);
+        const [hx, hz] = toWorld(v, inside.x, inside.z);
+        const npcThere = npc.state !== 'act' || npcWalk(npc, dt, nx, nz, 1.5);
+        npc.pose = { armR: -0.5, armL: -0.3, foreR: -0.5, foreL: -0.4 }; // arms up against the hands on him
+        const heroThere = heroWalk(dt, hx, hz, 1.5);
+        a.heroPose = { armR: -0.9, armL: -0.9, foreR: -0.7, foreL: -0.7 };
+        if ((npcThere && heroThere) || a.t > 1.6) next('face');
+      } else if (a.phase === 'face') {
+        // he turns on the hero; the hero squares up
+        const p = npc.group.position;
+        if (npc.state === 'act') {
+          npcTurn(npc, dt, Math.atan2(car.x - p.x, car.z - p.z));
+          npc.pose = { armR: -0.35, armL: -0.35, foreR: -0.9, foreL: -0.9 };
+        }
+        turnHero(Math.atan2(p.x - car.x, p.z - car.z), dt, 12);
+        a.heroPose = { armR: -0.4, armL: -0.4, foreR: -0.6, foreL: -0.6 };
+        if (a.t >= 0.35) next('shove');
+      } else if (a.phase === 'shove') {
+        // a step in and a two-handed shove out into the road: he goes staggering back
+        const p = npc.group.position;
+        const d = Math.hypot(p.x - car.x, p.z - car.z) || 1;
+        const lunge = bell(a.t, 0, 0.5);
+        a.heroPose = { armR: -0.5 - 1.0 * lunge, armL: -0.5 - 1.0 * lunge, foreR: -0.6 * (1 - lunge), foreL: -0.6 * (1 - lunge), spine: 0.25 * lunge };
+        if (a.t < 0.3) heroWalk(dt, car.x + ((p.x - car.x) / d) * 0.2, car.z + ((p.z - car.z) / d) * 0.2, 1.2);
+        if (a.t >= 0.18 && npc.state === 'act') shoveWalker(npc, (p.x - car.x) / d, (p.z - car.z) / d, 3.3);
+        if (a.t >= 0.5) next('toSeat');
+      } else if (a.phase === 'toSeat') {
+        a.heroPose = null;
+        const spot = besideDoor(model, true);
+        const [x, z] = toWorld(v, spot.x, spot.z);
+        if (heroWalk(dt, x, z, 1.3)) next('turn');
+      } else if (a.phase === 'turn') {
+        // his back to the seat, ready to sit
+        turnHero(v.h + Math.PI / 2, dt, 9);
+        hero.shuffle = true;
+        if (a.t >= 0.4) next('sit');
+      } else if (a.phase === 'sit') {
+        heroAtSeat(v, 1 - smooth(Math.min(1, a.t / 1.15)));
+        if (a.t >= 1.15) next('close');
+      } else if (a.phase === 'close') {
+        heroAtSeat(v, 0);
+        setDoor(model, 1 - between(a.t, 0, 0.35));
+        if (a.t >= 0.4) finishGettingIn();
+      }
+    } else if (a.kind === 'out') {
+      if (a.phase === 'open') {
+        heroAtSeat(v, 0);
+        setDoor(model, between(a.t, 0, 0.4));
+        if (a.t >= 0.4) next('climb');
+      } else if (a.phase === 'climb') {
+        heroAtSeat(v, smooth(Math.min(1, a.t / 1.1)));
+        if (a.t >= 1.1) {
+          a.heroPose = null;
+          swingingDoors.push(model); // it swings shut behind him
+          next('clear');
+        }
+      } else if (a.phase === 'clear') {
+        const [x, z] = toWorld(v, model.dims.hw + 1.3, seatedAt(model, true).z - 0.2);
+        if (heroWalk(dt, x, z) || a.t > 1.5) {
+          v.busy = false;
+          hero.yaw = hero.facing;
+          act = null;
+        }
+      }
+    } else if (a.kind === 'dragged') {
+      // the owner has caught up with his car: he opens the door, hauls the hero out and
+      // shoves him away, then gets in and drives off
+      const p = npc.group.position;
+      if (npc.state !== 'act') {
+        // something stopped him (a shot, say): the hero is let go
+        if (a.phase === 'open' || a.phase === 'pull') heroAtSeat(v, 1);
+        a.heroPose = null;
+        v.busy = false;
+        setDoor(model, 1);
+        swingingDoors.push(model);
+        act = null;
+        return;
+      }
+      if (a.phase === 'open') {
+        heroAtSeat(v, 0);
+        const [hx, hz] = toWorld(v, model.dims.hw, seatedAt(model, true).z + 0.3);
+        npcTurn(npc, dt, Math.atan2(hx - p.x, hz - p.z));
+        const reach = between(a.t, 0, 0.2) * (1 - between(a.t, 0.45, 0.6));
+        npc.pose = { armR: -1.2 * reach, foreR: -0.3 * reach };
+        setDoor(model, between(a.t, 0.15, 0.55));
+        if (a.t >= 0.6) next('pull');
+      } else if (a.phase === 'pull') {
+        heroAtSeat(v, smooth(Math.min(1, a.t / 1.0)));
+        const grip = between(a.t, 0, 0.25);
+        const haul = between(a.t, 0.3, 0.9);
+        npc.pose = { armR: -1.35 * grip + 0.35 * haul, armL: -1.2 * grip + 0.3 * haul, foreR: -0.2 - 0.8 * haul, foreL: -0.2 - 0.8 * haul, spine: 0.2 * grip - 0.1 * haul };
+        if (a.t > 0.3) {
+          const back = HAUL.back(model);
+          const [x, z] = toWorld(v, back.x, back.z);
+          npcWalk(npc, dt, x, z, 0.8, true, Math.atan2(car.x - p.x, car.z - p.z));
+        } else npc.actMove = 0;
+        if (a.t >= 1.05) next('swing');
+      } else if (a.phase === 'swing') {
+        // swung round to the outside, the owner taking the doorway
+        const out = HAUL.out(model);
+        const inside = HAUL.inside(model);
+        const [hx, hz] = toWorld(v, out.x, out.z);
+        const [nx, nz] = toWorld(v, inside.x, inside.z);
+        a.heroPose = { armR: -0.5, armL: -0.3, foreR: -0.5, foreL: -0.4 };
+        npc.pose = { armR: -0.9, armL: -0.9, foreR: -0.7, foreL: -0.7 };
+        const heroThere = heroWalk(dt, hx, hz, 1.5);
+        const npcThere = npcWalk(npc, dt, nx, nz, 1.5);
+        if ((heroThere && npcThere) || a.t > 1.6) next('face');
+      } else if (a.phase === 'face') {
+        a.heroPose = null;
+        turnHero(Math.atan2(p.x - car.x, p.z - car.z), dt, 9);
+        hero.shuffle = true;
+        npcTurn(npc, dt, Math.atan2(car.x - p.x, car.z - p.z));
+        npc.pose = { armR: -0.4, armL: -0.4, foreR: -0.6, foreL: -0.6 };
+        if (a.t >= 0.4) next('shove');
+      } else if (a.phase === 'shove') {
+        const d = Math.hypot(car.x - p.x, car.z - p.z) || 1;
+        const lunge = bell(a.t, 0, 0.5);
+        npc.pose = { armR: -0.5 - 1.0 * lunge, armL: -0.5 - 1.0 * lunge, foreR: -0.6 * (1 - lunge), foreL: -0.6 * (1 - lunge), spine: 0.25 * lunge };
+        if (a.t < 0.3) npcWalk(npc, dt, p.x + ((car.x - p.x) / d) * 0.2, p.z + ((car.z - p.z) / d) * 0.2, 1.2);
+        else npc.actMove = 0;
+        if (a.t >= 0.18 && !a.stumble) a.stumble = { dx: (car.x - p.x) / d, dz: (car.z - p.z) / d, t: 0 };
+        if (a.t >= 0.5) {
+          // he gets in on his own from here; the hero is still reeling
+          npc.pose = null;
+          npc.script = { phase: 'toSeat', t: 0, v };
+          next('reel');
+        }
+      }
+      if (a.stumble) {
+        // staggering back on his feet, slowing, arms out for balance
+        const s = a.stumble;
+        s.t += dt;
+        const k = Math.min(1, s.t / 1.1);
+        const speed = 3.1 * (1 - k) ** 1.5;
+        car.x += s.dx * speed * dt;
+        car.z += s.dz * speed * dt;
+        pushHeroOut(0.4);
+        car.y = groundAt(car.x, car.z, car.y + 0.3);
+        car.vx = s.dx * speed;
+        car.vz = s.dz * speed;
+        hero.backward = true;
+        turnHero(Math.atan2(-s.dx, -s.dz), dt, 12);
+        a.heroPose = { spine: -0.3 * (1 - k), armR: -0.5 * (1 - k), armL: -0.7 * (1 - k), armSplay: 0.6 * (1 - k), foreR: -0.4 * (1 - k), foreL: -0.4 * (1 - k) };
+        if (k >= 1 && a.phase === 'reel') {
+          hero.yaw = hero.facing;
+          act = null;
+        }
+      }
+    }
+    if (act) {
+      const m = hero.model;
+      m.group.position.set(car.x, car.y, car.z);
+      m.group.rotation.set(0, hero.facing, 0);
+      car.heading = hero.yaw;
+    }
+  }
+
+  // The hero is at the wheel: the vehicle is his to drive.
+  function finishGettingIn() {
+    const { v, vkind } = act;
+    const model = v.model;
+    act = null;
+    v.busy = false;
+    if (vkind === 'idle') {
+      idleCars.splice(idleCars.indexOf(v), 1);
+      removeCollider(v.box);
+    } else {
+      traffic.splice(traffic.indexOf(v), 1);
+      trafficBoxes.splice(trafficBoxes.indexOf(v.box), 1);
+    }
+    if (v.driver) {
+      model.group.remove(v.driver);
+      v.driver = null;
+    }
+    setDoor(model, 0);
+    drive(model, v.x, v.y || 0, v.z, v.h);
   }
 
   // The nearest point of a pavement loop to (x, z): the block, the place, and how far round.
@@ -5291,27 +10464,238 @@
     return { block, half, tx: block.x + px, tz: block.z + pz, s: edge * half * 2 + r + half };
   }
 
-  // The driver comes out of the door, is shoved over, and once back up walks off to the
-  // nearest pavement as one more pedestrian.
-  function throwOutDriver(v) {
-    const figure = v.driver;
-    v.model.group.remove(figure);
-    v.driver = null;
-    const template = figure.userData.template;
-    if (!template) return;
-    const w = createPerson(template);
-    const [x, z] = doorSpot(v, 1.5);
+  // Points a pedestrian who is off the pavements at the nearest one to walk back to.
+  function setPavementGoal(w, x, z) {
     const to = nearestPavement(x, z);
-    Object.assign(w, {
-      cx: to.block.x, gy: to.block.y, cz: to.block.z, half: to.half, s: to.s, tx: to.tx, tz: to.tz,
-      speed: rand(1.3, 1.7), phase: 0, health: 85, state: 'fall', timer: 0, tip: 0, tipSign: -1, dying: false, moving: 0,
-      away: true, baseY: v.y || 0, // not on its pavement yet
-    });
-    w.group.rotation.order = 'YXZ';
-    w.group.position.set(x, w.baseY, z);
-    w.group.rotation.y = v.h - Math.PI / 2; // facing the car he was pulled from, so he goes over backwards away from it
-    scene.add(w.group);
-    walkers.push(w);
+    Object.assign(w, { cx: to.block.x, gy: to.block.y, cz: to.block.z, half: to.half, s: to.s, tx: to.tx, tz: to.tz });
+  }
+
+  // A pedestrian moving on the ground: kept out of walls and vehicles, on whatever is underfoot.
+  function stepWalker(w, dx, dz) {
+    const g = w.group.position;
+    g.x += dx;
+    g.z += dz;
+    const boxes = collidersNear(g.x, g.z, 0.4).concat(trafficBoxes, policeBoxes);
+    if (mode === 'car' && player) {
+      // the vehicle you are driving is solid to him too
+      const { hl, hw } = player.dims;
+      const reach = hl + hw;
+      boxes.push({ minX: car.x - reach, maxX: car.x + reach, minZ: car.z - reach, maxZ: car.z + reach, car: { x: car.x, z: car.z, h: car.heading, hl, hw } });
+    }
+    for (const box of boxes) {
+      if ((box.minY ?? -Infinity) > g.y + 1.5 || (box.top ?? box.maxY ?? Infinity) <= g.y + STEP_UP) continue;
+      const touch = boxContact(box, g.x, g.z, 0.35);
+      if (!touch) continue;
+      g.x += touch.nx * (0.35 - touch.dist);
+      g.z += touch.nz * (0.35 - touch.dist);
+    }
+    g.y = groundAt(g.x, g.z, g.y + 0.3);
+    w.baseY = g.y;
+  }
+
+  // How far a point is from the outside of a vehicle's body.
+  function gapToVehicle(model, x, z) {
+    const p = model.group.position;
+    const h = model.group.rotation.y;
+    const along = (x - p.x) * Math.sin(h) + (z - p.z) * Math.cos(h);
+    const side = (x - p.x) * Math.cos(h) - (z - p.z) * Math.sin(h);
+    const { hl, hw } = model.dims || { hl: 2, hw: 1 };
+    return Math.hypot(Math.max(0, Math.abs(along) - hl), Math.max(0, Math.abs(side) - hw));
+  }
+
+  // Sends a pedestrian staggering backwards from a shove along (dx, dz).
+  function shoveWalker(w, dx, dz, speed) {
+    w.state = 'stumble';
+    w.timer = 0;
+    w.push = { dx, dz, speed, seconds: 1.15 };
+    w.pose = null;
+  }
+
+  // The states of a driver who has had his car taken: 'act' (moved by a scene),
+  // 'stumble' (reeling back from a shove), 'stunned' (staring after it), 'chase' (running
+  // after it). Returns false for any other state.
+  function updateJacked(w, dt) {
+    const g = w.group;
+    if (w.state === 'act') {
+      if (w.script) updateNpcScript(w, dt);
+      return true;
+    }
+    if (w.state === 'stumble') {
+      // backwards on his feet, slowing, arms out for balance, nearly over and then not
+      w.timer += dt;
+      const s = w.push;
+      const k = Math.min(1, w.timer / s.seconds);
+      const speed = s.speed * (1 - k) ** 1.5;
+      stepWalker(w, s.dx * speed * dt, s.dz * speed * dt);
+      g.rotation.set(0, Math.atan2(-s.dx, -s.dz), 0);
+      w.actMove = Math.min(1, speed / 0.5);
+      w.actSpeed = -speed;
+      w.pose = { spine: -0.35 * (1 - k), armR: -0.5 * (1 - k), armL: -0.8 * (1 - k), armSplay: 0.7 * (1 - k), foreR: -0.4 * (1 - k), foreL: -0.5 * (1 - k) };
+      if (k >= 1) {
+        w.pose = null;
+        w.actMove = 0;
+        w.state = 'stunned';
+        w.timer = STUNNED_SECONDS;
+      }
+      return true;
+    }
+    if (w.state === 'stunned') {
+      // watching his car go, turning to follow it
+      w.timer -= dt;
+      const p = w.stolen.group.position;
+      npcTurn(w, dt, Math.atan2(p.x - g.position.x, p.z - g.position.z));
+      if (w.timer <= 0) {
+        w.actMove = 0;
+        w.state = 'chase';
+        w.timer = CHASE_SECONDS;
+      }
+      return true;
+    }
+    if (w.state === 'chase') {
+      w.timer -= dt;
+      if (mode === 'foot' && !act && !hero.dead && Math.hypot(car.x - g.position.x, car.z - g.position.z) < 2.5) {
+        w.state = 'fight';
+        w.fight = newFight();
+        w.fight.cooldown = 0.2;
+        return true;
+      }
+      const model = w.stolen;
+      const parked = idleCars.find((e) => e.model === model);
+      const driven = mode === 'car' && player === model;
+      if (w.timer <= 0 || (!driven && !parked) || Math.hypot(model.group.position.x - g.position.x, model.group.position.z - g.position.z) > 400) {
+        // twenty seconds flat out and he is spent, or the car is long gone: back to the pavement
+        setPavementGoal(w, g.position.x, g.position.z);
+        w.state = 'goto';
+        return true;
+      }
+      // the car standing still (or near enough, or parked): make for its driver's door
+      const v = driven ? { x: car.x, z: car.z, h: car.heading, model } : parked;
+      const slow = !driven || Math.hypot(car.vx, car.vz) < SLOW_ENOUGH;
+      let tx = v.x;
+      let tz = v.z;
+      if (slow) {
+        const edge = atDoorEdge(model);
+        [tx, tz] = toWorld(v, edge.x, edge.z);
+      }
+      const dx = tx - g.position.x;
+      const dz = tz - g.position.z;
+      const d = Math.hypot(dx, dz) || 1;
+      if (slow && d < 0.3 && !(parked && parked.busy) && !(driven && act)) {
+        if (driven) startDragged(w);
+        else {
+          // nobody in it: he simply gets back in and drives off
+          parked.busy = true;
+          w.state = 'act';
+          w.script = { phase: 'open', t: 0, v: parked };
+        }
+        return true;
+      }
+      // sprinting, then a walk for the last few steps to the door
+      const pace = slow && d < 2.5 ? WALK_PACE : CHASE_SPEED;
+      const room = slow ? d : gapToVehicle(model, g.position.x, g.position.z) - 0.8;
+      const step = Math.max(0, Math.min(room, pace * dt));
+      stepWalker(w, (dx / d) * step, (dz / d) * step);
+      g.rotation.set(step / dt > 3 ? 0.12 : 0, Math.atan2(dx, dz), 0); // leaning into the run
+      // legs at the pace he really covers ground, so his feet never skate
+      w.actSpeed = step / dt;
+      w.actMove = Math.min(1, w.actSpeed / 0.6);
+      return true;
+    }
+    return false;
+  }
+
+  // What a pedestrian does on his own in a scene: back into his car and away.
+  function updateNpcScript(w, dt) {
+    const s = w.script;
+    const v = s.v;
+    const model = v.model;
+    s.t += dt;
+    const next = (phase) => {
+      s.phase = phase;
+      s.t = 0;
+    };
+    const p = w.group.position;
+    if (s.phase === 'open') {
+      const [hx, hz] = toWorld(v, model.dims.hw, seatedAt(model, false).z + 0.3);
+      npcTurn(w, dt, Math.atan2(hx - p.x, hz - p.z));
+      const reach = between(s.t, 0, 0.2) * (1 - between(s.t, 0.45, 0.6));
+      w.pose = { armR: -1.2 * reach, foreR: -0.3 * reach };
+      setDoor(model, between(s.t, 0.15, 0.55));
+      if (s.t >= 0.6) next('toSeat');
+    } else if (s.phase === 'toSeat') {
+      w.pose = null;
+      setDoor(model, 1);
+      const spot = besideDoor(model, false);
+      const [x, z] = toWorld(v, spot.x, spot.z);
+      if (npcWalk(w, dt, x, z, 1.3) || s.t > 4) next('turn');
+    } else if (s.phase === 'turn') {
+      npcTurn(w, dt, v.h + Math.PI / 2);
+      if (s.t >= 0.45) next('sit');
+    } else if (s.phase === 'sit') {
+      npcAtSeat(w, v, 1 - smooth(Math.min(1, s.t / 1.15)));
+      if (s.t >= 1.15) next('close');
+    } else if (s.phase === 'close') {
+      npcAtSeat(w, v, 0);
+      setDoor(model, 1 - between(s.t, 0, 0.35));
+      if (s.t >= 0.4) driveAway(w, v);
+    }
+  }
+
+  // He is at the wheel again: the figure at the wheel takes his place, and the car rejoins
+  // the traffic if it is on a city street (or stays parked with him in it if it is not).
+  function driveAway(w, v) {
+    const model = v.model;
+    setDoor(model, 0);
+    scene.remove(w.group);
+    walkers.splice(walkers.indexOf(w), 1);
+    idleCars.splice(idleCars.indexOf(v), 1);
+    removeCollider(v.box);
+    const figure = addDriver(model, w.template);
+    if (!rejoinTraffic(model, v.x, v.z, v.h, figure)) {
+      addIdleCar(model, v.x, v.y || 0, v.z, v.h);
+      idleCars[idleCars.length - 1].driver = figure;
+    }
+  }
+
+  // Puts a vehicle back into the traffic from where it stands: on the street it is on,
+  // heading the way along it that it faces. False if it is not on a city street.
+  function rejoinTraffic(model, x, z, h, driver) {
+    if (Math.abs(x) > HALF - 2 || Math.abs(z) > HALF - 2) return false;
+    const i = roadIndex(x);
+    const j = roadIndex(z);
+    const onNS = Math.abs(x - roadCenter(i)) < ROAD_WIDTH / 2;
+    const onEW = Math.abs(z - roadCenter(j)) < ROAD_WIDTH / 2;
+    if (!onNS && !onEW) return false;
+    const alongZ = onNS && (!onEW || Math.abs(Math.cos(h)) > Math.abs(Math.sin(h)));
+    const d = alongZ ? (Math.cos(h) >= 0 ? 1 : 3) : (Math.sin(h) >= 0 ? 0 : 2);
+    const forward = d < 2; // toward +x or +z
+    // the stretch of street it is on, the crossing behind it, and how far past that it is
+    const along = alongZ ? z : x;
+    const k = Math.max(0, Math.min(BLOCKS - 1, Math.floor((along - roadCenter(0)) / CELL)));
+    const start = forward ? k : k + 1;
+    const ci = alongZ ? i : start;
+    const cj = alongZ ? start : j;
+    if (!segmentOpen(ci, cj, d)) return false;
+    const t = forward ? along - roadCenter(k) : roadCenter(k + 1) - along;
+    const c = {
+      i: ci, j: cj, d, t: Math.max(JUNCTION + 1, Math.min(CELL - JUNCTION - 2, t)), phase: 'road', speed: 0, cruise: rand(9, 13), steer: 0,
+      side: 0, laneTimer: 0, wait: 0, reverse: 0, hold: null, id: nextTrafficId++, model, x, z, h, driver,
+    };
+    carrotPoint(c);
+    c.box = { minX: 0, maxX: 0, minZ: 0, maxZ: 0, maxY: model.roof + 0.2, owner: model, car: { x, z, h, ...model.dims } };
+    trafficBoxes.push(c.box);
+    traffic.push(c);
+    return true;
+  }
+
+  // The owner has caught the hero in his car: the hero's side of that scene.
+  function startDragged(w) {
+    const parked = releasePlayerCar();
+    w.state = 'act';
+    w.script = null;
+    act = { kind: 'dragged', v: parked, npc: w, phase: 'open', t: 0, heroPose: null };
+    heroAtSeat(parked, 0);
+    showToast('The owner wants his car back!', true);
   }
 
   function drive(model, x, y, z, h) {
@@ -5331,39 +10715,12 @@
     updateCamera(0, 0, true);
   }
 
-  function exitVehicle() {
-    const moving = Math.hypot(car.vx, car.vz) > 3;
-    if (moving || car.y > groundAt(car.x, car.z, car.y) + 0.02) {
-      showToast('Stop the car to get out', true);
-      return;
-    }
-    if (insideView) setInsideView(false);
-    player.flame.visible = false;
-    player.tailMat.color.setHex(0x7a1010);
-    scene.add(hero.model.group);
-    player.group.rotation.set(0, car.heading, 0);
-    addIdleCar(player, car.x, car.y, car.z, car.heading);
-    setDoor(player, 1); // he gets out, and the door swings shut behind him
-    swingingDoors.push(player);
-    const stepOut = player.dims.hw + 1.1;
-    player = null;
-    car.boosting = false;
-
-    // step out on the driver's side
-    hero.yaw = hero.facing = car.heading;
-    hero.pitch = 0;
-    car.x += Math.cos(car.heading) * stepOut;
-    car.z -= Math.sin(car.heading) * stepOut;
-    car.vx = car.vz = 0;
-    setMode('foot');
-    updateCamera(0, 0, true);
-  }
-
   function setWeapon(name) {
     hero.weapon = name;
     hero.model.gun.visible = name === 'gun';
     hero.model.bow.visible = name === 'bow';
     $('weapon').textContent = { fist: 'Fist', gun: 'Gun', bow: 'Bow' }[name];
+    $('weapon').parentElement.dataset.kind = name; // its icon
   }
 
   // Hits the nearest person or dog within arm's reach in front of the hero.
@@ -5402,11 +10759,18 @@
       const p = b.group.position;
       yield { x: p.x, y: p.y, z: p.z, r: 1.4, bird: b };
     }
-    // the tyres of any vehicle close enough to hit
-    const models = [...traffic.map((c) => c.model), ...idleCars.map((v) => v.model), ...police.filter((p) => p.active).map((p) => p.model)];
+    // the tyres and bodies of any vehicle close enough to hit
+    const models = [...traffic.map((c) => c.model), ...highwayTraffic.map((c) => c.model), ...idleCars.map((v) => v.model), ...police.filter((p) => p.active).map((p) => p.model)];
     for (const model of models) {
       const at = model.group.position;
       if (Math.abs(at.x - car.x) > 60 || Math.abs(at.z - car.z) > 60) continue;
+      if (!model.wrecked) {
+        const h = model.group.rotation.y;
+        const half = model.dims.hl * 0.5;
+        for (const end of [-1, 1]) {
+          yield { x: at.x + Math.sin(h) * half * end, y: at.y + 0.85, z: at.z + Math.cos(h) * half * end, r: model.dims.hw + 0.1, vehicle: model };
+        }
+      }
       for (let i = 0; i < model.wheels.length; i++) {
         model.wheels[i].getWorldPosition(wheelPoint);
         yield { x: wheelPoint.x, y: wheelPoint.y, z: wheelPoint.z, r: 0.4, wheel: { model, index: i } };
@@ -5421,6 +10785,10 @@
 
   // `damage` is out of a person's 100 health; a hit to the head always kills.
   function applyHit(t, damage = 34, dirX = 0, dirZ = 1) {
+    if (t.vehicle) {
+      hurtVehicle(t.vehicle, damage * 1.6);
+      return;
+    }
     if (t.wheel) {
       punctureTyre(t.wheel.model, t.wheel.index);
       return;
@@ -5437,6 +10805,11 @@
     }
     const w = t.walker;
     const wentDown = hurtWalker(w, t.head ? 100 : damage, dirX, dirZ);
+    if (!wentDown && w.isPerson && w.state === 'stagger') {
+      w.afterStagger = 'flee';
+      w.away = true;
+      w.baseY = w.group.position.y;
+    }
     // the police come for the first blow, and again each time someone is put on the ground
     if (w.isPerson && (wentDown || wanted === 0)) {
       setWanted(wanted + 1);
@@ -5447,7 +10820,11 @@
   // Distance along a ray to the first wall, car or the ground (capped at `max`).
   function rayToWorld(o, d, max) {
     let best = d.y < -1e-4 ? Math.min(max, -o.y / d.y) : max;
-    for (const box of colliders.concat(trafficBoxes, policeBoxes)) {
+    const ex = o.x + d.x * best;
+    const ez = o.z + d.z * best;
+    const boxes = indexQuery(colliderIndex, Math.min(o.x, ex), Math.min(o.z, ez), Math.max(o.x, ex), Math.max(o.z, ez))
+      .concat(trafficBoxes, policeBoxes, trainBoxes);
+    for (const box of boxes) {
       const lo = [box.minX, box.minY ?? 0, box.minZ];
       const hi = [box.maxX, Math.min(box.maxY ?? 3, 80), box.maxZ];
       const from = [o.x, o.y, o.z];
@@ -5484,11 +10861,12 @@
   const arrowMat = new THREE.MeshBasicMaterial({ color: 0x3a2a18 });
 
   function fire() {
-    if (mode !== 'foot' || hero.cooldown > 0) return;
+    if (mode !== 'foot' || hero.dead || hero.down || act) return;
     if (hero.weapon === 'fist') {
-      punch();
+      heroAttack();
       return;
     }
+    if (hero.cooldown > 0) return;
     const origin = camera.position;
     camera.getWorldDirection(aimDir);
     const muzzle = new THREE.Vector3(car.x + aimDir.x * 0.7, car.y + 1.5, car.z + aimDir.z * 0.7);
@@ -5555,7 +10933,7 @@
         a.life = 0;
         continue;
       }
-      const inWall = colliders.some((b) =>
+      const inWall = collidersNear(p.x, p.z, 0).some((b) =>
         p.x > b.minX && p.x < b.maxX && p.z > b.minZ && p.z < b.maxZ &&
         p.y > (b.minY ?? 0) && p.y < (b.maxY ?? 3));
       if (inWall || p.y <= terrain(p.x, p.z) + 0.05) {
@@ -5563,6 +10941,1352 @@
         a.life = Math.min(a.life, 5);
       }
     }
+  }
+
+  // ---------- Fire, smoke and explosions ----------
+
+  // Smoke and flames are soft round sprites, hundreds at a time in two point clouds: smoke
+  // drawn normally (grey to black), flames added onto what is behind them (red through
+  // orange to white-hot). Each puff rises, spreads and fades over its life.
+  function particleCloud(count, additive) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(count * 3), 3));
+    geo.setAttribute('size', new THREE.BufferAttribute(new Float32Array(count), 1));
+    geo.setAttribute('alpha', new THREE.BufferAttribute(new Float32Array(count), 1));
+    geo.setAttribute('shade', new THREE.BufferAttribute(new Float32Array(count), 1));
+    const material = new THREE.ShaderMaterial({
+      uniforms: { scale: { value: 600 } },
+      transparent: true,
+      depthWrite: false,
+      blending: additive ? THREE.AdditiveBlending : THREE.NormalBlending,
+      vertexShader: `
+        attribute float size;
+        attribute float alpha;
+        attribute float shade;
+        uniform float scale;
+        varying float vAlpha;
+        varying float vShade;
+        varying float vSeed;
+        void main() {
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          gl_PointSize = size * scale / max(0.5, -mv.z);
+          gl_Position = projectionMatrix * mv;
+          vAlpha = alpha;
+          vShade = shade;
+          vSeed = fract(position.x * 1.3 + position.z * 0.7);
+        }`,
+      fragmentShader: additive ? `
+        varying float vAlpha;
+        varying float vShade;
+        varying float vSeed;
+        void main() {
+          vec2 c = gl_PointCoord - 0.5;
+          float d = length(c);
+          if (d > 0.5) discard;
+          // licks of flame: brighter in the middle, ragged at the edge
+          float rag = 0.85 + 0.15 * sin(atan(c.y, c.x) * 5.0 + vSeed * 30.0);
+          float a = smoothstep(0.5 * rag, 0.08, d) * vAlpha;
+          vec3 hot = mix(vec3(0.9, 0.22, 0.04), vec3(1.0, 0.75, 0.3), vShade);
+          hot = mix(hot, vec3(1.0, 0.95, 0.8), smoothstep(0.25, 0.0, d) * vShade);
+          gl_FragColor = vec4(hot * a, a);
+        }` : `
+        varying float vAlpha;
+        varying float vShade;
+        varying float vSeed;
+        void main() {
+          vec2 c = gl_PointCoord - 0.5;
+          float d = length(c);
+          if (d > 0.5) discard;
+          float lump = 0.8 + 0.2 * sin(c.x * 11.0 + vSeed * 20.0) * sin(c.y * 9.0 + vSeed * 13.0);
+          float a = smoothstep(0.5, 0.12, d) * vAlpha * lump;
+          gl_FragColor = vec4(vec3(vShade), a);
+        }`,
+    });
+    const points = new THREE.Points(geo, material);
+    points.frustumCulled = false;
+    points.renderOrder = additive ? 6 : 5;
+    scene.add(points);
+    const list = Array.from({ length: count }, () => ({ life: 0 }));
+    return { points, list, next: 0 };
+  }
+
+  let smokeCloud = null;
+  let flameCloud = null;
+
+  function puff(cloud, x, y, z, o) {
+    const p = cloud.list[cloud.next];
+    cloud.next = (cloud.next + 1) % cloud.list.length;
+    Object.assign(p, {
+      x, y, z, vx: o.vx || 0, vy: o.vy || 0, vz: o.vz || 0, life: o.life, max: o.life,
+      s0: o.size, s1: o.grow ?? o.size * 2, a: o.alpha ?? 1, shade: o.shade ?? 0.5, rise: o.rise ?? 0, drag: o.drag ?? 1.2,
+    });
+  }
+  const smoke = (x, y, z, o) => puff(smokeCloud, x, y, z, o);
+  const flame = (x, y, z, o) => puff(flameCloud, x, y, z, o);
+
+  function updateClouds(dt) {
+    for (const cloud of [smokeCloud, flameCloud]) {
+      const geo = cloud.points.geometry;
+      const pos = geo.attributes.position.array;
+      const size = geo.attributes.size.array;
+      const alpha = geo.attributes.alpha.array;
+      const shade = geo.attributes.shade.array;
+      cloud.list.forEach((p, i) => {
+        if (p.life <= 0) {
+          alpha[i] = 0;
+          return;
+        }
+        p.life -= dt;
+        const k = 1 - Math.max(0, p.life) / p.max; // 0 new, 1 gone
+        const drag = Math.exp(-p.drag * dt);
+        p.vx *= drag;
+        p.vz *= drag;
+        p.vy = p.vy * drag + p.rise * dt;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.z += p.vz * dt;
+        pos[i * 3] = p.x;
+        pos[i * 3 + 1] = p.y;
+        pos[i * 3 + 2] = p.z;
+        size[i] = p.s0 + (p.s1 - p.s0) * Math.sqrt(k);
+        alpha[i] = p.a * Math.min(1, k * 6) * (1 - k) * (1 - k * 0.3);
+        shade[i] = cloud === flameCloud ? p.shade * (1 - k * 0.8) : p.shade;
+      });
+      geo.attributes.position.needsUpdate = true;
+      geo.attributes.size.needsUpdate = true;
+      geo.attributes.alpha.needsUpdate = true;
+      geo.attributes.shade.needsUpdate = true;
+      cloud.points.material.uniforms.scale.value = renderer.domElement.height / (2 * Math.tan((camera.fov * Math.PI) / 360));
+    }
+  }
+
+  // --- vehicle damage that ends in fire ---
+
+  // Every vehicle can take so much: crashes, bullets and blasts wear its health down. A
+  // good crash takes at most a third of it, so the first big hit leaves it smoking grey,
+  // the second smoking thick and black out of the bonnet and the cabin, and the third sets
+  // it on fire; the fire takes a few seconds to grow, and then it explodes.
+  const VEHICLE_HEALTH = { bus: 1700, truck: 1500, moto: 550, sports: 950 };
+  const vehicleHealth = (model) => VEHICLE_HEALTH[model.kind] || 1000;
+  const CRASH_SHARE = 0.36; // the most one crash can take
+  const FUSE = 5.5; // seconds from catching fire to going up
+  const hurtVehicles = new Set(); // vehicles smoking, burning or burnt out
+  const wrecks = []; // { model, vy, spin, rest, timer }
+
+  // `crash`: the blow of a collision. One crash is one blow, however many times the bodies
+  // touch while it lasts, and no one blow can finish a vehicle off.
+  function hurtVehicle(model, amount, crash = false) {
+    if (!model || model.wrecked) return;
+    const max = vehicleHealth(model);
+    if (model.health === undefined) model.health = max;
+    if (crash) {
+      amount = Math.min(amount, max * CRASH_SHARE);
+      if (clock - (model.crashAt ?? -9) < 1) {
+        const more = Math.max(0, amount - model.crashHit);
+        model.crashHit += more;
+        amount = more;
+      } else {
+        model.crashAt = clock;
+        model.crashHit = amount;
+      }
+    }
+    model.health -= amount;
+    if (model.health < max * 0.97) hurtVehicles.add(model);
+    if (model.health <= 0 && model.fuse === undefined) model.fuse = FUSE; // it catches
+    else if (model.fuse !== undefined) model.fuse -= amount / max; // more hits hurry it along
+  }
+
+  // Where the engine is, for the smoke and the first flames: under the front of the bonnet.
+  const enginePoint = new THREE.Vector3();
+  function engineAt(model) {
+    const { hl } = model.dims;
+    enginePoint.set(0, model.kind === 'bus' || model.kind === 'truck' ? 1.2 : 0.85, hl - (model.moto ? 0.4 : 0.75));
+    model.group.updateWorldMatrix(true, false);
+    return enginePoint.applyMatrix4(model.group.matrixWorld);
+  }
+
+  function updateVehicleFires(dt) {
+    for (const model of hurtVehicles) {
+      const max = vehicleHealth(model);
+      const share = model.wrecked ? 0 : Math.max(0, model.health) / max;
+      const p = engineAt(model);
+      if (model.wrecked) {
+        // a burnt-out shell: the fire dies down, then a thin smoke for a while
+        model.afterburn = (model.afterburn ?? 1) - dt / 30;
+        if (model.afterburn <= -1.2) {
+          hurtVehicles.delete(model);
+          continue;
+        }
+        const heat = Math.max(0, model.afterburn);
+        if (Math.random() < heat * 0.9) flame(p.x + rand(-1, 1), p.y - 0.2 + rand(0, 0.6), p.z + rand(-1, 1), { vy: rand(1.5, 3), life: rand(0.5, 1), size: rand(0.8, 1.8) * (0.4 + heat), grow: 0.4, shade: rand(0.3, 0.9), rise: 1.5 });
+        if (Math.random() < 0.35) smoke(p.x + rand(-0.8, 0.8), p.y + 0.6, p.z + rand(-0.8, 0.8), { vy: rand(1.5, 2.5), life: rand(4, 7), size: 1.6, grow: 6, shade: 0.08 + 0.1 * (1 - heat), alpha: 0.5, rise: 0.4 });
+        continue;
+      }
+      // after one big hit a thin grey smoke from under the bonnet; after two it pours out
+      // thick and dark, and seeps from the cabin too
+      const heavy = share < 0.45;
+      const rate = share < 0.97 ? (heavy ? 22 : 10 + (1 - share) * 8) : 0;
+      if (Math.random() < rate * dt) {
+        smoke(p.x + rand(-0.3, 0.3), p.y + 0.1, p.z + rand(-0.3, 0.3), {
+          vx: rand(-0.3, 0.3), vy: rand(1.2, 2.2), vz: rand(-0.3, 0.3), life: rand(2.5, 4.5), size: heavy ? 0.8 : 0.6, grow: rand(3.5, 5.5) * (heavy ? 1.2 : 0.9),
+          shade: heavy ? 0.13 : 0.55, alpha: heavy ? 0.62 : 0.45, rise: 0.5,
+        });
+      }
+      if (heavy && Math.random() < 6 * dt) {
+        const c = cabinAt(model);
+        smoke(c.x + rand(-0.4, 0.4), c.y, c.z + rand(-0.4, 0.4), {
+          vx: rand(-0.2, 0.2), vy: rand(0.6, 1.2), vz: rand(-0.2, 0.2), life: rand(2, 3.5), size: 0.45, grow: 3, shade: 0.22, alpha: 0.4, rise: 0.4,
+        });
+      }
+      // caught: the fire takes hold under the bonnet, grows, and then it goes up
+      if (model.fuse !== undefined) {
+        model.fuse -= dt;
+        const hold = Math.min(1, 1.15 - model.fuse / FUSE); // 0.15 at first, 1 at the end
+        for (let n = 0; n < 3; n++) {
+          if (Math.random() < 0.35 + 0.6 * hold) {
+            flame(p.x + rand(-0.5, 0.5) * (0.4 + hold), p.y + rand(-0.1, 0.25), p.z + rand(-0.5, 0.5) * (0.4 + hold), {
+              vx: rand(-0.4, 0.4), vy: rand(1.5, 3.2), vz: rand(-0.4, 0.4), life: rand(0.35, 0.8), size: rand(0.5, 1.1) * (0.5 + hold), grow: 0.3, shade: rand(0.4, 1), rise: 2,
+            });
+          }
+        }
+        if (model.fuse <= 0) explodeVehicle(model);
+      }
+    }
+  }
+
+  // Middle of the cabin roof, where smoke escapes round the doors and the glass.
+  const cabinPoint = new THREE.Vector3();
+  function cabinAt(model) {
+    const top = { bus: 2.6, truck: 2.4, suv: 1.55, pickup: 1.55, moto: 1.0 }[model.kind] || 1.25;
+    cabinPoint.set(0, top, -0.2);
+    return cabinPoint.applyMatrix4(model.group.matrixWorld);
+  }
+
+  // --- explosions ---
+
+  const blastLight = new THREE.PointLight(0xffa04a, 0, 45, 1.6);
+  scene.add(blastLight);
+  let blastGlow = 0;
+  const debris = []; // { mesh, vx, vy, vz, spin, life }
+  const debrisGeo = new THREE.BoxGeometry(0.35, 0.12, 0.5);
+  const debrisMat = new THREE.MeshLambertMaterial({ color: 0x1c1b1a });
+  const scorchMat = new THREE.MeshBasicMaterial({
+    color: 0x000000, transparent: true, opacity: 0.75, depthWrite: false,
+    alphaMap: canvasTexture(128, 128, (g, w) => {
+      g.fillStyle = '#000';
+      g.fillRect(0, 0, w, w);
+      const fade = g.createRadialGradient(w / 2, w / 2, 4, w / 2, w / 2, w / 2);
+      fade.addColorStop(0, '#fff');
+      fade.addColorStop(0.55, '#aaa');
+      fade.addColorStop(1, '#000');
+      g.fillStyle = fade;
+      g.fillRect(0, 0, w, w);
+    }),
+  });
+
+  // A blast at (x, y, z): a fireball, a column of black smoke, pieces flung out, a flash, a
+  // boom, and everything near it hurt, knocked flat or set burning in turn.
+  function explosion(x, y, z, power = 1, source = null) {
+    for (let n = 0; n < 70 * power; n++) {
+      const a = Math.random() * Math.PI * 2;
+      const up = rand(-0.2, 1);
+      const speed = rand(3, 11) * power;
+      flame(x + rand(-0.6, 0.6), y + rand(0, 0.8), z + rand(-0.6, 0.6), {
+        vx: Math.cos(a) * speed * (1 - up * 0.5), vy: up * speed + 2, vz: Math.sin(a) * speed * (1 - up * 0.5),
+        life: rand(0.5, 1.3), size: rand(1.6, 3.6) * power, grow: rand(3, 6) * power, shade: rand(0.5, 1), rise: 3, drag: 3,
+      });
+    }
+    for (let n = 0; n < 45 * power; n++) {
+      const a = Math.random() * Math.PI * 2;
+      const speed = rand(1, 5);
+      smoke(x + rand(-1, 1), y + rand(0.5, 2.5), z + rand(-1, 1), {
+        vx: Math.cos(a) * speed, vy: rand(3, 8), vz: Math.sin(a) * speed, life: rand(4, 8), size: rand(2.5, 4), grow: rand(8, 13),
+        shade: rand(0.04, 0.14), alpha: 0.85, rise: 0.6, drag: 1.5,
+      });
+    }
+    for (let n = 0; n < 9 * power; n++) {
+      const mesh = new THREE.Mesh(debrisGeo, debrisMat);
+      mesh.position.set(x, y + 0.8, z);
+      mesh.scale.set(rand(0.5, 1.6), rand(0.5, 1.4), rand(0.5, 1.6));
+      mesh.castShadow = true;
+      scene.add(mesh);
+      const a = Math.random() * Math.PI * 2;
+      const speed = rand(5, 13) * power;
+      debris.push({ mesh, vx: Math.cos(a) * speed, vy: rand(6, 14) * power, vz: Math.sin(a) * speed, spin: rand(-9, 9), life: 20 });
+    }
+    const scorch = new THREE.Mesh(new THREE.PlaneGeometry(7 * power, 7 * power).rotateX(-Math.PI / 2), scorchMat);
+    const floor = groundAt(x, z, y + 1);
+    scorch.position.set(x, floor + (floor < 0.05 ? 0.007 : 0.016), z);
+    scorch.renderOrder = 0.8;
+    scene.add(scorch);
+    blastLight.position.set(x, y + 2, z);
+    blastGlow = 1.4 * power;
+    playBlast(power, Math.hypot(x - camera.position.x, z - camera.position.z));
+    const near = Math.hypot(x - car.x, z - car.z);
+    bump = Math.max(bump, Math.min(1, (power * 30) / Math.max(10, near)));
+
+    // what the blast does around it
+    const reach = 9 * power;
+    for (const w of walkers) {
+      const p = w.group.position;
+      const d = Math.hypot(p.x - x, p.z - z);
+      if (d > reach || Math.abs(p.y - y) > 6) continue;
+      if (w.state === 'dead' || w.state === 'act') continue;
+      const dx = (p.x - x) / (d || 1);
+      const dz = (p.z - z) / (d || 1);
+      if (onFeet(w) || w.state === 'fight' || w.state === 'flee') hurtWalker(w, d < reach * 0.55 ? 200 : 60, dx, dz, true);
+      else if (d < reach * 0.55) w.dying = true;
+    }
+    for (const a of animals) {
+      if (Math.hypot(a.x - x, a.z - z) < reach) {
+        a.down = KNOCKED_SECONDS * 2;
+        a.group.rotation.z = Math.PI / 2;
+      }
+    }
+    const vehicles = [...traffic.map((c) => c.model), ...highwayTraffic.map((c) => c.model), ...idleCars.map((v) => v.model), ...police.filter((p) => p.active).map((p) => p.model)];
+    if (player) vehicles.push(player);
+    for (const model of vehicles) {
+      if (model === source || model.wrecked) continue;
+      const p = model.group.position;
+      const d = Math.hypot(p.x - x, p.z - z);
+      if (d < reach) hurtVehicle(model, 1300 * power * (1 - d / reach) ** 1.3); // close by, it goes up too
+    }
+    // the hero: on foot he is thrown down and hurt, or killed if right beside it
+    if (!hero.dead) {
+      const d = Math.hypot(car.x - x, car.z - z);
+      const inside = mode === 'car' ? player === source : mode === 'heli' ? heli && heli.model === source : false;
+      if (inside) killHero('Blown up');
+      else if (d < reach && Math.abs(car.y - y) < 6) {
+        hurtHero(130 * power * (1 - d / reach) ** 1.2, 'explosion', car.x - x, car.z - z);
+        if (mode === 'foot' && !hero.dead) knockHeroDown(car.x - x, car.z - z, 1.5);
+      }
+    }
+  }
+
+  // A vehicle goes up: the blast, then a charred shell that jumps and drops back, burns out
+  // and smoulders. It cannot be driven again.
+  function explodeVehicle(model) {
+    if (model.wrecked) return;
+    model.wrecked = true;
+    model.health = 0;
+    model.afterburn = 1;
+    const p = model.group.position;
+    // charred paint, the glass gone, the lamps dead
+    for (const material of model.materials || []) {
+      material.color.multiplyScalar(0.13); // a loaded model's every surface is scorched
+      if (material.specular) material.specular.setHex(0x111111);
+    }
+    if (model.paint) {
+      model.paint.color.setHex(0x1d1c1b);
+      model.paint.specular && model.paint.specular.setHex(0x111111);
+      model.paint.userData.reflect = 0.02;
+    }
+    for (const glass of model.glassParts || []) glass.visible = false;
+    for (const lamp of [model.headMat, model.tailMat, model.amberL, model.amberR]) {
+      if (!lamp) continue;
+      lamp.color.setHex(0x0b0b0b);
+      if (lamp.userData) lamp.userData.mine = true;
+    }
+    if (model.beam) model.beam.visible = false;
+    if (model.bar) model.bar.forEach((m) => m.color.setHex(0x0b0b0b));
+    if (model.flame) model.flame.visible = false;
+    hurtVehicles.add(model);
+
+    // whoever was driving does not survive it
+    const traffic0 = traffic.find((c) => c.model === model);
+    const highway0 = highwayTraffic.find((c) => c.model === model);
+    const police0 = police.find((q) => q.model === model);
+    const idle0 = idleCars.find((v) => v.model === model);
+    for (const owner of [traffic0, highway0]) {
+      if (!owner) continue;
+      if (owner.driver) model.group.remove(owner.driver);
+      if (owner === traffic0) traffic.splice(traffic.indexOf(owner), 1);
+      else highwayTraffic.splice(highwayTraffic.indexOf(owner), 1);
+      trafficBoxes.splice(trafficBoxes.indexOf(owner.box), 1);
+    }
+    if (idle0 && idle0.driver) {
+      model.group.remove(idle0.driver);
+      idle0.driver = null;
+    }
+    if (police0) {
+      // the force sends another car; this one stays where it burnt
+      policeBoxes.splice(policeBoxes.indexOf(police0.box), 1);
+      police.splice(police.indexOf(police0), 1);
+    }
+    const h = model.group.rotation.y;
+    const y = p.y;
+    if (model === player) {
+      // he was at the wheel
+      killHero('Blown up');
+    }
+    if (!idle0 && model !== player) addIdleCar(model, p.x, y, p.z, h);
+    const entry = idleCars.find((v) => v.model === model);
+    if (entry) entry.busy = true; // nobody gets in a burnt-out car
+    explosion(p.x, y + 0.6, p.z, model.kind === 'moto' ? 0.6 : model.kind === 'bus' || model.kind === 'truck' ? 1.3 : 1, model);
+    // it jumps on the blast and comes down again, turned
+    wrecks.push({ model, vy: model.moto ? 4 : 6.5, spin: rand(-1.2, 1.2), roll: rand(-0.25, 0.25), timer: 0 });
+    if (traffic0) setTimeout(() => spawnTraffic(), 4000); // traffic carries on, a car short for a moment
+    // on the highway a new one comes out of the tunnel behind
+    if (highway0) setTimeout(() => addHighwayCar(highway0.lane, -highway0.dir * (HIGHWAY.end - 5)), 5000);
+  }
+
+  function updateWrecks(dt) {
+    for (let i = wrecks.length - 1; i >= 0; i--) {
+      const w = wrecks[i];
+      const g = w.model.group;
+      w.timer += dt;
+      if (w.vy !== null) {
+        w.vy -= GRAVITY * dt;
+        g.position.y += w.vy * dt;
+        g.rotation.y += w.spin * dt;
+        g.rotation.z += (w.roll - g.rotation.z) * Math.min(1, 3 * dt);
+        let floor = terrain(g.position.x, g.position.z);
+        for (const s of indexQuery(surfaceIndex, g.position.x, g.position.z, g.position.x, g.position.z)) {
+          const sh = surfaceHeight(s, g.position.x, g.position.z);
+          if (sh !== null && sh <= g.position.y + 0.5 && sh > floor) floor = sh;
+        }
+        if (g.position.y <= floor && w.vy < 0) {
+          g.position.y = floor;
+          w.vy = Math.abs(w.vy) > 4 ? -w.vy * 0.25 : null; // one small bounce, then it settles
+          const entry = idleCars.find((v) => v.model === w.model);
+          if (entry && entry.box.car) {
+            Object.assign(entry, { x: g.position.x, z: g.position.z, h: g.rotation.y });
+            Object.assign(entry.box.car, { x: g.position.x, z: g.position.z, h: g.rotation.y });
+          }
+        }
+      }
+      // long burnt out and far from anyone: the wreck is towed away
+      if (w.timer > 120 && Math.hypot(g.position.x - car.x, g.position.z - car.z) > 220) {
+        scene.remove(g);
+        const entry = idleCars.find((v) => v.model === w.model);
+        if (entry) {
+          idleCars.splice(idleCars.indexOf(entry), 1);
+          removeCollider(entry.box);
+        }
+        hurtVehicles.delete(w.model);
+        wrecks.splice(i, 1);
+      }
+    }
+    for (let i = debris.length - 1; i >= 0; i--) {
+      const d = debris[i];
+      d.life -= dt;
+      const m = d.mesh;
+      if (d.vy !== null) {
+        d.vy -= GRAVITY * dt;
+        m.position.x += d.vx * dt;
+        m.position.y += d.vy * dt;
+        m.position.z += d.vz * dt;
+        m.rotation.x += d.spin * dt;
+        m.rotation.z += d.spin * 0.7 * dt;
+        const floor = groundAt(m.position.x, m.position.z, m.position.y + 0.3);
+        if (m.position.y <= floor + 0.06) {
+          m.position.y = floor + 0.06;
+          if (Math.abs(d.vy) > 3) {
+            d.vy = -d.vy * 0.3;
+            d.vx *= 0.5;
+            d.vz *= 0.5;
+          } else d.vy = null;
+        }
+      }
+      if (d.life <= 0) {
+        scene.remove(m);
+        debris.splice(i, 1);
+      }
+    }
+    blastGlow = Math.max(0, blastGlow - dt * 3);
+    blastLight.intensity = blastGlow * 6;
+  }
+
+  // --- the helicopter on fire ---
+
+  // A hard enough knock against a building or a vehicle sets it alight: the fire takes a
+  // while to grow, the engine falters, and then it explodes, with anyone still aboard.
+  function igniteHeli(force) {
+    if (!heli || heli.burning !== undefined) return;
+    heli.burning = 0;
+    showToast(mode === 'heli' ? 'The helicopter is on fire! Get down and get out (F)' : 'The helicopter is on fire', true);
+    playCrash(Math.min(1, force / 18));
+    bump = Math.max(bump, 0.6);
+  }
+
+  function updateHeliFire(dt) {
+    const h = heli;
+    if (!h || h.burning === undefined) return;
+    h.burning = Math.min(1, h.burning + dt / 11); // about eleven seconds from the first flames to the blast
+    const g = h.model.group;
+    g.updateWorldMatrix(true, false);
+    const at = new THREE.Vector3(0, 2.3, -0.6).applyMatrix4(g.matrixWorld); // the engine, behind the cabin
+    const heat = h.burning;
+    for (let n = 0; n < 1 + Math.floor(heat * 4); n++) {
+      if (Math.random() < 0.35 + heat * 0.6) {
+        flame(at.x + rand(-0.5, 0.5), at.y + rand(-0.3, 0.3), at.z + rand(-0.5, 0.5), {
+          vx: rand(-0.5, 0.5), vy: rand(1.5, 3), vz: rand(-0.5, 0.5), life: rand(0.3, 0.7), size: rand(0.5, 1.2) * (0.5 + heat * 1.6), grow: 0.3, shade: rand(0.4, 1), rise: 2,
+        });
+      }
+    }
+    if (Math.random() < 6 * dt * (0.4 + heat)) {
+      smoke(at.x, at.y + 0.5, at.z, { vy: rand(1, 2.5), life: rand(3, 6), size: 0.8, grow: 4 + heat * 5, shade: 0.1, alpha: 0.6 + heat * 0.3, rise: 0.4 });
+    }
+    if (heat >= 1) explodeHeli();
+  }
+
+  function explodeHeli() {
+    const h = heli;
+    const g = h.model.group;
+    const aboard = mode === 'heli';
+    // the shell, charred, falls to the ground and lies there
+    g.traverse((o) => {
+      if (o.isMesh && o.material && o.material.color) {
+        o.material = o.material.clone();
+        o.material.color.setHex(0x1b1a19);
+        if (o.material.transparent) o.visible = false;
+      }
+    });
+    const shell = { model: { group: g, dims: { hl: 4, hw: 1.3 }, kind: 'heli' }, vy: 0, spin: rand(-0.8, 0.8), roll: rand(-0.6, 0.6), timer: 0 };
+    wrecks.push(shell);
+    heli = null; // the next call brings a new one
+    if (aboard) {
+      hero.model.group.visible = false;
+      killHero('Blown up in the helicopter');
+    }
+    explosion(g.position.x, g.position.y + 1.5, g.position.z, 1.2, g);
+  }
+
+  // ---------- Health and stamina ----------
+
+  // The hero has 100 health and 100 stamina. Running and fighting tire him, rest brings it
+  // back; run dry and he can only walk until he has his breath back. Health comes back by
+  // itself up to 60 if nothing hurts him for a while. Falls, punches, crashes and blasts
+  // take it away; at nothing he is dead, and starts again where the game began.
+  Object.assign(hero, {
+    health: 100, stamina: 100, exhausted: false, lastHurt: -99, dead: null, down: null, sprinting: false, landing: 0,
+  });
+  const STAMINA_RUN = 15; // per second spent running
+  const STAMINA_BACK = 22; // per second recovered standing still (less when walking)
+
+  function hurtHero(amount, cause, dx = 0, dz = 0) {
+    if (hero.dead || amount <= 0) return;
+    hero.health -= amount;
+    hero.lastHurt = clock;
+    const pain = $('pain');
+    pain.style.opacity = Math.min(0.85, 0.25 + amount / 60);
+    if (hero.health <= 0) killHero(cause, dx, dz);
+  }
+
+  // (dx, dz): the way the blow that killed him was going, if it pushed him
+  function killHero(cause, dx = 0, dz = 0) {
+    if (hero.dead) return;
+    hero.health = 0;
+    hero.dead = { t: 0, cause };
+    startHeroFall(dx, dz);
+    keys.clear();
+    $('wasted').hidden = false;
+    $('wasted-cause').textContent = cause;
+    if (document.exitPointerLock) document.exitPointerLock();
+  }
+
+  // Thrown off his feet by a blast or a heavy blow: flat on his back, then up again.
+  // `rate`: how fast he goes down (a fall from high up is over at once).
+  function knockHeroDown(dx, dz, rate = 1.2) {
+    if (hero.dead || mode !== 'foot') return;
+    const d = Math.hypot(dx, dz) || 1;
+    hero.down = { t: 0, dx: dx / d, dz: dz / d, rate };
+    hero.fight.move = null;
+    startHeroFall(dx, dz);
+  }
+
+  // He starts going down where he stands: forwards, unless the blow sends him back.
+  function startHeroFall(dx, dz) {
+    if (hero.fallAt) return; // already on his way down
+    const ahead = dx * Math.sin(hero.facing) + dz * Math.cos(hero.facing);
+    hero.fallDir = (dx || dz) && ahead < 0 ? -1 : 1;
+    hero.fallSide = Math.random() < 0.5 ? 1 : -1;
+    hero.ct = 0;
+    hero.fallAt = { x: car.x, y: groundAt(car.x, car.z, car.y + 0.3), z: car.z, h: hero.facing };
+    const k = hero.skin;
+    if (k && !hero.legs && mode === 'foot') hero.legs = measureBody(hero.model.group, heroBone);
+  }
+
+  // Landing from a fall of `drop` metres: a jolt, then more and more hurt past about 4 m,
+  // and a fall from very high (about 15 m and up) is usually the end of him.
+  function landed(drop) {
+    if (hero.dead || drop < 2) return;
+    if (mode === 'foot') {
+      hero.landing = Math.min(0.7, 0.2 + drop * 0.04); // knees bend to take it
+      bump = Math.max(bump, Math.min(1, drop / 12));
+      if (drop > 4) {
+        const harm = (drop - 4) * 8 * rand(0.85, 1.25) + Math.max(0, drop - 13) * 14;
+        hurtHero(harm, 'Fell to his death');
+        if (!hero.dead && drop > 7) knockHeroDown(Math.sin(hero.facing), Math.cos(hero.facing), 1.9); // thrown flat by it
+      }
+      if (drop > 3) playCrash(Math.min(0.5, drop / 30));
+    } else if (mode === 'car' && player) {
+      // a car dropped from a height: the car takes most of it, the driver some
+      if (drop > 2.5) {
+        hurtVehicle(player, (drop - 2.5) * 140, true);
+        damageCar(player, car.x, car.y, car.z, 0, 0, Math.min(25, drop * 2.2));
+        playCrash(Math.min(1, drop / 15));
+      }
+      if (drop > 8) hurtHero((drop - 8) * 5, 'Crashed');
+    } else if (drop > 3) {
+      hurtHero((drop - 3) * 6, 'Fell to his death');
+    }
+  }
+
+  function updateVitals(dt) {
+    // stamina: drained by running, recovered at rest, faster standing still
+    const still = Math.hypot(car.vx, car.vz) < 0.3 || mode !== 'foot';
+    if (hero.sprinting) hero.stamina = Math.max(0, hero.stamina - STAMINA_RUN * dt);
+    else hero.stamina = Math.min(100, hero.stamina + (still ? STAMINA_BACK : STAMINA_BACK * 0.55) * dt);
+    if (hero.stamina <= 0) hero.exhausted = true;
+    if (hero.stamina >= 35) hero.exhausted = false;
+    // health creeps back to 60 after eight quiet seconds
+    if (!hero.dead && clock - hero.lastHurt > 8 && hero.health < 60) hero.health = Math.min(60, hero.health + 1.5 * dt);
+    hero.landing = Math.max(0, hero.landing - dt);
+
+    const health = Math.max(0, hero.health);
+    $('health-bar').style.width = `${health}%`;
+    $('health-bar').parentElement.classList.toggle('low', health < 25);
+    $('stamina-bar').style.width = `${hero.stamina}%`;
+    $('stamina-bar').parentElement.classList.toggle('low', hero.exhausted);
+    const pain = $('pain');
+    const fade = Math.max(health < 25 ? 0.3 : 0, Number(pain.style.opacity || 0) - dt * 1.2);
+    pain.style.opacity = fade;
+
+    if (hero.dead) {
+      hero.dead.t += dt;
+      if (hero.dead.t > 5) respawn();
+    }
+  }
+
+  // Back on his feet where the game began, the slate wiped clean.
+  function respawn() {
+    if (mode === 'car' && player) {
+      const model = player;
+      const at = model.group.position.clone();
+      const turn = model.group.rotation.y;
+      const parked = releasePlayerCar();
+      parked.busy = !!model.wrecked;
+      if (model.wrecked) {
+        // leave the shell where it came to rest
+        model.group.position.copy(at);
+        model.group.rotation.y = turn;
+        Object.assign(parked, { x: at.x, y: at.y, z: at.z, h: turn });
+        Object.assign(parked.box.car, { x: at.x, z: at.z, h: turn });
+      }
+    } else if (mode === 'horse' && horse) {
+      horse.speed = 0;
+      car.y = groundAt(car.x, car.z, car.y);
+      dismountHorse();
+    } else if (mode === 'bike' && bike) {
+      bike.speed = 0;
+      car.y = groundAt(car.x, car.z, car.y);
+      dismountBike();
+    } else if (mode === 'heli') {
+      if (heli) heli.flown = false;
+    }
+    act = null;
+    scene.add(hero.model.group);
+    setMode('foot');
+    hero.model.group.visible = true;
+    Object.assign(car, { x: START.x + 3, y: 0, z: START.z, vx: 0, vy: 0, vz: 0, heading: START.heading });
+    Object.assign(hero, { health: 100, stamina: 100, exhausted: false, dead: null, down: null, landing: 0, yaw: START.heading, facing: START.heading, pitch: 0,
+      fallAt: null, collapse: null, ct: 0, fade: null });
+    hero.fight = newFight();
+    hero.model.group.rotation.set(0, hero.facing, 0);
+    setWanted(0);
+    $('wasted').hidden = true;
+    updateCamera(0, 0, true);
+  }
+
+  const heroBone = (key) => hero.skin && hero.skin.bones[key] && hero.skin.bones[key].bone;
+  const heroAt = new THREE.Vector3();
+
+  // The hero dead or knocked flat: his knees go and he drops onto them (or onto his seat)
+  // and over (see collapseAt), hands out to save himself unless he is dead. Knocked down,
+  // he lies a moment, comes to, and gets up step by step and dusts himself off (see
+  // getUpPlan); the keys can cut the dusting short.
+  function updateHeroDown(dt) {
+    const m = hero.model;
+    if (!hero.fallAt) startHeroFall(0, 0);
+    const at = hero.fallAt;
+    const end = collapseEnd(hero.fallDir);
+    const full = hero.skin && hero.legs && hero.legs.torso;
+    car.vx = car.vz = 0;
+    m.group.rotation.order = 'YXZ';
+    if (hero.down && !hero.dead) {
+      const d = hero.down;
+      d.t += dt;
+      // shoved along the blow as he goes
+      if (d.t < 0.5) {
+        const push = 6 * (0.5 - d.t) * dt;
+        at.x += d.dx * push;
+        at.z += d.dz * push;
+      }
+      if (d.plan) {
+        d.g += dt;
+        const walking = ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown'].some((code) => keys.has(code));
+        if (d.g >= d.plan.end || (walking && d.g > d.plan.dustFrom + 0.15)) {
+          finishGettingUp(d.plan, d.g < d.plan.end);
+          return;
+        }
+        hero.collapse = getUpPose(d.plan, d.g, at, hero.legs, m.group);
+        fromFacing(at, 0, hero.collapse.hipF, 0, heroAt); // the camera stays with him
+        Object.assign(car, { x: heroAt.x, y: at.y, z: heroAt.z });
+        return;
+      }
+      if (d.lie === undefined) {
+        hero.ct = Math.min(end, hero.ct + dt * d.rate);
+        if (hero.ct >= end) d.lie = 0;
+      } else {
+        d.lie += dt;
+      }
+      if (d.lie > 0.9) {
+        if (full) {
+          d.plan = getUpPlan(hero.fallDir, sampleBody(m.group, heroBone, at, hero.legs, hero.collapse && hero.collapse.keys), hero.legs);
+          d.g = 0;
+        } else {
+          // the built-in figure: up the way it went down
+          hero.ct = Math.max(0, hero.ct - dt * 0.9);
+          if (hero.ct <= 0) {
+            finishGettingUp(null, false);
+            return;
+          }
+        }
+      }
+    } else {
+      hero.ct = Math.min(end, hero.ct + dt);
+    }
+    if (full) {
+      const c = collapseAt(hero.ct, hero.fallDir, hero.fallSide, hero.legs);
+      m.group.position.set(at.x + Math.sin(at.h) * c.hf, at.y + c.hy, at.z + Math.cos(at.h) * c.hf);
+      m.group.rotation.set(c.pitch, at.h, 0);
+      hero.collapse = { ...c, brace: hero.dead ? 0 : hero.fallDir, at };
+      fromFacing(at, 0, c.hf + hero.legs.hip * Math.sin(c.pitch), 0, heroAt); // the camera follows the hips
+      Object.assign(car, { x: heroAt.x, y: at.y, z: heroAt.z });
+    } else {
+      // the built-in figure: simply over
+      const tip = smooth(hero.ct / end);
+      Object.assign(car, { x: at.x, y: at.y, z: at.z });
+      m.group.position.set(at.x, at.y + 0.12 * tip, at.z);
+      m.group.rotation.set(-hero.fallDir * tip * Math.PI / 2 * 0.96, at.h, 0);
+    }
+  }
+
+  // On his feet again, where the get-up left him; if he walked off mid-dusting, his arms
+  // and trunk ease back over a moment rather than snapping.
+  function finishGettingUp(plan, cutShort) {
+    const m = hero.model;
+    const at = hero.fallAt;
+    const spot = fromFacing(at, 0, plan ? plan.stand : 0, 0, new THREE.Vector3());
+    if (cutShort && hero.skin && hero.collapse) {
+      m.group.updateMatrixWorld(true);
+      const inverse = m.group.getWorldQuaternion(new THREE.Quaternion()).invert();
+      const arms = [['armL', 'foreL'], ['foreL', 'handL'], ['armR', 'foreR'], ['foreR', 'handR']].map(([key, child]) => {
+        const from = heroBone(key).getWorldPosition(new THREE.Vector3());
+        return [key, child, heroBone(child).getWorldPosition(new THREE.Vector3()).sub(from).normalize().applyQuaternion(inverse)];
+      });
+      hero.fade = { arms, keys: { ...hero.collapse.keys }, w: 1 };
+    }
+    Object.assign(car, { x: spot.x, y: at.y, z: spot.z, vx: 0, vz: 0 });
+    hero.facing = at.h;
+    hero.down = null;
+    hero.fallAt = null;
+    hero.collapse = null;
+    m.group.position.set(spot.x, at.y, spot.z);
+    m.group.rotation.set(0, at.h, 0);
+  }
+
+  // ---------- Fighting ----------
+
+  // Fist fights, for the hero and for the people he picks on. A fighter stands in a guard:
+  // left foot forward, knees soft, chin down, hands up by the face. From it come the jab
+  // (lead hand straight), the cross (rear hand, the hips and shoulders turning through),
+  // the hook (lead hand round in an arc, elbow up) and the uppercut (dip, then rear hand
+  // driven upward); a kick for someone already on the ground; a block with both forearms
+  // up; and the jolt of being hit, head snapped back or round. Each pose says where each
+  // arm and forearm points in the body's own frame (x to its left, y up, z forward), how
+  // the shoulders turn, the lean, the head, and the bend in the knees.
+  const V3 = (x, y, z) => new THREE.Vector3(x, y, z).normalize();
+  const GUARD = {
+    aim: { armL: V3(0.12, -0.6, 0.72), foreL: V3(-0.22, 0.74, 0.6), armR: V3(-0.18, -0.72, 0.48), foreR: V3(0.34, 0.84, 0.34) },
+    keys: { twist: -0.3, spine: 0.13, neck: 0.16, crouch: 0.07, legL: -0.22, kneeL: 0.3, legR: 0.2, kneeR: 0.38, legSplay: 0.1, headTurn: 0, lean: 0 },
+  };
+  const FIGHT_MOVES = {
+    jab: {
+      dur: 0.42, hit: 0.14, reach: 1.35, damage: 9, stamina: 4, step: 0.14,
+      strike: { aim: { armL: V3(0.04, 0.1, 1), foreL: V3(-0.03, 0.08, 1) }, keys: { twist: -0.6, spine: 0.2, neck: 0.2, legL: -0.32, kneeL: 0.36 } },
+    },
+    cross: {
+      dur: 0.5, hit: 0.19, reach: 1.42, damage: 15, stamina: 6, step: 0.1,
+      wind: { at: 0.07, keys: { twist: -0.42 } },
+      strike: { aim: { armR: V3(0.25, 0.1, 1), foreR: V3(0.2, 0.08, 1) }, keys: { twist: 0.48, spine: 0.24, neck: 0.15, legR: 0.07, kneeR: 0.2, crouch: 0.09, lean: -0.04 } },
+    },
+    hook: {
+      dur: 0.58, hit: 0.27, reach: 1.15, damage: 18, stamina: 7, step: 0.06,
+      wind: { at: 0.12, aim: { armL: V3(0.55, -0.2, 0.75), foreL: V3(-0.3, 0.55, 0.75) }, keys: { twist: -0.62, crouch: 0.11, lean: 0.06 } },
+      strike: { aim: { armL: V3(0.85, 0.14, 0.5), foreL: V3(-0.9, 0.06, 0.42) }, keys: { twist: 0.42, spine: 0.17, crouch: 0.1, lean: -0.05 } },
+    },
+    uppercut: {
+      dur: 0.64, hit: 0.32, reach: 1.05, damage: 23, stamina: 8, step: 0.08,
+      wind: { at: 0.17, aim: { armR: V3(-0.12, -0.86, 0.4), foreR: V3(0.25, 0.22, 0.95) }, keys: { crouch: 0.18, spine: 0.32, twist: -0.18, lean: -0.1 } },
+      strike: { aim: { armR: V3(0.16, -0.45, 0.88), foreR: V3(0.12, 0.72, 0.68) }, keys: { crouch: 0.0, spine: 0.06, twist: 0.32, neck: -0.04 } },
+    },
+    kick: {
+      dur: 0.82, hit: 0.44, reach: 1.7, damage: 14, stamina: 8, step: 0.16,
+      wind: {
+        at: 0.26,
+        aim: { legR: V3(-0.04, -0.78, -0.62), kneeR: V3(-0.04, -0.3, -0.95), armL: V3(0.5, -0.65, 0.45), foreL: V3(0.2, -0.05, 1), armR: V3(-0.55, -0.8, 0.0), foreR: V3(-0.25, -0.6, 0.6) },
+        keys: { spine: 0.1, neck: 0.38, twist: 0.12, crouch: 0.05, kneeL: 0.25 },
+      },
+      strike: {
+        aim: { legR: V3(0.02, -0.68, 0.73), kneeR: V3(0.02, -0.92, 0.38), armL: V3(0.62, -0.62, 0.1), foreL: V3(0.35, -0.3, 0.85), armR: V3(-0.6, -0.55, 0.45), foreR: V3(-0.2, -0.2, 0.95) },
+        keys: { spine: -0.16, neck: 0.46, twist: -0.1, crouch: 0.03, kneeL: 0.22 },
+      },
+    },
+  };
+  const BLOCK = {
+    aim: { armL: V3(0.06, -0.12, 0.99), foreL: V3(-0.22, 0.96, 0.14), armR: V3(-0.06, -0.12, 0.99), foreR: V3(0.22, 0.96, 0.14) },
+    keys: { crouch: 0.11, neck: 0.34, spine: 0.22, twist: -0.08 },
+  };
+  const HURT = {
+    aim: { armL: V3(0.28, -0.92, 0.2), foreL: V3(0.05, -0.25, 0.97), armR: V3(-0.28, -0.92, 0.16), foreR: V3(-0.05, -0.25, 0.97) },
+    keys: { neck: -0.48, spine: -0.22, crouch: 0.03 },
+  };
+  const COMBO = ['jab', 'cross', 'hook', 'uppercut'];
+
+  const newFight = () => ({ guard: 0, move: null, react: null, block: 0, combo: -1, comboAt: -9, lastAction: -9, cooldown: rand(0.4, 1), circle: Math.random() < 0.5 ? 1 : -1, circleT: 0, timer: 0, target: null, closing: null });
+  hero.fight = newFight();
+
+  // Mixes pose `b` into pose `a` by k (aim directions and keys), returning a new pose.
+  function mixPose(a, b, k) {
+    if (!b || k <= 0) return a;
+    const aim = { ...a.aim };
+    for (const [key, dir] of Object.entries(b.aim || {})) aim[key] = aim[key] ? aim[key].clone().lerp(dir, k).normalize() : dir;
+    const keys = { ...a.keys };
+    for (const [key, v] of Object.entries(b.keys || {})) keys[key] = (keys[key] || 0) + (v - (keys[key] || 0)) * k;
+    return { aim, keys };
+  }
+
+  // The pose of a fighter now: the guard, through whatever move or block or hurt is on.
+  function fightPose(f) {
+    let pose = GUARD;
+    const m = f.move;
+    if (m) {
+      const spec = FIGHT_MOVES[m.type];
+      const t = m.t;
+      const windAt = spec.wind ? spec.wind.at : 0;
+      // drawing back, then fast out to the target, a beat there, and home to the guard
+      const wind = spec.wind ? smooth(t / windAt) : 0;
+      const out = t < windAt ? 0 : 1 - (1 - Math.min(1, (t - windAt) / Math.max(0.01, spec.hit - windAt))) ** 2.2;
+      const home = smooth((t - spec.hit - 0.06) / (spec.dur - spec.hit - 0.06));
+      if (spec.wind) pose = mixPose(pose, spec.wind, wind * (1 - out));
+      pose = mixPose(pose, spec.strike, out * (1 - home));
+    }
+    if (f.block > 0.01) pose = mixPose(pose, BLOCK, f.block);
+    if (f.react) {
+      const r = f.react;
+      const k = Math.min(1, r.t / 0.07) * (1 - smooth((r.t - 0.12) / (r.dur - 0.12)));
+      // a hook turns the head round, a straight punch snaps it back
+      const hurt = { aim: HURT.aim, keys: { ...HURT.keys } };
+      if (r.blocked) {
+        pose = mixPose(pose, BLOCK, k);
+        pose = mixPose(pose, { keys: { neck: 0.1, spine: 0.05, crouch: 0.12 } }, k);
+      } else {
+        if (r.kind === 'hook') {
+          hurt.keys.headTurn = r.side * 0.6;
+          hurt.keys.neck = -0.18;
+          hurt.keys.twist = r.side * 0.3;
+        } else if (r.kind === 'uppercut') {
+          hurt.keys.neck = -0.7;
+          hurt.keys.spine = -0.3;
+        }
+        pose = mixPose(pose, hurt, k);
+      }
+    }
+    return pose;
+  }
+
+  // --- the hero's fists ---
+
+  // Clicking with the fists: the next punch of a combination (jab, cross, hook, uppercut)
+  // if the last one landed lately, a kick if someone is down in front of him.
+  function heroAttack() {
+    const f = hero.fight;
+    if (hero.down || hero.dead) return;
+    if (f.move || f.closing) {
+      if (f.closing || f.move.t > FIGHT_MOVES[f.move.type].hit * 0.6) f.queued = true; // the next one follows on
+      return;
+    }
+    if (f.react && f.react.t < f.react.dur * 0.6) return;
+    // whoever he means: someone standing where he looks (or faces), else someone down
+    const target = pickTarget();
+    const downed = target ? null : findDowned();
+    let type;
+    if (downed) type = 'kick';
+    else {
+      f.combo = clock - f.comboAt < 1.0 ? (f.combo + 1) % COMBO.length : 0;
+      type = COMBO[f.combo];
+    }
+    f.target = target;
+    f.lastAction = clock;
+    if (target) {
+      provoke(target); // he stops and squares up (or cowers) as the hero comes at him
+      const p = target.group.position;
+      const d = Math.hypot(p.x - car.x, p.z - car.z);
+      hero.facing = Math.atan2(p.x - car.x, p.z - car.z);
+      if (d > FIGHT_MOVES[type].reach + 0.1) {
+        // out of reach: a couple of quick steps in, and the blow follows
+        f.closing = { type, t: 0 };
+        return;
+      }
+    }
+    startHeroMove(type, downed);
+  }
+
+  function startHeroMove(type, downed = null) {
+    const f = hero.fight;
+    const spec = FIGHT_MOVES[type];
+    const tired = hero.stamina < spec.stamina;
+    hero.stamina = Math.max(0, hero.stamina - spec.stamina);
+    f.move = { type, t: 0, landed: false, downed, slow: tired ? 1.35 : 1, stepped: 0, lunge: 0 };
+    f.lastAction = clock;
+    f.queued = false;
+    f.closing = null;
+    // square up to whoever he is after, and step in if the boot will not reach
+    const target = downed || (f.target && onFeet(f.target) ? f.target : nearestOpponent(3));
+    if (target) {
+      const p = downed ? downed.at : target.group.position;
+      const d = Math.hypot(p.x - car.x, p.z - car.z);
+      hero.facing = Math.atan2(p.x - car.x, p.z - car.z);
+      if (downed) f.move.lunge = Math.max(0, Math.min(0.6, d - 1.15));
+    }
+  }
+
+  // Who the hero means to hit: someone on their feet close by, the way the camera looks
+  // or the way he faces, the nearest and most squarely in front first.
+  function pickTarget(range = 3.4) {
+    const lx = Math.sin(hero.yaw);
+    const lz = Math.cos(hero.yaw);
+    const fx = Math.sin(hero.facing);
+    const fz = Math.cos(hero.facing);
+    let best = null;
+    let bestScore = Infinity;
+    for (const w of walkers) {
+      if (!onFeet(w) || w.state === 'act') continue;
+      const p = w.group.position;
+      const dx = p.x - car.x;
+      const dz = p.z - car.z;
+      const d = Math.hypot(dx, dz);
+      if (d > range || Math.abs(p.y - car.y) > 1.2) continue;
+      const ahead = d > 0.3 ? Math.max((dx * lx + dz * lz) / d, (dx * fx + dz * fz) / d) : 1;
+      if (ahead < 0.25) continue;
+      const score = d - 1.5 * ahead;
+      if (score < bestScore) {
+        best = w;
+        bestScore = score;
+      }
+    }
+    return best;
+  }
+
+  // The nearest person (or dog) on their feet in front of the hero within `reach`.
+  function nearestOpponent(reach, cone = 0.55) {
+    const fx = Math.sin(hero.facing);
+    const fz = Math.cos(hero.facing);
+    let best = null;
+    let bestDist = reach;
+    for (const w of walkers) {
+      if (!onFeet(w)) continue;
+      const p = w.group.position;
+      const dx = p.x - car.x;
+      const dz = p.z - car.z;
+      const d = Math.hypot(dx, dz);
+      if (d > bestDist || Math.abs(p.y - car.y) > 1.2) continue;
+      if (d > 0.4 && (dx * fx + dz * fz) / d < cone) continue;
+      best = w;
+      bestDist = d;
+    }
+    return best;
+  }
+
+  // Someone lying in front of him: a person knocked down or dead, or a downed animal.
+  function findDowned() {
+    const fx = Math.sin(hero.yaw);
+    const fz = Math.cos(hero.yaw);
+    const inFront = (x, z, y) => {
+      const dx = x - car.x;
+      const dz = z - car.z;
+      const d = Math.hypot(dx, dz);
+      return d < 2.1 && Math.abs(y - car.y) < 1 && (d < 0.5 || (dx * fx + dz * fz) / d > 0.3) ? d : Infinity;
+    };
+    let best = null;
+    let bestDist = Infinity;
+    for (const w of walkers) {
+      if (!['down', 'dead', 'fall'].includes(w.state)) continue;
+      const at = bodyCentre(w);
+      const d = inFront(at.x, at.z, w.group.position.y);
+      if (d < bestDist) {
+        best = { walker: w, group: w.group, at };
+        bestDist = d;
+      }
+    }
+    for (const a of animals) {
+      if (a.down <= 0) continue;
+      const d = inFront(a.x, a.z, a.y);
+      if (d < bestDist) {
+        best = { animal: a, group: a.group, at: a.group.position };
+        bestDist = d;
+      }
+    }
+    return best;
+  }
+
+  // The hero's fight, each frame on foot: the guard comes up when there is trouble near,
+  // moves play out (with a step in behind each), and blows land when the fist arrives.
+  function updateHeroFight(dt, moving, running = false) {
+    const f = hero.fight;
+    const fists = hero.weapon === 'fist';
+    if (running) {
+      // breaking into a run drops the fight at once: no guard, no follow-up, and the
+      // last blow's recovery cut short
+      if (f.move && f.move.landed) f.move = null;
+      f.closing = null;
+      f.queued = false;
+      f.target = null;
+      f.lastAction = -9;
+    }
+    const foes = walkers.some((w) => w.state === 'fight' && !w.fight.timid && Math.hypot(w.group.position.x - car.x, w.group.position.z - car.z) < 9);
+    const engaged = fists && !hero.down && !running && (f.move || f.react || f.closing || clock - f.lastAction < (moving ? 1.2 : 3) || foes);
+    f.guard = approach(f.guard, engaged ? 1 : 0, (engaged ? 6 : running ? 12 : 3) * dt);
+    if (f.closing) {
+      // stepping in on his man, quick and light, before the blow
+      const c = f.closing;
+      c.t += dt;
+      const target = f.target;
+      if (!target || !onFeet(target) || c.t > 0.7) {
+        f.closing = null;
+        if (target && onFeet(target)) startHeroMove(c.type);
+      } else {
+        const p = target.group.position;
+        const dx = p.x - car.x;
+        const dz = p.z - car.z;
+        const d = Math.hypot(dx, dz);
+        hero.facing = Math.atan2(dx, dz);
+        if (d <= FIGHT_MOVES[c.type].reach - 0.05) startHeroMove(c.type);
+        else {
+          const step = Math.min(d - FIGHT_MOVES[c.type].reach + 0.1, 3.6 * dt);
+          car.x += (dx / d) * step;
+          car.z += (dz / d) * step;
+          car.vx = (dx / d) * 3.6;
+          car.vz = (dz / d) * 3.6;
+          pushHeroOut(0.4);
+        }
+      }
+    }
+    if (f.react) {
+      f.react.t += dt;
+      // knocked back a step by the blow
+      if (f.react.t < 0.22) {
+        car.x += f.react.dx * 1.1 * dt;
+        car.z += f.react.dz * 1.1 * dt;
+        pushHeroOut(0.4);
+      }
+      if (f.react.t >= f.react.dur) f.react = null;
+    }
+    const m = f.move;
+    if (m) {
+      const spec = FIGHT_MOVES[m.type];
+      m.t += dt / m.slow;
+      // the step in behind the punch
+      const want = (spec.step + (m.lunge || 0)) * smooth(m.t / spec.hit);
+      const step = want - m.stepped;
+      m.stepped = want;
+      car.x += Math.sin(hero.facing) * step;
+      car.z += Math.cos(hero.facing) * step;
+      pushHeroOut(0.4);
+      if (!m.landed && m.t >= spec.hit) {
+        m.landed = true;
+        landBlow(m);
+      }
+      if (m.t >= spec.dur) {
+        f.move = null;
+        f.comboAt = clock;
+        if (f.queued) heroAttack();
+      }
+    }
+    // keep facing whoever he is fighting
+    if (f.target && (!onFeet(f.target) || Math.hypot(f.target.group.position.x - car.x, f.target.group.position.z - car.z) > 6)) f.target = null;
+    const foe = f.guard > 0.4 ? f.target || nearestOpponent(4, -1) : null;
+    if (foe && !moving && !f.closing) {
+      const p = foe.group.position;
+      hero.facing += wrapAngle(Math.atan2(p.x - car.x, p.z - car.z) - hero.facing) * Math.min(1, 8 * dt);
+    }
+    hero.fightPose = f.guard > 0.01 ? fightPose(f) : null;
+  }
+
+  // The moment the fist (or the boot) arrives: whoever is there is hit.
+  function landBlow(m) {
+    const spec = FIGHT_MOVES[m.type];
+    const fx = Math.sin(hero.facing);
+    const fz = Math.cos(hero.facing);
+    if (m.type === 'kick') {
+      const target = m.downed;
+      if (!target) return;
+      const p = target.at;
+      if (Math.hypot(p.x - car.x, p.z - car.z) > spec.reach) return;
+      playPunch(false, 0.9);
+      if (target.animal) {
+        target.animal.down = Math.max(target.animal.down, KNOCKED_SECONDS);
+        return;
+      }
+      const w = target.walker;
+      w.health -= spec.damage;
+      w.timer = Math.max(w.timer || 0, 2.5); // keeps him down
+      g2push(w.fallAt || w.group.position, fx, fz, 0.18);
+      if (w.health < -45 && w.state !== 'dead') {
+        w.dying = true;
+        if (w.state === 'down') {
+          w.state = 'dead';
+          w.timer = 30;
+        }
+      }
+      return;
+    }
+    // the man he is squared up to, if the fist can get there, else whoever is in front
+    let target = null;
+    const locked = hero.fight.target;
+    if (locked && onFeet(locked)) {
+      const dx = locked.group.position.x - car.x;
+      const dz = locked.group.position.z - car.z;
+      const d = Math.hypot(dx, dz);
+      if (d < spec.reach + 0.35 && (d < 0.4 || (dx * fx + dz * fz) / d > 0.3)) target = locked;
+    }
+    target = target || nearestOpponent(spec.reach + 0.15, 0.4);
+    if (!target) {
+      playWhoosh();
+      return;
+    }
+    strikeWalker(target, m.type, fx, fz);
+  }
+  const g2push = (pos, fx, fz, d) => {
+    pos.x += fx * d;
+    pos.z += fz * d;
+  };
+
+  // A punch from the hero landing on a pedestrian.
+  function strikeWalker(w, type, dx, dz) {
+    const spec = FIGHT_MOVES[type];
+    if (!w.isPerson) {
+      // a dog is simply bowled over
+      playPunch(false, 0.8);
+      hurtWalker(w, 20, dx, dz, true);
+      return;
+    }
+    if (!w.fight) w.fight = newFight();
+    const f = w.fight;
+    const p = w.group.position;
+    // a block only stops what comes at him from in front
+    const facing = Math.sin(w.group.rotation.y) * -dx + Math.cos(w.group.rotation.y) * -dz;
+    const blocked = w.state === 'fight' && f.block > 0.5 && facing > 0.5;
+    const damage = spec.damage * (blocked ? (f.timid ? 0.6 : 0.2) : 1) * (hero.exhausted ? 0.6 : 1); // a coward's arms keep little out
+    w.health -= damage;
+    playPunch(blocked, Math.min(1, damage / 20));
+    if (w.health <= 0) {
+      // out cold: the knees go and he drops the way the blow sends him
+      w.fight = null;
+      w.actMove = 0;
+      w.dying = w.health < -35;
+      if (w.stolen === undefined || w.away) setPavementGoal(w, p.x, p.z);
+      w.away = true;
+      w.baseY = p.y;
+      startFall(w, dx, dz);
+      if (hero.fight.target === w) hero.fight.target = null;
+      setWanted(wanted + 1);
+      showToast(wanted === 1 ? 'Wanted! Police are coming' : 'Wanted level up', true);
+      return;
+    }
+    f.move = null;
+    f.react = { t: 0, dur: blocked ? 0.3 : 0.48, dx, dz, kind: type, blocked, side: type === 'hook' ? -1 : 1 };
+    if (w.state === 'fight' && f.timid) f.scared = true; // he has had enough: he runs once he can
+    else if (w.state !== 'fight' && w.state !== 'flee') {
+      // caught off guard: he squares up to fight, or runs for it
+      provoke(w);
+      if (w.fight.timid) w.fight.scared = true;
+    }
+  }
+
+  // Picked on by the hero: a person stops what he is doing and turns to face him, fists
+  // up if he means to fight (most men, a good many women), forearms up to shield his
+  // face if not, and he runs at the first blow.
+  function provoke(w) {
+    if (!w.isPerson || !onFeet(w) || ['fight', 'flee', 'stagger', 'act'].includes(w.state)) return;
+    if (w.brave === undefined) w.brave = Math.random() < (w.female ? 0.6 : 0.85);
+    const p = w.group.position;
+    w.away = true;
+    w.baseY = p.y;
+    w.pose = null;
+    w.actMove = 0;
+    w.group.rotation.x = w.group.rotation.z = 0;
+    const react = w.fight && w.fight.react;
+    w.fight = newFight();
+    w.fight.react = react;
+    w.fight.timid = !w.brave;
+    w.fight.cooldown = rand(0.45, 0.9);
+    w.state = 'fight';
+  }
+
+  // --- pedestrians who fight back, or run ---
+
+  function updateFighter(w, dt) {
+    const g = w.group;
+    if (w.state === 'flee') {
+      // running flat out away from the hero, then back to some pavement
+      w.timer -= dt;
+      const dx = g.position.x - car.x;
+      const dz = g.position.z - car.z;
+      const d = Math.hypot(dx, dz) || 1;
+      const step = 4.6 * dt;
+      stepWalker(w, (dx / d) * step, (dz / d) * step);
+      g.rotation.set(0.1, Math.atan2(dx, dz), 0);
+      w.actMove = 1;
+      w.actSpeed = 4.6;
+      w.pose = null;
+      if (w.timer <= 0 || d > 45) {
+        g.rotation.x = 0;
+        setPavementGoal(w, g.position.x, g.position.z);
+        w.state = 'goto';
+      }
+      return true;
+    }
+    if (w.state !== 'fight') return false;
+    const f = w.fight;
+    f.timer += dt;
+    const dx = car.x - g.position.x;
+    const dz = car.z - g.position.z;
+    const d = Math.hypot(dx, dz) || 1;
+    // the hero gone (into a car, too far, or dead): the fight is over
+    if (mode !== 'foot' || hero.dead || d > 14 || f.timer > 45) {
+      w.state = 'goto';
+      w.pose = null;
+      w.actMove = 0;
+      setPavementGoal(w, g.position.x, g.position.z);
+      return true;
+    }
+    const toHero = Math.atan2(dx, dz);
+    g.rotation.set(0, g.rotation.y + wrapAngle(toHero - g.rotation.y) * Math.min(1, (f.react ? 2 : 8) * dt), 0);
+    w.actMove = 0;
+    w.actSpeed = 0;
+    f.guard = approach(f.guard, 1, 5 * dt);
+    if (f.timid) {
+      // no fighter: hands up over his face, backing off; hit (or given a moment) he runs
+      if (f.react) {
+        f.react.t += dt;
+        if (f.react.t < 0.25) stepWalker(w, f.react.dx * 1.2 * dt, f.react.dz * 1.2 * dt);
+        if (f.react.t >= f.react.dur) f.react = null;
+      } else if (d < 2.2) {
+        stepWalker(w, (-dx / d) * 0.7 * dt, (-dz / d) * 0.7 * dt);
+        w.actMove = 0.6;
+        w.actSpeed = -0.7;
+      }
+      f.block = approach(f.block, 1, 8 * dt);
+      if ((f.scared && !f.react) || f.timer > 2.2) {
+        w.state = 'flee';
+        w.timer = rand(7, 11);
+        w.pose = null;
+        return true;
+      }
+      w.pose = fightPose(f);
+      w.pose.weight = f.guard;
+      g.position.y = groundAt(g.position.x, g.position.z, g.position.y + 0.3) - (w.pose.keys.crouch || 0) * 0.6;
+      return true;
+    }
+    if (f.react) {
+      f.react.t += dt;
+      if (f.react.t < 0.25) stepWalker(w, f.react.dx * 1.2 * dt, f.react.dz * 1.2 * dt);
+      if (f.react.t >= f.react.dur) {
+        f.react = null;
+        // stung: often he hits straight back
+        f.cooldown = Math.min(f.cooldown, rand(0.1, 0.5));
+      }
+    } else if (f.move) {
+      const spec = FIGHT_MOVES[f.move.type];
+      f.move.t += dt;
+      const want = spec.step * smooth(f.move.t / spec.hit);
+      const step = want - f.move.stepped;
+      f.move.stepped = want;
+      stepWalker(w, Math.sin(g.rotation.y) * step, Math.cos(g.rotation.y) * step);
+      if (!f.move.landed && f.move.t >= spec.hit) {
+        f.move.landed = true;
+        // it lands if the hero is in reach and in front of him
+        const ahead = (dx * Math.sin(g.rotation.y) + dz * Math.cos(g.rotation.y)) / d;
+        if (d < spec.reach + 0.1 && ahead > 0.6 && !hero.down && mode === 'foot') punchHero(f.move.type, -dx / d, -dz / d);
+        else playWhoosh();
+      }
+      if (f.move.t >= spec.dur) {
+        f.move = null;
+        f.cooldown = rand(0.6, 1.5);
+      }
+    } else {
+      // footwork: in to just beyond arm's length, back off if crowded, circle now and then
+      f.cooldown -= dt;
+      f.circleT -= dt;
+      if (f.circleT <= 0) {
+        f.circle = Math.random() < 0.5 ? 1 : -1;
+        f.circleT = rand(1, 2.5);
+      }
+      let mx = 0;
+      let mz = 0;
+      let pace = 0;
+      if (d > 1.3) {
+        mx = dx / d;
+        mz = dz / d;
+        pace = d > 4 ? 2.6 : 1.3;
+      } else if (d < 0.8) {
+        mx = -dx / d;
+        mz = -dz / d;
+        pace = -1.0;
+      } else if (f.circleT > 1) {
+        mx = (-dz / d) * f.circle;
+        mz = (dx / d) * f.circle;
+        pace = 0.55;
+      }
+      if (pace) {
+        stepWalker(w, mx * Math.abs(pace) * dt, mz * Math.abs(pace) * dt);
+        w.actMove = Math.min(1, Math.abs(pace) / 1.2);
+        w.actSpeed = pace;
+      }
+      // when the hero throws a punch at him, he may get his guard up in time
+      const heroSwinging = hero.fight.move && hero.fight.move.t < FIGHT_MOVES[hero.fight.move.type].hit && d < 1.8;
+      if (heroSwinging && f.willBlock === undefined) f.willBlock = Math.random() < 0.35;
+      if (!heroSwinging) f.willBlock = undefined;
+      f.block = approach(f.block, heroSwinging && f.willBlock ? 1 : 0, 12 * dt);
+      if (f.cooldown <= 0 && d < 1.4 && f.block < 0.3) {
+        const roll = Math.random();
+        const type = roll < 0.45 ? 'jab' : roll < 0.75 ? 'cross' : roll < 0.93 ? 'hook' : 'uppercut';
+        f.move = { type, t: 0, landed: false, stepped: 0 };
+      }
+    }
+    w.pose = fightPose(f);
+    w.pose.weight = f.guard;
+    // knees bent: a little lower to the ground
+    g.position.y = groundAt(g.position.x, g.position.z, g.position.y + 0.3) - (w.pose.keys.crouch || 0) * 0.6;
+    return true;
+  }
+
+  // A pedestrian's punch landing on the hero.
+  function punchHero(type, dx, dz) {
+    const damage = { jab: 6, cross: 9, hook: 10, uppercut: 13 }[type] * rand(0.85, 1.15);
+    playPunch(false, damage / 14);
+    hurtHero(damage, 'Beaten to death', dx, dz);
+    if (hero.dead) {
+      knockHeroDown(dx, dz);
+      return;
+    }
+    hero.fight.move = null;
+    hero.fight.react = { t: 0, dur: 0.42, dx, dz, kind: type, blocked: false, side: type === 'hook' ? 1 : -1 };
+    hero.fight.lastAction = clock;
+    bump = Math.max(bump, 0.25);
   }
 
   // ---------- Ride models ----------
@@ -6118,7 +12842,7 @@
   }
 
   function leaveHeli() {
-    if (car.y > groundAt(car.x, car.z, car.y) + 0.02 || Math.abs(heli.speed) > 2) {
+    if (heli.burning === undefined && (car.y > groundAt(car.x, car.z, car.y) + 0.02 || Math.abs(heli.speed) > 2)) {
       showToast('Land the helicopter to get out', true);
       return;
     }
@@ -6153,14 +12877,25 @@
     car.vz = Math.cos(car.heading) * h.speed;
     car.x += car.vx * dt;
     car.z += car.vz * dt;
+    const freeX = car.x;
+    const freeZ = car.z;
     pushHeroOut(2.2);
+    // how hard it was driven into whatever pushed it back (only what pushes against the way
+    // it was flying counts): hard enough, and it catches fire
+    const flown = Math.hypot(car.vx, car.vz);
+    const against = flown > 3 ? -((car.x - freeX) * car.vx + (car.z - freeZ) * car.vz) / flown : 0;
+    const impact = dt > 0 ? Math.min(flown + 2, Math.max(0, against) / dt) : 0;
+    if (impact > 7) igniteHeli(impact);
+    if (impact > 2) h.speed *= Math.max(0.3, 1 - impact / 25);
     const expected = Math.abs(h.speed) * dt;
     if (expected > 1e-4 && Math.hypot(car.x - fromX, car.z - fromZ) < expected * 0.4) h.speed *= 0.5;
 
     clampToWorld();
 
     const lift = !ready ? 0 : held('Space') ? 1 : held('ShiftLeft', 'ShiftRight') ? -1 : 0;
-    hoverStep(dt, lift, HELI_LIFT);
+    // on fire the engine falters: less lift, and past half way it sinks unless held up
+    const burning = h.burning || 0;
+    hoverStep(dt, burning > 0.5 && lift >= 0 ? lift - (burning - 0.5) * 1.6 : lift, HELI_LIFT * (1 - 0.45 * burning));
 
     // nose dips into forward flight and the body banks into turns
     const ease = Math.min(1, 4 * dt);
@@ -6176,6 +12911,13 @@
     h.model.rotor.rotation.y += h.rotor * 34 * dt;
     h.model.tailRotor.rotation.x += h.rotor * 50 * dt;
     if (!h.flown) {
+      // nobody at the controls: if it is in the air, it falls; a hard landing finishes it
+      const floor = groundAt(h.x, h.z, h.y);
+      if (h.y > floor + 0.02) {
+        h.fallV = (h.fallV || 0) - GRAVITY * dt;
+        h.y = Math.max(floor, h.y + h.fallV * dt);
+        if (h.y <= floor && h.fallV < -9) h.burning = 1;
+      } else h.fallV = 0;
       h.tilt += (0 - h.tilt) * Math.min(1, 4 * dt);
       h.roll += (0 - h.roll) * Math.min(1, 4 * dt);
     }
@@ -6393,7 +13135,25 @@
   function runCheat(text) {
     const code = text.trim().toLowerCase().replace(/\s+/g, '');
     const kinds = { car: 'sports', sportscar: 'sports', supercar: 'sports', sedan: 'sedan', hatchback: 'hatch',
-      suv: 'suv', truck: 'pickup', pickup: 'pickup', bus: 'bus', motorbike: 'moto', motorcycle: 'moto' };
+      suv: 'suv', truck: 'truck', lorry: 'truck', pickup: 'pickup', bus: 'bus', motorbike: 'moto', motorcycle: 'moto', police: 'police' };
+    const lightCommands = {
+      lights: () => setLights({ head: HEAD_MODES[(HEAD_MODES.indexOf(lights.head) + 1) % HEAD_MODES.length] }),
+      lightson: () => setLights({ head: 'on' }), headlights: () => setLights({ head: 'on' }),
+      lightsoff: () => setLights({ head: 'off' }), lightsauto: () => setLights({ head: 'auto' }),
+      lightshigh: () => setLights({ head: 'high' }), highbeam: () => setLights({ head: 'high' }), fullbeam: () => setLights({ head: 'high' }),
+      left: () => toggleIndicator('left'), indicatorleft: () => toggleIndicator('left'),
+      right: () => toggleIndicator('right'), indicatorright: () => toggleIndicator('right'),
+      indicatoroff: () => setLights({ indicator: null }), indicatorsoff: () => setLights({ indicator: null }),
+      hazard: () => toggleIndicator('hazard'), hazards: () => toggleIndicator('hazard'),
+      siren: () => setLights({ emergency: !lights.emergency }), emergency: () => setLights({ emergency: !lights.emergency }),
+      sirens: () => setLights({ emergency: !lights.emergency }),
+      brakes: () => setLights({ brakes: !lights.brakes }), brakelights: () => setLights({ brakes: !lights.brakes }),
+    };
+    if (lightCommands[code]) {
+      if (mode !== 'car') showToast('Get in a vehicle first', true);
+      else lightCommands[code]();
+      return;
+    }
     if (kinds[code]) {
       // swap into a new sports car on the spot
       if (mode !== 'car' && !backOnFoot()) return; // still moving too fast to get off
@@ -6402,7 +13162,9 @@
         scene.remove(player.group);
         if (insideView) setInsideView(false);
       }
-      const model = createCar(pick(kinds[code] === 'sports' ? SPORTS_COLORS : TRAFFIC_COLORS), kinds[code]);
+      const police = kinds[code] === 'police';
+      const model = createCar(police ? 0xf4f6f8 : colorFor(kinds[code]), police ? 'sedan' : kinds[code]);
+      if (police) addPoliceLook(model);
       model.group.position.set(at.x, at.y, at.z);
       drive(model, at.x, at.y, at.z, at.h);
       showToast('Vehicle delivered');
@@ -6433,6 +13195,11 @@
     } else if (code === 'rocketman' || code === 'jetpack') {
       setJetpack(!hero.jetpack);
       showToast(hero.jetpack ? 'Rocket pack on: hold Space to fly' : 'Rocket pack off');
+    } else if (code === 'deepsnow') {
+      setWeather('snow');
+      env.snow = 1;
+      env.snowCover = 1;
+      showToast('Deep snow');
     } else if (WEATHERS[code]) {
       setWeather(code);
       showToast(`Weather: ${code}`);
@@ -6516,13 +13283,14 @@
       if (handbrake) vf = approach(vf, 0, HANDBRAKE * dt);
 
       // tyres: sideways speed is scrubbed off at once with grip, slowly when the handbrake locks the rear
-      vl *= Math.exp(-(handbrake ? HANDBRAKE_GRIP : stats.grip * settings.grip * Math.max(0.3, 1 - 0.3 * flats.length)) * dt);
+      const icy = 1 - 0.4 * env.snowCover; // snow on the road: less grip
+      vl *= Math.exp(-(handbrake ? HANDBRAKE_GRIP : stats.grip * settings.grip * icy * Math.max(0.3, 1 - 0.3 * flats.length)) * dt);
 
       // Steering turns the front wheels, and the car follows the arc they make: tight at
       // walking pace, and at speed only as tight as the tyres can hold. So a corner has to
       // be slowed for, and the car goes where it is pointed instead of pivoting on the spot.
       const lock = (Math.tan(0.6) / wb) * Math.abs(vf);
-      const hold = ((handbrake ? TYRE_HOLD * 1.5 : TYRE_HOLD) * settings.grip) / Math.max(1, Math.abs(vf));
+      const hold = ((handbrake ? TYRE_HOLD * 1.5 : TYRE_HOLD) * settings.grip * icy) / Math.max(1, Math.abs(vf));
       yaw = car.steer * Math.sign(vf) * Math.min(lock, hold) * settings.steering;
       // a flat drags the car toward its corner (the front ones hardest) and sets it weaving
       const pull = flats.reduce((sum, f) => sum + f.side * (f.front ? 1 : 0.5), 0);
@@ -6586,8 +13354,9 @@
   function collide(fx, fz) {
     const { r, offsets } = bodyCircles(player);
     for (const offset of offsets) {
-      for (const box of colliders.concat(trafficBoxes, policeBoxes)) {
-        if (!blocksPlayer(box)) continue;
+      for (const box of solidsNear(car.x + fx * offset, car.z + fz * offset, r).concat(peopleBoxes())) {
+        if (!blocksPlayer(box) || box.soft) continue;
+        if (box.signal !== undefined && Math.hypot(car.vx, car.vz) >= 4) continue; // it goes over (see checkSignalHits)
         const cx = car.x + fx * offset;
         const cz = car.z + fz * offset;
         const touch = boxContact(box, cx, cz, r);
@@ -6603,8 +13372,10 @@
             const y = car.y + 0.6;
             damageCar(player, cx - nx * r, y, cz - nz * r, nx, nz, -into);
             if (box.owner) damageCar(box.owner, cx - nx * r, y, cz - nz * r, -nx, -nz, -into * 0.8);
+            if (box.highway) box.highway.stunned = 4; // the other driver stops, shaken
             bump = Math.max(bump, Math.min(1, -into / 14));
             playCrash(Math.min(1, -into / 18));
+            if (-into > 12) hurtHero((-into - 12) * 2.2, 'Killed in a crash'); // the driver is thrown about too
           }
           car.vx -= nx * into * 1.2;
           car.vz -= nz * into * 1.2;
@@ -6658,7 +13429,8 @@
   // the way the blow pushed. A light knock leaves a shallow dent; a hard one caves the
   // panel in over a wide area, and a very hard one, or several, breaks the glass.
   function damageCar(model, px, py, pz, nx, nz, speed) {
-    if (!model.deform || speed < 2.5) return;
+    if (model.wrecked || !model.deform || speed < 2.5) return;
+    hurtVehicle(model, speed * speed * 0.9, true); // hard knocks wear it down toward fire
     const depth = Math.min(0.42, 0.03 + speed * 0.015);
     const radius = Math.min(1.4, 0.45 + speed * 0.04);
     model.damage = (model.damage || 0) + speed / 30;
@@ -6723,6 +13495,10 @@
 
   // Makes a vehicle as new: panels back in shape, glass replaced, tyres pumped up.
   function repairCar(model) {
+    if (model.wrecked) return;
+    model.health = vehicleHealth(model);
+    model.fuse = undefined;
+    hurtVehicles.delete(model);
     for (const mesh of model.deform || []) {
       if (!mesh.userData.pristine) continue;
       mesh.geometry.dispose();
@@ -6820,7 +13596,7 @@
       if (length < 4) {
         const nx = (-(z - last[1]) / length) * 0.11;
         const nz = ((x - last[0]) / length) * 0.11;
-        const y = car.y + 0.115;
+        const y = car.y + (car.y < 0.05 ? 0.006 : 0.015); // on the road (or a deck), under the tyres
         const k = nextMark++ % MARKS;
         position.array.set([
           last[0] + nx, y, last[1] + nz, last[0] - nx, y, last[1] - nz, x + nx, y, z + nz,
@@ -6904,7 +13680,7 @@
       const eye = player.stats.eye;
       const [ahead, across] = player.seat || [-0.2, 0.38];
       camera.position.set(car.x + fx * ahead + lx * across, car.y + eye, car.z + fz * ahead + lz * across);
-      camLook.set(car.x + fx * 14 + lx * (0.38 + lean), car.y + eye - 0.12 - Math.tan(car.pitch) * 14, car.z + fz * 14 + lz * (0.38 + lean));
+      camLook.set(car.x + fx * 14 + lx * (across + lean), car.y + eye - 0.12 - Math.tan(car.pitch) * 14, car.z + fz * 14 + lz * (across + lean));
       fov = 72 + (car.boosting ? 12 : 0);
     } else {
       // chase camera: closer and lower behind a horse, further back behind the helicopter
@@ -6935,9 +13711,18 @@
     sun.target.position.set(car.x, 0, car.z);
   }
 
+  // The dial shows only when there is something to drive: its ring fills with the speed
+  // (to about 220 km/h) and turns orange on nitro.
+  const dash = $('dash');
+  const gauge = $('gauge');
   function updateHud(vf, speed) {
-    $('speed').textContent = Math.round(speed * 3.6);
+    dash.hidden = mode === 'foot';
+    if (dash.hidden) return;
+    const kmh = Math.round(speed * 3.6);
+    $('speed').textContent = kmh;
     $('gear').textContent = speed < 0.3 ? 'N' : vf < 0 ? 'R' : 'D';
+    gauge.style.setProperty('--v', Math.min(1, kmh / 220).toFixed(3));
+    gauge.classList.toggle('boost', !!car.boosting);
     $('nitro').style.width = `${car.nitro * 100}%`;
     $('nitro').classList.toggle('active', car.boosting);
   }
@@ -6994,23 +13779,35 @@
     clock += dt;
     updateEnvironment(dt);
     updateTraffic(dt);
+    updateHighwayTraffic(dt);
+    updateTrains(dt);
     updateWalkers(dt);
     updateBirds(dt);
     updateAnimals(dt);
     updateLights();
 
     let vf = 0;
-    if (mode === 'car') vf = updateCar(dt);
+    if (hero.dead || hero.down) {
+      // dead or flat on his back: nothing answers the keys; a car rolls on to a stop
+      if (mode === 'car' && player && !player.wrecked) vf = updateCar(dt);
+      else if (mode === 'foot') updateHeroDown(dt);
+    } else if (mode === 'car') vf = updateCar(dt);
     else if (mode === 'horse') updateRiding(dt);
     else if (mode === 'heli') updateHeli(dt);
     else if (mode === 'bike') updateBiking(dt);
-    else if (entering) updateEntering(dt);
+    else if (act) updateAct(dt);
     else updateHero(dt);
     updateDoors(dt);
     if (horse) animateHorse(dt);
     if (heli) animateHeli(dt);
     if (bike) animateBike(dt);
     updateHeroSkin(dt);
+    updateVehicleLights(dt);
+    updateVehicleFires(dt);
+    updateHeliFire(dt);
+    updateWrecks(dt);
+    updateClouds(dt);
+    updateVitals(dt);
     const speed = Math.hypot(car.vx, car.vz);
     if (mode === 'car' && car.y < 1) checkPedestrianHits(speed);
     if (mode === 'car') checkSignalHits(speed);
@@ -7030,6 +13827,7 @@
       toastTimer -= dt;
       if (toastTimer <= 0) $('toast').hidden = true;
     }
+    updateWheelInstances();
   }
 
   function resize() {
@@ -7059,6 +13857,7 @@
     }
     if (BLOCKED.has(e.code)) e.preventDefault();
     startAudio();
+    if (hero.dead) return;
     keys.add(e.code);
     if (e.repeat) return;
     if (e.code === 'KeyF') {
@@ -7077,9 +13876,16 @@
     if (e.code === 'Digit1') setWeapon('gun');
     if (e.code === 'Digit2') setWeapon('bow');
     if (e.code === 'KeyP') toggleSettings(!settingsOpen);
+    if (mode === 'car') {
+      if (e.code === 'KeyL') setLights({ head: HEAD_MODES[(HEAD_MODES.indexOf(lights.head) + 1) % HEAD_MODES.length] });
+      if (e.code === 'KeyZ') toggleIndicator('left');
+      if (e.code === 'KeyX') toggleIndicator('right');
+      if (e.code === 'KeyH') toggleIndicator('hazard');
+      if (e.code === 'KeyK') setLights({ emergency: !lights.emergency });
+    }
     if (e.code === 'KeyM') toggleBigMap(!mapOpen);
     if (e.code === 'Escape' && mapOpen) toggleBigMap(false);
-    if (e.code === 'KeyR' && mode === 'car') {
+    if (e.code === 'KeyR' && mode === 'car' && !player.wrecked) {
       repairCar(player);
       showToast('Repaired: good as new');
     }
@@ -7110,19 +13916,25 @@
   // Everything is built once the embedded models have been decoded (or have failed to),
   // because the cars and the things you can ride are made from them.
   function start() {
+    buildTerrain();
     buildCity();
+    buildRoads();
+    buildMetro();
+    buildMall();
+    plantCountryside();
+    paintMarks();
     addStreetLamps();
     addRoadDetails();
     addRoadSigns();
     addSky();
     headBeam = new THREE.SpotLight(0xfff0d0, 0, 75, 0.55, 0.6, 1.2);
     scene.add(headBeam, headBeam.target);
-    buildHills();
     buildVegetation();
     spawnAnimals();
     addParkedCars();
     buildTrafficLights();
     spawnTraffic();
+    spawnHighwayTraffic();
     spawnWalkers(PEOPLE, createPerson, 1.1, 1.8);
     spawnWalkers(DOGS, createDog, 1.6, 2.8);
     spawnBirds();
@@ -7140,6 +13952,9 @@
     setWeapon('fist');
     buildPolice();
     buildMap();
+    setupSnow();
+    smokeCloud = particleCloud(1200, false);
+    flameCloud = particleCloud(1000, true);
 
     targetPad = flatPlane(BAY_W - 0.3, BAY_L - 0.3, 0xffcc00, 0, 0, 0.12);
     targetPad.material = new THREE.MeshBasicMaterial({ color: 0xffcc00, transparent: true, opacity: 0.5 });
@@ -7166,6 +13981,7 @@
 
   Promise.all([
     new Promise((ready) => loadCarModel(ready)),
+    new Promise((ready) => loadVehicleModels(ready)),
     loadRideModels(),
     loadNpcModels(),
   ]).then(start);
