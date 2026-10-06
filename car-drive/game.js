@@ -106,10 +106,48 @@
   const rand = (min, max) => min + Math.random() * (max - min);
   const pick = (list) => list[Math.floor(Math.random() * list.length)];
 
-  const renderer = new THREE.WebGLRenderer({ canvas: $('scene'), antialias: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  // ---------- Graphics quality ----------
+
+  // Three presets, picked on the controls page (P) and remembered. High is the full picture;
+  // Medium and Low trade resolution, shadow detail, how far small things are drawn and how
+  // much rain or snow falls for a cooler, quieter machine. Whatever the preset, the frame
+  // rate is held to a limit (60 by default: on a 120 Hz screen the game would otherwise draw
+  // every picture twice as often for nothing you can see), and when frames still come late
+  // the resolution eases down a step until they don't, and back up when there is room.
+  //   ratio, minRatio  the most and the fewest pixels per screen pixel
+  //   shadow*          the sun's shadow map: its size, half the width of ground it covers,
+  //                    soft or plain edges, how often it is redrawn (1 = every frame), and
+  //                    how near a person must be to cast one
+  //   fine, detail     how near a vehicle must be to draw its cabin and small parts, and its
+  //                    wheels and trim
+  //   people, dogs, drivers  how near they must be to be drawn at all
+  //   viewFar          how far anything is drawn (no further than the haze lets you see)
+  //   weather          how much of the rain or snow is drawn
+  const QUALITY = {
+    low: { ratio: 1, minRatio: 0.7, aniso: 2, shadow: 1024, shadowHalf: 46, softShadows: false, shadowEvery: 3, shadowPeople: 18,
+      fine: 35, detail: 75, people: 80, dogs: 40, drivers: 28, viewFar: 850, weather: 0.45, snowMap: 1024 },
+    medium: { ratio: 1.5, minRatio: 0.85, aniso: 4, shadow: 1024, shadowHalf: 60, softShadows: false, shadowEvery: 2, shadowPeople: 30,
+      fine: 50, detail: 110, people: 110, dogs: 55, drivers: 38, viewFar: 1300, weather: 0.75, snowMap: 1024 },
+    high: { ratio: 2, minRatio: 1, aniso: 16, shadow: 2048, shadowHalf: 72, softShadows: true, shadowEvery: 1, shadowPeople: 45,
+      fine: 70, detail: 150, people: 140, dogs: 70, drivers: 45, viewFar: 1900, weather: 1, snowMap: 2048 },
+  };
+  const graphics = { quality: 'high', fps: 60, adaptive: true };
+  try {
+    Object.assign(graphics, JSON.parse(localStorage.getItem('car-drive-graphics') || '{}'));
+  } catch (error) {
+    // storage unavailable: the defaults
+  }
+  if (!QUALITY[graphics.quality]) graphics.quality = 'high';
+  let gq = QUALITY[graphics.quality];
+  const deviceRatio = window.devicePixelRatio || 1;
+  let pixelRatio = Math.min(deviceRatio, gq.ratio);
+  const madeTextures = []; // the textures made here, so their filtering can follow the preset
+
+  const renderer = new THREE.WebGLRenderer({ canvas: $('scene'), antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(pixelRatio);
   renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.type = gq.softShadows ? THREE.PCFSoftShadowMap : THREE.PCFShadowMap;
+  const anisotropy = () => Math.min(renderer.capabilities.getMaxAnisotropy(), gq.aniso);
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(SKY);
@@ -125,13 +163,14 @@
   scene.add(skyLight);
   const sun = new THREE.DirectionalLight(0xfff0da, 0.78);
   sun.castShadow = true;
-  sun.shadow.mapSize.set(2048, 2048);
-  sun.shadow.camera.left = -80;
-  sun.shadow.camera.right = 80;
-  sun.shadow.camera.top = 80;
-  sun.shadow.camera.bottom = -80;
+  sun.shadow.mapSize.set(gq.shadow, gq.shadow);
+  sun.shadow.camera.left = -gq.shadowHalf;
+  sun.shadow.camera.right = gq.shadowHalf;
+  sun.shadow.camera.top = gq.shadowHalf;
+  sun.shadow.camera.bottom = -gq.shadowHalf;
   sun.shadow.camera.far = 400;
   sun.shadow.bias = -0.0005;
+  sun.shadow.autoUpdate = false; // redrawn when the frame loop says (see frame)
   scene.add(sun, sun.target);
 
   // ---------- City ----------
@@ -154,7 +193,8 @@
     draw(canvas.getContext('2d'), w, h);
     const tex = new THREE.CanvasTexture(canvas);
     tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-    tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    tex.anisotropy = anisotropy();
+    madeTextures.push(tex);
     return tex;
   }
 
@@ -189,7 +229,8 @@
     if (!uri) return null;
     const tex = new THREE.Texture();
     tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-    tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    tex.anisotropy = anisotropy();
+    madeTextures.push(tex);
     const image = new Image();
     image.onload = () => {
       tex.image = image;
@@ -254,6 +295,7 @@
     material.reflectivity = 0;
     reflective.push(material);
     wetSurfaces.push({ material, color: new THREE.Color(color) });
+    material.userData.wetGround = true;
     return material;
   }
 
@@ -675,6 +717,7 @@
   }
 
   function flushBatch(batch, shadows = true) {
+    const made = [];
     for (const [material, part] of batch) {
       if (!part.index.length) continue;
       const geo = new THREE.BufferGeometry();
@@ -687,8 +730,10 @@
       mesh.castShadow = shadows;
       mesh.receiveShadow = true;
       scene.add(mesh);
+      made.push(mesh);
     }
     batch.clear();
+    return made;
   }
   // (normal maps in three.js work from the uv layout alone; nothing more is needed)
   const computeTangentsSafe = () => {};
@@ -1161,11 +1206,17 @@
       }),
     });
 
+    const GREENS = [[0.3, 0.46, 0.16], [0.38, 0.55, 0.2], [0.22, 0.38, 0.14], [0.46, 0.6, 0.22], [0.26, 0.42, 0.2]];
+    // the city's and the countryside's plants, then the hill's pines on their own (picnic
+    // mode hides those under its jungle)
+    grow(plants.filter((p) => !p.hill), true, null);
+    grow(plants.filter((p) => p.hill), false, hillWoods);
+
+    function grow(list, withLawns, owner) {
     const cards = { leaf: [], pine: [], tuft: [] }; // each: [x, y, z, rx, ry, rz, width, height, r, g, b]
     const wood = []; // trunks and boughs: [x, y, z, tiltX, turnY, radius, length]
-    const GREENS = [[0.3, 0.46, 0.16], [0.38, 0.55, 0.2], [0.22, 0.38, 0.14], [0.46, 0.6, 0.22], [0.26, 0.42, 0.2]];
 
-    for (const p of plants) {
+    for (const p of list) {
       const s = p.s;
       if (p.type === 'tree') {
         const green = pick(GREENS);
@@ -1218,7 +1269,7 @@
         }
       }
     }
-    for (const lawn of lawns) {
+    for (const lawn of withLawns ? lawns : []) {
       for (let n = 0; n < 380; n++) {
         const x = lawn.x + rand(-0.5, 0.5) * lawn.size;
         const z = lawn.z + rand(-0.5, 0.5) * lawn.size;
@@ -1252,7 +1303,7 @@
         colors.push(new THREE.Color(c[8], c[9], c[10]));
       }
       tiledInstances(plane, material, matrices, {
-        colors, reach: name === 'tuft' ? 160 : 700,
+        colors, reach: name === 'tuft' ? 160 : 700, owner,
         setup: (mesh) => {
           if (!shadows) return;
           mesh.castShadow = true;
@@ -1268,7 +1319,8 @@
       dummy.updateMatrix();
       return dummy.matrix.clone();
     });
-    tiledInstances(trunkGeo, bark, trunks, { reach: 600, setup: (mesh) => { mesh.castShadow = true; } });
+    tiledInstances(trunkGeo, bark, trunks, { reach: 600, owner, setup: (mesh) => { mesh.castShadow = true; } });
+    }
   }
 
   function addBayRow(cx, cz, count) {
@@ -1591,7 +1643,7 @@
         if (!o.isMesh) return;
         const geo = o.geometry.clone().applyMatrix4(o.matrixWorld).scale(1.3, 1.3, 1.3); // about 5 m tall
         const name = o.material.name;
-        parts.push([geo, name.endsWith('glass') ? glass : name.endsWith('bulb') ? bulb : iron, !name.endsWith('glass')]);
+        parts.push([geo, name.endsWith('glass') ? glass : name.endsWith('bulb') ? bulb : iron, !name.endsWith('glass') && !name.endsWith('bulb')]);
       });
     } else {
       const metal = new THREE.MeshLambertMaterial({ color: 0x3a3f47 });
@@ -1791,6 +1843,8 @@
     env.timer = rand(150, 260);
   }
 
+  let clockShown = -1;
+  const clockText = $('clock');
   function updateEnvironment(dt) {
     env.hour = (env.hour + (dt * 24) / DAY_SECONDS) % 24;
     env.timer -= dt;
@@ -1867,6 +1921,18 @@
     scene.background.copy(u.horizon.value);
     scene.fog.near = 260 - 170 * env.rain - 170 * env.snow; // rain and snow close the view in
     scene.fog.far = 1300 - 800 * env.rain - 820 * env.snow;
+    // Past the far edge of the haze everything is the colour of the haze, so nothing is drawn
+    // beyond it (nor beyond the preset's distance, the haze drawn in to meet it).
+    if (scene.fog.far > gq.viewFar - 60) {
+      scene.fog.far = gq.viewFar - 60;
+      scene.fog.near = Math.min(scene.fog.near, scene.fog.far * 0.3);
+    }
+    const viewFar = Math.min(gq.viewFar, scene.fog.far + 100);
+    if (Math.abs(camera.far - viewFar) > 15) {
+      camera.far = viewFar;
+      camera.updateProjectionMatrix();
+      skyDome.scale.setScalar(Math.min(1, (viewFar * 0.94) / 1700)); // the sky stays inside it
+    }
 
     // --- lamps: street lights and vehicle lights come on as it gets dark
     const lampsOn = smooth((env.night + env.overcast * 0.35 - 0.25) / 0.3);
@@ -1899,7 +1965,16 @@
     if (lampsOn > 0.6 && !reflectionNight && reflection && clock > 3) captureReflections(true);
     useReflection(nightSky ? reflectionNight : reflection);
 
-    // --- wet ground: darker, glossier, and it picks up the sky
+    // --- wet ground: darker, glossier, and it picks up the sky. While it is dry the
+    // ground has no reflection map at all, so the most of the screen does not sample one.
+    const gloss = env.wet > 0.01 && !!reflectionNow;
+    if (gloss !== groundGloss) {
+      groundGloss = gloss;
+      for (const surface of wetSurfaces) {
+        surface.material.envMap = gloss ? reflectionNow : null;
+        surface.material.needsUpdate = true;
+      }
+    }
     for (const surface of wetSurfaces) {
       surface.material.color.copy(surface.color).multiplyScalar(1 - 0.38 * env.wet);
       surface.material.shininess = 8 + 90 * env.wet;
@@ -1914,7 +1989,11 @@
     updateRain(dt);
     updateSnow(dt);
     updateAudio();
-    $('clock').textContent = `${String(Math.floor(env.hour)).padStart(2, '0')}:${String(Math.floor((env.hour % 1) * 60)).padStart(2, '0')}`;
+    const minute = Math.floor(env.hour * 60);
+    if (minute !== clockShown) {
+      clockShown = minute;
+      clockText.textContent = `${String(Math.floor(env.hour)).padStart(2, '0')}:${String(Math.floor((env.hour % 1) * 60)).padStart(2, '0')}`;
+    }
   }
 
   // --- snow ---
@@ -2011,7 +2090,7 @@
   const flakeData = new Float32Array(SNOW_FLAKES * 5); // x, y, z, the height of what is under it, a wobble phase
 
   function setupSnow() {
-    snowTarget = new THREE.WebGLRenderTarget(2048, 2048, { depthBuffer: false, stencilBuffer: false });
+    snowTarget = new THREE.WebGLRenderTarget(gq.snowMap, gq.snowMap, { depthBuffer: false, stencilBuffer: false });
     snowUniforms.snowTracks.value = snowTarget.texture;
     snowScene = new THREE.Scene();
     snowCamera = new THREE.OrthographicCamera(-SNOW_AREA, SNOW_AREA, SNOW_AREA, -SNOW_AREA, 1, 200);
@@ -2045,8 +2124,14 @@
   const stripDummy = new THREE.Object3D();
   let tracksDirty = false;
 
-  // Each moving vehicle lays two strips, one under each line of wheels.
-  function paintSnowTracks(dt) {
+  // Each moving vehicle lays two strips, one under each line of wheels. Twenty times a
+  // second is plenty for tracks: painting the whole map every frame costs far more.
+  let snowPaintDue = 0;
+  function paintSnowTracks(frameDt) {
+    snowPaintDue += frameDt;
+    if (snowPaintDue < 0.05) return;
+    const dt = Math.min(0.2, snowPaintDue);
+    snowPaintDue = 0;
     let n = 0;
     const lay = (x, z, h, dims, speed) => {
       if (speed < 0.6 || n > 410 || Math.abs(x) > SNOW_AREA || Math.abs(z) > SNOW_AREA) return;
@@ -2125,9 +2210,10 @@
       scene.add(snowFlakes);
     }
     snowFlakes.visible = true;
-    snowFlakes.geometry.setDrawRange(0, Math.floor(SNOW_FLAKES * Math.min(1, env.snow * 1.1)));
+    const flakes = Math.floor(SNOW_FLAKES * Math.min(1, env.snow * 1.1) * gq.weather);
+    snowFlakes.geometry.setDrawRange(0, flakes);
     const points = snowFlakes.geometry.attributes.position.array;
-    for (let i = 0; i < SNOW_FLAKES; i++) {
+    for (let i = 0; i < flakes; i++) {
       const d = i * 5;
       let x = flakeData[d] + (1.2 + Math.sin(clock * 0.7 + flakeData[d + 4]) * 0.8) * dt;
       let y = flakeData[d + 1] - (1.1 + (i % 7) * 0.08) * dt;
@@ -2183,11 +2269,12 @@
     }
     rainLines.visible = true;
     rainLines.material.opacity = 0.16 + 0.3 * env.rain;
-    rainLines.geometry.setDrawRange(0, Math.floor(RAIN_DROPS * Math.min(1, env.rain * 1.2)) * 2);
+    const drops = Math.floor(RAIN_DROPS * Math.min(1, env.rain * 1.2) * gq.weather);
+    rainLines.geometry.setDrawRange(0, drops * 2);
     const points = rainLines.geometry.attributes.position.array;
     const fall = 26 * dt;
     const slant = 5 * dt; // blown along on the wind
-    for (let n = 0; n < RAIN_DROPS; n++) {
+    for (let n = 0; n < drops; n++) {
       const d = n * 4;
       let x = rainDrops[d] + slant;
       let y = rainDrops[d + 1] - fall;
@@ -2239,7 +2326,7 @@
     sports: { pitch: 72, bright: 1.5, gain: 1.15 }, sedan: { pitch: 55, bright: 1, gain: 1 },
     hatch: { pitch: 62, bright: 1, gain: 0.9 }, suv: { pitch: 47, bright: 0.85, gain: 1.05 },
     pickup: { pitch: 43, bright: 0.8, gain: 1.1 }, bus: { pitch: 30, bright: 0.55, gain: 1.5 },
-    truck: { pitch: 34, bright: 0.6, gain: 1.4 },
+    truck: { pitch: 34, bright: 0.6, gain: 1.4 }, rv: { pitch: 40, bright: 0.7, gain: 1.25 },
     moto: { pitch: 98, bright: 1.9, gain: 1.1 },
   };
   const OTHER_ENGINES = 4; // how many nearby vehicles are heard at once
@@ -2803,6 +2890,8 @@
     }
   }
 
+  const terrainMeshes = []; // the shaped patches of ground (picnic mode recolours the hills')
+
   // The ground everywhere: a flat field of grass in 100 m tiles, except where one of the
   // terrain patches has its own shaped mesh, tinted by height, steepness, beach and verge.
   function buildTerrain() {
@@ -2863,6 +2952,7 @@
       ground.receiveShadow = true;
       ground.userData.snow = 'ground';
       scene.add(ground);
+      terrainMeshes.push(ground);
     }
 
     // the flat grass, in tiles, leaving room for the shaped patches
@@ -2931,6 +3021,11 @@
   }
   let waterMat = null;
 
+  // What stands on the hills that picnic mode's jungle replaces: the pines (drawn under
+  // hillWoods), the boulders and the villas, with their colliders and surfaces.
+  const hillWoods = new THREE.Object3D();
+  const hillThings = { meshes: [], boxes: [], surfaces: [] };
+
   // Pines and boulders over the slopes, clear of the roads and the summit, and the lookout.
   function buildHillDetails() {
     const b = HILL_BOUNDS;
@@ -2951,16 +3046,16 @@
       .map((spot) => ({ ...spot, s: rand(0.8, 1.5), turn: Math.random() * 6 }));
 
     const pines = spots(420, 3);
-    for (const t of pines) plants.push({ type: Math.random() < 0.75 ? 'pine' : 'tree', x: t.x, y: t.y, z: t.z, s: t.s });
+    for (const t of pines) plants.push({ type: Math.random() < 0.75 ? 'pine' : 'tree', x: t.x, y: t.y, z: t.z, s: t.s, hill: true });
     for (const t of pines) {
-      addCollider({ minX: t.x - 0.45, maxX: t.x + 0.45, minZ: t.z - 0.45, maxZ: t.z + 0.45, minY: t.y - 1, maxY: t.y + 8 });
+      hillThings.boxes.push(addCollider({ minX: t.x - 0.45, maxX: t.x + 0.45, minZ: t.z - 0.45, maxZ: t.z + 0.45, minY: t.y - 1, maxY: t.y + 8 }));
     }
     const stone = new THREE.MeshPhongMaterial({ color: 0x8d8a84, flatShading: true, shininess: 0 });
     const rocks = spots(140, 6);
     const boulders = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 1), stone, rocks.length);
     rocks.forEach((spot, i) => {
       const r = 1.0 * spot.s;
-      addCollider({ minX: spot.x - r, maxX: spot.x + r, minZ: spot.z - r, maxZ: spot.z + r, minY: spot.y - 1, maxY: spot.y + 1.05 * spot.s, top: spot.y + 0.95 * spot.s });
+      hillThings.boxes.push(addCollider({ minX: spot.x - r, maxX: spot.x + r, minZ: spot.z - r, maxZ: spot.z + r, minY: spot.y - 1, maxY: spot.y + 1.05 * spot.s, top: spot.y + 0.95 * spot.s }));
       dummy.position.set(spot.x, spot.y + 0.2 * spot.s, spot.z);
       dummy.scale.set(1.3 * spot.s, 0.9 * spot.s, 1.1 * spot.s);
       dummy.rotation.set(0, spot.turn, 0);
@@ -2969,9 +3064,12 @@
     });
     boulders.castShadow = true;
     scene.add(boulders);
+    hillThings.meshes.push(boulders);
 
     // --- villas on shelves beside the hill road, on stone foundations where the ground falls away
     const villas = makeBatch();
+    const villaBoxesFrom = colliders.length;
+    const villaSurfacesFrom = surfaces.length;
     const stoneMat = cityMaterial('concrete', 0x9a948a);
     let placedVillas = 0;
     for (let i = 30; i < hillRoad.length - 30 && placedVillas < 14; i += 9) {
@@ -2995,13 +3093,16 @@
           for (let k = (before.get(m) || 0) + 1; k < part.positions.length; k += 3) part.positions[k] += highest;
         }
         batchBox(villas, stoneMat, x, (lowest + highest) / 2 - 0.4, z, 13, highest - lowest + 0.8, 13, 0, 3);
-        addCollider({ minX: x - 6.5, maxX: x + 6.5, minZ: z - 6.5, maxZ: z + 6.5, minY: lowest - 1, maxY: highest + 0.2, top: highest + 0.2 });
-        addSurface({ minX: x - 6.5, maxX: x + 6.5, minZ: z - 6.5, maxZ: z + 6.5, h0: highest + 0.2, h1: highest + 0.2 });
+        hillThings.boxes.push(addCollider({ minX: x - 6.5, maxX: x + 6.5, minZ: z - 6.5, maxZ: z + 6.5, minY: lowest - 1, maxY: highest + 0.2, top: highest + 0.2 }));
+        hillThings.surfaces.push(addSurface({ minX: x - 6.5, maxX: x + 6.5, minZ: z - 6.5, maxZ: z + 6.5, h0: highest + 0.2, h1: highest + 0.2 }));
         placedVillas++;
         break;
       }
     }
-    flushBatch(villas);
+    // (each house filed its own collider and roof surface as it was added)
+    for (const box of colliders.slice(villaBoxesFrom)) if (!hillThings.boxes.includes(box)) hillThings.boxes.push(box);
+    for (const surface of surfaces.slice(villaSurfacesFrom)) if (!hillThings.surfaces.includes(surface)) hillThings.surfaces.push(surface);
+    hillThings.meshes.push(...flushBatch(villas));
 
     // --- summit lookout: a gravel pad, a shelter and a flag
     const top = terrain(main.x, main.z);
@@ -3414,14 +3515,16 @@
       const b = points[k + 1];
       addSurface({ ax: a.x, az: a.z, bx: b.x, bz: b.z, ha: a.h + road.lift, hb: b.h + road.lift, half: half + 0.05 });
     }
-    ribbonStrip(road, -half, half, 0, opts.material || roadTarmac(), null, 0.05);
-    ribbonStrip(road, half - 0.55, half - 0.4, 0.004, lineWhite);
-    ribbonStrip(road, -half + 0.4, -half + 0.55, 0.004, lineWhite);
+    // (kept: picnic mode turns the hill road to a dirt track and takes its lines away)
+    road.tarmac = opts.material || roadTarmac();
+    road.meshes = [ribbonStrip(road, -half, half, 0, road.tarmac, null, 0.05)];
+    road.meshes.push(ribbonStrip(road, half - 0.55, half - 0.4, 0.004, lineWhite));
+    road.meshes.push(ribbonStrip(road, -half + 0.4, -half + 0.55, 0.004, lineWhite));
     if (road.center === 'double') {
-      ribbonStrip(road, 0.12, 0.27, 0.004, lineYellow);
-      ribbonStrip(road, -0.27, -0.12, 0.004, lineYellow);
+      road.meshes.push(ribbonStrip(road, 0.12, 0.27, 0.004, lineYellow));
+      road.meshes.push(ribbonStrip(road, -0.27, -0.12, 0.004, lineYellow));
     } else if (road.center === 'dashed') {
-      ribbonStrip(road, -0.08, 0.08, 0.004, lineWhite, [1, 1]);
+      road.meshes.push(ribbonStrip(road, -0.08, 0.08, 0.004, lineWhite, [1, 1]));
     }
     if (opts.lanes === 2) {
       for (const side of [-1, 1]) ribbonStrip(road, side * half / 2 - 0.07, side * half / 2 + 0.07, 0.004, lineWhite, [1, 1]);
@@ -4878,8 +4981,9 @@
   function useReflection(texture) {
     if (!texture || texture === reflectionNow) return;
     reflectionNow = texture;
-    for (const material of reflective) material.envMap = texture;
+    for (const material of reflective) if (!material.userData.wetGround || groundGloss) material.envMap = texture;
   }
+  let groundGloss = false; // the wet ground has its reflection map (see updateEnvironment)
 
   function captureReflections(night = false) {
     const target = new THREE.WebGLCubeRenderTarget(256, {
@@ -4960,6 +5064,7 @@
   const CAR_INTERIOR = new Set(['leather', 'carpet', 'interior_dark', 'interior_light', 'carbon_fibre_trim', 'blue',
     'yellow_trim']);
   const CAR_WHEEL_PARTS = /^(tire|wheel|rim_)/;
+  const CAR_CORE = new Set(['body', 'glass', 'trim', 'lights_red']); // the shape seen from any distance
   const glassClear = new THREE.MeshPhongMaterial({
     color: 0x9fb4c8, transparent: true, opacity: 0.18, shininess: 90, depthWrite: false, side: THREE.DoubleSide,
   });
@@ -5044,6 +5149,11 @@
     });
     main.getObjectByName('body').castShadow = true;
     rig.add(main);
+    const detail = new THREE.Group(); // the cabin and the small parts, dropped far off (see updateVehicleDetail)
+    rig.add(detail);
+    const fine = main.clone(false); // in the same place as the body
+    for (const part of [...main.children]) if (!CAR_CORE.has(part.name)) fine.add(part);
+    detail.add(fine);
 
     const wheels = [];
     const frontPivots = [];
@@ -5080,10 +5190,11 @@
     steeringWheel.position.set(0, 0, 0);
     steeringWheel.quaternion.identity();
     column.add(steeringWheel);
-    rig.add(column);
+    detail.add(column);
 
     scene.add(group);
     return {
+      detail, fine: true,
       group, rig, wheels, frontPivots, tailMat, flame, sports: true, kind: 'sports',
       dims: { hl: 2.3, hw: 1.0, wb: 2.65 }, seatY: 0.36,
       deform: [main.getObjectByName('body')], glassParts: [main.getObjectByName('glass')],
@@ -5154,13 +5265,15 @@
     const index = vertices > 65535 ? new Uint32Array(indices) : new Uint16Array(indices);
     let v = 0;
     let i = 0;
-    // element by element: the loader may hand over interleaved attributes
+    // element by element: the loader may hand over interleaved attributes, or packed ones
+    // (whole numbers standing for -1..1 or 0..1, which this version of three.js reads raw)
     const copy = (attribute, out, at, size) => {
       if (!attribute) return;
+      const unit = attribute.normalized ? 1 / ({ Int8Array: 127, Uint8Array: 255, Int16Array: 32767, Uint16Array: 65535 }[attribute.array.constructor.name] || 1) : 1;
       for (let k = 0; k < attribute.count; k++) {
-        out[(at + k) * size] = attribute.getX(k);
-        out[(at + k) * size + 1] = attribute.getY(k);
-        if (size === 3) out[(at + k) * size + 2] = attribute.getZ(k);
+        out[(at + k) * size] = attribute.getX(k) * unit;
+        out[(at + k) * size + 1] = attribute.getY(k) * unit;
+        if (size === 3) out[(at + k) * size + 2] = attribute.getZ(k) * unit;
       }
     };
     for (const g of list) {
@@ -5236,13 +5349,14 @@
       if (!materials[name]) {
         if (source.map) source.map.encoding = THREE.LinearEncoding; // the scene's other pictures are linear too
         const shiny = spec.chrome.includes(name);
+        const paint = spec.paint.includes(name) && !spec.matte; // (a photo scan has its shine painted in)
         const material = new THREE.MeshPhongMaterial({
           color: source.color, map: source.map, side: THREE.DoubleSide,
-          shininess: shiny ? 110 : spec.paint.includes(name) ? 70 : 18, specular: shiny ? 0xdddddd : spec.paint.includes(name) ? 0x666666 : 0x151515,
+          shininess: shiny ? 110 : paint ? 70 : 18, specular: shiny ? 0xdddddd : paint ? 0x666666 : 0x151515,
           transparent: source.transparent && !spec.glass.includes(name), opacity: source.opacity, alphaTest: source.alphaTest,
         });
         if (spec.inside.includes(name)) material.userData.noSnow = true;
-        materials[name] = { material, reflect: shiny ? 0.45 : spec.paint.includes(name) ? 0.18 : 0 };
+        materials[name] = { material, reflect: shiny ? 0.45 : paint ? 0.18 : 0 };
       }
       roles[role] = roles[role] || [];
       roles[role].push({ geometry: joinGeometries([o.geometry]).applyMatrix4(o.matrixWorld), name });
@@ -5454,7 +5568,7 @@
       // you sit in the real cab: nothing to add for the inside view, nothing to hide
       interior: new THREE.Group(), interiorAlways: true, cabin: new THREE.Group(),
       materials: [...own.values()], // everything of its own, charred if it burns
-      model: true,
+      model: true, fine: true,
     };
   }
 
@@ -6474,7 +6588,8 @@
       if (!m.detail) return;
       const p = m.group.position;
       const d2 = (p.x - eye.x) ** 2 + (p.z - eye.z) ** 2;
-      m.detail.visible = d2 < 150 * 150;
+      const reach = m.fine ? gq.fine : gq.detail;
+      m.detail.visible = d2 < reach * reach;
       // past 70 m the body is the coarse shell, doors and all (unless it is dented: that shape is its own)
       const parts = m.parts;
       if (!parts || !parts.paintFar || m.body.userData.pristine || m.doorOpen) return;
@@ -6977,14 +7092,31 @@
 
   // Everything a traffic vehicle must not drive into, gathered once a frame: where it is,
   // which way it points, half its length and width, and how fast it is going.
+  // Everything a vehicle in the city has to stop for, as one list rebuilt each frame from
+  // records that are kept and reused (rather than made afresh, a few hundred a frame).
+  const obstaclePool = [];
+  const obstacleList = [];
   function trafficObstacles() {
-    const list = traffic.map((o) => ({ x: o.x, z: o.z, h: o.h, speed: Math.abs(o.speed), car: o, ...o.model.dims }));
-    for (const v of idleCars) if ((v.y || 0) < 1) list.push({ x: v.x, z: v.z, h: v.h, speed: 0, ...v.model.dims });
-    for (const p of police) if (p.active) list.push({ x: p.x, z: p.z, h: p.h, speed: Math.abs(p.speed), ...p.model.dims });
-    if (heli && mode !== 'heli' && heli.y < 1) list.push({ x: heli.x, z: heli.z, h: heli.h, speed: 0, hl: 3, hw: 1.6 });
+    obstacleList.length = 0;
+    const put = (x, z, h, speed, hl, hw, owner = null) => {
+      let o = obstaclePool[obstacleList.length];
+      if (!o) obstaclePool.push((o = {}));
+      o.x = x;
+      o.z = z;
+      o.h = h;
+      o.speed = speed;
+      o.hl = hl;
+      o.hw = hw;
+      o.car = owner;
+      obstacleList.push(o);
+    };
+    for (const o of traffic) put(o.x, o.z, o.h, Math.abs(o.speed), o.model.dims.hl, o.model.dims.hw, o);
+    for (const v of idleCars) if ((v.y || 0) < 1) put(v.x, v.z, v.h, 0, v.model.dims.hl, v.model.dims.hw);
+    for (const p of police) if (p.active) put(p.x, p.z, p.h, Math.abs(p.speed), p.model.dims.hl, p.model.dims.hw);
+    if (heli && mode !== 'heli' && heli.y < 1) put(heli.x, heli.z, heli.h, 0, 3, 1.6);
     if (car.y < 1.5 && mode !== 'heli') {
       const dims = mode === 'car' ? player.dims : { hl: 0.5, hw: 0.4 }; // on foot, bike or horse: something narrow
-      list.push({ x: car.x, z: car.z, h: car.heading, speed: Math.hypot(car.vx, car.vz), ...dims });
+      put(car.x, car.z, car.heading, Math.hypot(car.vx, car.vz), dims.hl, dims.hw);
     }
     // people off the pavement: fighting, running, walking back, or lying in the road
     for (const w of walkers) {
@@ -6992,9 +7124,23 @@
       const p = w.group.position;
       if (p.y > 0.6) continue;
       const lying = !onFeet(w);
-      list.push({ x: p.x, z: p.z, h: w.group.rotation.y, speed: 0, hl: lying ? 1 : 0.35, hw: lying ? 0.45 : 0.35 });
+      put(p.x, p.z, w.group.rotation.y, 0, lying ? 1 : 0.35, lying ? 0.45 : 0.35);
     }
-    return list;
+    return obstacleList;
+  }
+
+  // Vehicles far from the player are moved less often, each time by all the time that has
+  // passed since: every other frame beyond 250 m, every fourth beyond 500 m. Returns the
+  // step to take now, or 0 for none this frame.
+  function trafficStep(c, dt) {
+    c.lag = (c.lag || 0) + dt;
+    const far = Math.max(Math.abs(c.x - car.x), Math.abs(c.z - car.z));
+    const every = far > 500 ? 4 : far > 250 ? 2 : 1;
+    c.beat = ((c.beat ?? Math.floor(Math.random() * 4)) + 1) % 4;
+    if (c.beat % every) return 0;
+    const step = Math.min(0.12, c.lag);
+    c.lag = 0;
+    return step;
   }
 
   // The gap between vehicle `c` and the nearest thing in a strip of road along its heading,
@@ -7083,134 +7229,139 @@
   function updateTraffic(dt) {
     const obstacles = trafficObstacles();
     for (const c of traffic) {
-      const { hl, wb } = c.model.dims;
-      c.laneTimer = Math.max(0, c.laneTimer - dt);
-
-      // keep the carrot a few lengths ahead
-      const look = 5 + hl + Math.abs(c.speed) * 0.7;
-      const lead = Math.hypot(c.cx - c.x, c.cz - c.z);
-      if (lead < look) advanceCarrot(c, Math.min(look - lead, 45 * dt + 0.2));
-      const progress = c.phase === 'road' ? roadProgress(c) : 0;
-      // the junction is free again once this vehicle's tail has left it
-      if (c.hold && c.phase === 'road' && progress - hl > JUNCTION) {
-        if (junctionHolder[c.hold] === c) delete junctionHolder[c.hold];
-        c.hold = null;
-      }
-
-      const ahead = gapAlong(c, obstacles, 0, false);
-      // A vehicle is "stuck" when what blocks it is not ordinary waiting traffic: something
-      // parked in the road, or another vehicle that is itself stuck or backing up. Whoever
-      // comes up behind a stuck vehicle hangs well back, so it has room to work its way out.
-      const leadStuck = !!ahead.car && (ahead.car.stuck || ahead.car.reverse > 0);
-      c.stuck = ahead.still && ahead.gap < 5 && (!ahead.car || leadStuck);
-      let room = ahead.gap - (leadStuck ? 6 : 1.4); // metres it may still roll before it has to be stopped
-      // nose to tail in a queue that margin is right; squeezing past at an angle, test the real shapes
-      if (ahead.gap < 4.5 && !leadStuck) room = pathClear(c, obstacles) ? Math.max(room, 2) : Math.min(room, 0);
-      if (c.phase === 'road' && c.t >= CELL - JUNCTION - 1e-3 && !mayEnter(c)) {
-        // the carrot is held at the junction: stop at the line (or, if over it, at the edge)
-        const line = progress + hl > STOP_LINE + 1.5 ? CELL - JUNCTION - 0.4 : STOP_LINE;
-        room = Math.min(room, line - hl - progress);
-      }
-
-      // Lane choice, on a road only. A lane blocked by something that is not moving sends
-      // the carrot to the other lane when that is clear alongside and ahead; from the
-      // passing lane it comes back as soon as the outer lane is clear.
-      if (c.phase === 'road' && c.reverse <= 0) {
-        const [rx, rz] = rightOf(DIRS[c.d]);
-        const drift = (c.x - roadCenter(c.i)) * rx + (c.z - roadCenter(c.j)) * rz - LANE; // where it really is
-        // Stuck nose-in behind something while trying to reach the other lane: back up and
-        // have another go at the angle, like a three-point turn. With no room behind
-        // either, it stays put until whatever is boxing it in moves.
-        if (c.wait > 1 && ahead.still && ahead.gap < 4.5 && Math.abs(drift - c.side) > 1.2
-          && gapAlong(c, obstacles, 0, true).gap > 2.5) c.reverse = 1.8;
-        // sitting on the tail of a vehicle that is trying to manoeuvre: back off and give it room
-        if (c.wait > 0.5 && leadStuck && ahead.gap < 5 && gapAlong(c, obstacles, 0, true).gap > 2.5) {
-          c.reverse = 1.5;
-          c.yielding = true;
-        }
-      }
-      if (c.phase === 'road' && c.laneTimer <= 0 && c.reverse <= 0) {
-        const [rx, rz] = rightOf(DIRS[c.d]);
-        const drift = (c.x - roadCenter(c.i)) * rx + (c.z - roadCenter(c.j)) * rz - LANE;
-        const other = c.side === 0 ? PASSING_LANE : 0;
-        const blocked = ahead.still && ahead.gap < 16;
-        if ((blocked || c.side !== 0) && laneClear(c, obstacles, other)) {
-          c.side = other;
-          c.laneTimer = 2.5;
-          carrotPoint(c);
-          // too close behind the obstruction to swing out: back up first, if there is room to
-          if (blocked && ahead.gap < 5 && gapAlong(c, obstacles, 0, true).gap > 2.5) c.reverse = 2.2;
-        }
-      }
-
-      // Where to steer: at the carrot, except while still well out of its lane, when it aims
-      // at the lane just ahead of its own nose so it gets across before it gets along.
-      let aimX = c.cx;
-      let aimZ = c.cz;
-      if (c.phase === 'road') {
-        const [dx, dz] = DIRS[c.d];
-        const [rx, rz] = rightOf(DIRS[c.d]);
-        const drift = (c.x - roadCenter(c.i)) * rx + (c.z - roadCenter(c.j)) * rz - LANE;
-        if (Math.abs(drift - c.side) > 1) {
-          const along = Math.min(c.t, progress + hl + 3);
-          aimX = roadCenter(c.i) + dx * along + rx * (LANE + c.side);
-          aimZ = roadCenter(c.j) + dz * along + rz * (LANE + c.side);
-        }
-      }
-      const target = wrapAngle(Math.atan2(aimX - c.x, aimZ - c.z) - c.h);
-      let want;
-      if (c.reverse > 0) {
-        // backing away from the obstruction, nose swinging toward the lane it will take
-        c.reverse -= dt;
-        const back = gapAlong(c, obstacles, 0, true).gap;
-        want = back > 2 ? -2.4 : 0; // boxed in from behind: it just has to wait
-        if (ahead.gap > 6.5 || (back <= 2 && Math.abs(c.speed) < 0.1)) c.reverse = 0;
-        // swing the nose toward the lane it wants; when only making room, back straight
-        c.steer = approach(c.steer, c.yielding ? 0 : Math.max(-0.6, Math.min(0.6, -target * 2.5)), 2.5 * dt);
-        if (c.reverse <= 0) c.yielding = false;
-      } else {
-        const cornering = 1 - 0.55 * Math.min(1, Math.abs(target) / 0.7);
-        const cruise = (c.phase === 'road' ? c.cruise : Math.min(c.cruise, 7)) * cornering;
-        want = Math.min(cruise, Math.sqrt(10 * Math.max(0, room)));
-        c.steer = approach(c.steer, Math.max(-0.6, Math.min(0.6, target * 1.8)), 2.5 * dt);
-      }
-      if (c.jacked) want = 0; // someone has hold of the door
-      if (c.model.flats && c.model.flats.length) want *= 0.45; // limping on a flat tyre
-      c.speed = approach(c.speed, want, (Math.abs(want) < Math.abs(c.speed) ? 12 : 4) * dt);
-      // Never off the road. Backing up, or out in the middle of a block, a vehicle whose
-      // leading end would mount the kerb stops short of it (and, nose to the kerb, backs
-      // off to line itself up again).
-      const leading = Math.sign(c.speed) * (hl + 0.4);
-      const midBlock = c.phase === 'road' && progress > JUNCTION + 6 && progress < CELL - JUNCTION - 6;
-      if (c.speed !== 0 && (c.speed < 0 || midBlock)
-        && !onStreet(c.x + Math.sin(c.h) * leading, c.z + Math.cos(c.h) * leading, c.model.dims.hw * 0.6)) {
-        const nosing = c.speed > 0;
-        c.speed = 0;
-        if (!nosing) c.reverse = 0;
-        else if (c.wait > 1 && c.reverse <= 0 && gapAlong(c, obstacles, 0, true).gap > 2.5) c.reverse = 1.4;
-      }
-      c.wait = Math.abs(c.speed) < 0.3 ? c.wait + dt : 0;
-
-      // the front wheels steer; the vehicle follows the arc they make
-      c.h += (c.speed / wb) * Math.tan(c.steer) * dt;
-      c.x += Math.sin(c.h) * c.speed * dt;
-      c.z += Math.cos(c.h) * c.speed * dt;
-
-      const m = c.model;
-      m.group.position.set(c.x, 0, c.z);
-      m.group.rotation.set(0, c.h, flatLean(m) + (m.moto ? -c.steer * 0.6 * Math.min(1, Math.abs(c.speed) / 8) : 0));
-      for (const pivot of m.frontPivots) pivot.rotation.y = c.steer;
-      for (const wheel of m.wheels) wheel.rotation.x += (m.spin || 1) * (c.speed / 0.38) * dt;
-      m.tailMat.color.setHex(want < c.speed - 0.1 || Math.abs(c.speed) < 0.1 ? 0xff2a2a : tailIdle);
-      if (c.driver) c.driver.visible = Math.abs(c.x - car.x) < 110 && Math.abs(c.z - car.z) < 110;
-
-      const [hx, hz] = footprint(m, c.h);
-      c.box.minX = c.x - hx;
-      c.box.maxX = c.x + hx;
-      c.box.minZ = c.z - hz;
-      c.box.maxZ = c.z + hz;
-      if (c.box.car) Object.assign(c.box.car, { x: c.x, z: c.z, h: c.h });
+      const step = trafficStep(c, dt);
+      if (step) driveTrafficCar(c, step, obstacles);
     }
+  }
+
+  function driveTrafficCar(c, dt, obstacles) {
+    const { hl, wb } = c.model.dims;
+    c.laneTimer = Math.max(0, c.laneTimer - dt);
+
+    // keep the carrot a few lengths ahead
+    const look = 5 + hl + Math.abs(c.speed) * 0.7;
+    const lead = Math.hypot(c.cx - c.x, c.cz - c.z);
+    if (lead < look) advanceCarrot(c, Math.min(look - lead, 45 * dt + 0.2));
+    const progress = c.phase === 'road' ? roadProgress(c) : 0;
+    // the junction is free again once this vehicle's tail has left it
+    if (c.hold && c.phase === 'road' && progress - hl > JUNCTION) {
+      if (junctionHolder[c.hold] === c) delete junctionHolder[c.hold];
+      c.hold = null;
+    }
+
+    const ahead = gapAlong(c, obstacles, 0, false);
+    // A vehicle is "stuck" when what blocks it is not ordinary waiting traffic: something
+    // parked in the road, or another vehicle that is itself stuck or backing up. Whoever
+    // comes up behind a stuck vehicle hangs well back, so it has room to work its way out.
+    const leadStuck = !!ahead.car && (ahead.car.stuck || ahead.car.reverse > 0);
+    c.stuck = ahead.still && ahead.gap < 5 && (!ahead.car || leadStuck);
+    let room = ahead.gap - (leadStuck ? 6 : 1.4); // metres it may still roll before it has to be stopped
+    // nose to tail in a queue that margin is right; squeezing past at an angle, test the real shapes
+    if (ahead.gap < 4.5 && !leadStuck) room = pathClear(c, obstacles) ? Math.max(room, 2) : Math.min(room, 0);
+    if (c.phase === 'road' && c.t >= CELL - JUNCTION - 1e-3 && !mayEnter(c)) {
+      // the carrot is held at the junction: stop at the line (or, if over it, at the edge)
+      const line = progress + hl > STOP_LINE + 1.5 ? CELL - JUNCTION - 0.4 : STOP_LINE;
+      room = Math.min(room, line - hl - progress);
+    }
+
+    // Lane choice, on a road only. A lane blocked by something that is not moving sends
+    // the carrot to the other lane when that is clear alongside and ahead; from the
+    // passing lane it comes back as soon as the outer lane is clear.
+    if (c.phase === 'road' && c.reverse <= 0) {
+      const [rx, rz] = rightOf(DIRS[c.d]);
+      const drift = (c.x - roadCenter(c.i)) * rx + (c.z - roadCenter(c.j)) * rz - LANE; // where it really is
+      // Stuck nose-in behind something while trying to reach the other lane: back up and
+      // have another go at the angle, like a three-point turn. With no room behind
+      // either, it stays put until whatever is boxing it in moves.
+      if (c.wait > 1 && ahead.still && ahead.gap < 4.5 && Math.abs(drift - c.side) > 1.2
+        && gapAlong(c, obstacles, 0, true).gap > 2.5) c.reverse = 1.8;
+      // sitting on the tail of a vehicle that is trying to manoeuvre: back off and give it room
+      if (c.wait > 0.5 && leadStuck && ahead.gap < 5 && gapAlong(c, obstacles, 0, true).gap > 2.5) {
+        c.reverse = 1.5;
+        c.yielding = true;
+      }
+    }
+    if (c.phase === 'road' && c.laneTimer <= 0 && c.reverse <= 0) {
+      const [rx, rz] = rightOf(DIRS[c.d]);
+      const drift = (c.x - roadCenter(c.i)) * rx + (c.z - roadCenter(c.j)) * rz - LANE;
+      const other = c.side === 0 ? PASSING_LANE : 0;
+      const blocked = ahead.still && ahead.gap < 16;
+      if ((blocked || c.side !== 0) && laneClear(c, obstacles, other)) {
+        c.side = other;
+        c.laneTimer = 2.5;
+        carrotPoint(c);
+        // too close behind the obstruction to swing out: back up first, if there is room to
+        if (blocked && ahead.gap < 5 && gapAlong(c, obstacles, 0, true).gap > 2.5) c.reverse = 2.2;
+      }
+    }
+
+    // Where to steer: at the carrot, except while still well out of its lane, when it aims
+    // at the lane just ahead of its own nose so it gets across before it gets along.
+    let aimX = c.cx;
+    let aimZ = c.cz;
+    if (c.phase === 'road') {
+      const [dx, dz] = DIRS[c.d];
+      const [rx, rz] = rightOf(DIRS[c.d]);
+      const drift = (c.x - roadCenter(c.i)) * rx + (c.z - roadCenter(c.j)) * rz - LANE;
+      if (Math.abs(drift - c.side) > 1) {
+        const along = Math.min(c.t, progress + hl + 3);
+        aimX = roadCenter(c.i) + dx * along + rx * (LANE + c.side);
+        aimZ = roadCenter(c.j) + dz * along + rz * (LANE + c.side);
+      }
+    }
+    const target = wrapAngle(Math.atan2(aimX - c.x, aimZ - c.z) - c.h);
+    let want;
+    if (c.reverse > 0) {
+      // backing away from the obstruction, nose swinging toward the lane it will take
+      c.reverse -= dt;
+      const back = gapAlong(c, obstacles, 0, true).gap;
+      want = back > 2 ? -2.4 : 0; // boxed in from behind: it just has to wait
+      if (ahead.gap > 6.5 || (back <= 2 && Math.abs(c.speed) < 0.1)) c.reverse = 0;
+      // swing the nose toward the lane it wants; when only making room, back straight
+      c.steer = approach(c.steer, c.yielding ? 0 : Math.max(-0.6, Math.min(0.6, -target * 2.5)), 2.5 * dt);
+      if (c.reverse <= 0) c.yielding = false;
+    } else {
+      const cornering = 1 - 0.55 * Math.min(1, Math.abs(target) / 0.7);
+      const cruise = (c.phase === 'road' ? c.cruise : Math.min(c.cruise, 7)) * cornering;
+      want = Math.min(cruise, Math.sqrt(10 * Math.max(0, room)));
+      c.steer = approach(c.steer, Math.max(-0.6, Math.min(0.6, target * 1.8)), 2.5 * dt);
+    }
+    if (c.jacked) want = 0; // someone has hold of the door
+    if (c.model.flats && c.model.flats.length) want *= 0.45; // limping on a flat tyre
+    c.speed = approach(c.speed, want, (Math.abs(want) < Math.abs(c.speed) ? 12 : 4) * dt);
+    // Never off the road. Backing up, or out in the middle of a block, a vehicle whose
+    // leading end would mount the kerb stops short of it (and, nose to the kerb, backs
+    // off to line itself up again).
+    const leading = Math.sign(c.speed) * (hl + 0.4);
+    const midBlock = c.phase === 'road' && progress > JUNCTION + 6 && progress < CELL - JUNCTION - 6;
+    if (c.speed !== 0 && (c.speed < 0 || midBlock)
+      && !onStreet(c.x + Math.sin(c.h) * leading, c.z + Math.cos(c.h) * leading, c.model.dims.hw * 0.6)) {
+      const nosing = c.speed > 0;
+      c.speed = 0;
+      if (!nosing) c.reverse = 0;
+      else if (c.wait > 1 && c.reverse <= 0 && gapAlong(c, obstacles, 0, true).gap > 2.5) c.reverse = 1.4;
+    }
+    c.wait = Math.abs(c.speed) < 0.3 ? c.wait + dt : 0;
+
+    // the front wheels steer; the vehicle follows the arc they make
+    c.h += (c.speed / wb) * Math.tan(c.steer) * dt;
+    c.x += Math.sin(c.h) * c.speed * dt;
+    c.z += Math.cos(c.h) * c.speed * dt;
+
+    const m = c.model;
+    m.group.position.set(c.x, 0, c.z);
+    m.group.rotation.set(0, c.h, flatLean(m) + (m.moto ? -c.steer * 0.6 * Math.min(1, Math.abs(c.speed) / 8) : 0));
+    for (const pivot of m.frontPivots) pivot.rotation.y = c.steer;
+    for (const wheel of m.wheels) wheel.rotation.x += (m.spin || 1) * (c.speed / 0.38) * dt;
+    m.tailMat.color.setHex(want < c.speed - 0.1 || Math.abs(c.speed) < 0.1 ? 0xff2a2a : tailIdle);
+    if (c.driver) c.driver.visible = Math.abs(c.x - car.x) < gq.drivers && Math.abs(c.z - car.z) < gq.drivers;
+
+    const [hx, hz] = footprint(m, c.h);
+    c.box.minX = c.x - hx;
+    c.box.maxX = c.x + hx;
+    c.box.minZ = c.z - hz;
+    c.box.maxZ = c.z + hz;
+    if (c.box.car) Object.assign(c.box.car, { x: c.x, z: c.z, h: c.h });
   }
 
   // ---------- Highway traffic ----------
@@ -7284,59 +7435,63 @@
 
   function updateHighwayTraffic(dt) {
     for (const c of highwayTraffic) {
-      const m = c.model;
-      c.stunned = Math.max(0, c.stunned - dt);
-      const { gap, speed: lead } = highwayGap(c, c.target);
-      // keep two seconds back from whatever is ahead, closing up gently
-      const safe = 6 + c.speed * 1.6;
-      let want = c.cruise;
-      if (gap < safe) want = Math.min(want, lead + (gap - 6) * 0.6);
-      if (gap < 4) want = 0;
-      if (c.stunned > 0 || c.jacked) want = 0;
-      if (m.flats && m.flats.length) want = Math.min(want, 9);
-      want = Math.max(0, want);
-      c.speed = approach(c.speed, want, (want < c.speed ? 9 : 2.5) * dt);
+      const step = trafficStep(c, dt);
+      if (step) driveHighwayCar(c, step);
+    }
+  }
 
-      // stuck behind something slower: look for a clear lane alongside, the faster one first
-      c.laneTimer = (c.laneTimer || 0) - dt;
-      if (c.laneTimer <= 0 && c.target === c.lane && gap < safe + 15 && lead < c.cruise - 3) {
-        c.laneTimer = 2;
-        const options = [c.lane - 2, c.lane + 2].filter((k) => k >= 0 && k < 6);
-        for (const k of options.sort((a, b) => a - b)) {
-          if (laneFree(c, k, 14, 30)) {
-            c.target = k;
-            break;
-          }
+  function driveHighwayCar(c, dt) {
+    const m = c.model;
+    c.stunned = Math.max(0, c.stunned - dt);
+    const { gap, speed: lead } = highwayGap(c, c.target);
+    // keep two seconds back from whatever is ahead, closing up gently
+    const safe = 6 + c.speed * 1.6;
+    let want = c.cruise;
+    if (gap < safe) want = Math.min(want, lead + (gap - 6) * 0.6);
+    if (gap < 4) want = 0;
+    if (c.stunned > 0 || c.jacked) want = 0;
+    if (m.flats && m.flats.length) want = Math.min(want, 9);
+    want = Math.max(0, want);
+    c.speed = approach(c.speed, want, (want < c.speed ? 9 : 2.5) * dt);
+
+    // stuck behind something slower: look for a clear lane alongside, the faster one first
+    c.laneTimer = (c.laneTimer || 0) - dt;
+    if (c.laneTimer <= 0 && c.target === c.lane && gap < safe + 15 && lead < c.cruise - 3) {
+      c.laneTimer = 2;
+      const options = [c.lane - 2, c.lane + 2].filter((k) => k >= 0 && k < 6);
+      for (const k of options.sort((a, b) => a - b)) {
+        if (laneFree(c, k, 14, 30)) {
+          c.target = k;
+          break;
         }
       }
-      // ease across into the target lane, and drift back toward the slow lane when it is clear
-      const goalZ = highwayLanes[c.target].z;
-      const dz = goalZ - c.z;
-      const sideways = Math.max(-1.6, Math.min(1.6, dz * 1.2)) * Math.min(1, c.speed / 6);
-      c.z += sideways * dt;
-      if (Math.abs(dz) < 0.05) {
-        c.z = goalZ;
-        c.lane = c.target;
-        if (c.laneTimer <= 0 && c.lane + 2 < 6 && laneFree(c, c.lane + 2, 20, 50) && Math.random() < 0.01) c.target = c.lane + 2;
-      }
-      c.x += c.dir * c.speed * dt;
-      // through the tunnel at one end and out of the other
-      if (c.x * c.dir > HIGHWAY.end) c.x -= c.dir * HIGHWAY.end * 2;
-
-      c.h = Math.atan2(c.dir * c.speed, sideways) || c.h;
-      if (c.speed < 0.5) c.h = c.dir > 0 ? Math.PI / 2 : -Math.PI / 2;
-      m.group.position.set(c.x, 0.04, c.z);
-      m.group.rotation.set(0, c.h, flatLean(m));
-      for (const wheel of m.wheels) wheel.rotation.x += (m.spin || 1) * (c.speed / 0.38) * dt;
-      m.tailMat.color.setHex(want < c.speed - 0.3 || c.speed < 0.1 ? 0xff2a2a : tailIdle);
-      const near = Math.abs(c.x - car.x) < 140 && Math.abs(c.z - car.z) < 140;
-      if (c.driver) c.driver.visible = near;
-      m.group.visible = Math.abs(c.x) < HIGHWAY.portal + 230;
-
-      const [hx, hz] = footprint(m, c.h);
-      Object.assign(c.box, { minX: c.x - hx, maxX: c.x + hx, minZ: c.z - hz, maxZ: c.z + hz });
-      Object.assign(c.box.car, { x: c.x, z: c.z, h: c.h });
     }
+    // ease across into the target lane, and drift back toward the slow lane when it is clear
+    const goalZ = highwayLanes[c.target].z;
+    const dz = goalZ - c.z;
+    const sideways = Math.max(-1.6, Math.min(1.6, dz * 1.2)) * Math.min(1, c.speed / 6);
+    c.z += sideways * dt;
+    if (Math.abs(dz) < 0.05) {
+      c.z = goalZ;
+      c.lane = c.target;
+      if (c.laneTimer <= 0 && c.lane + 2 < 6 && laneFree(c, c.lane + 2, 20, 50) && Math.random() < 0.01) c.target = c.lane + 2;
+    }
+    c.x += c.dir * c.speed * dt;
+    // through the tunnel at one end and out of the other
+    if (c.x * c.dir > HIGHWAY.end) c.x -= c.dir * HIGHWAY.end * 2;
+
+    c.h = Math.atan2(c.dir * c.speed, sideways) || c.h;
+    if (c.speed < 0.5) c.h = c.dir > 0 ? Math.PI / 2 : -Math.PI / 2;
+    m.group.position.set(c.x, 0.04, c.z);
+    m.group.rotation.set(0, c.h, flatLean(m));
+    for (const wheel of m.wheels) wheel.rotation.x += (m.spin || 1) * (c.speed / 0.38) * dt;
+    m.tailMat.color.setHex(want < c.speed - 0.3 || c.speed < 0.1 ? 0xff2a2a : tailIdle);
+    if (c.driver) c.driver.visible = Math.abs(c.x - car.x) < gq.drivers && Math.abs(c.z - car.z) < gq.drivers;
+    m.group.visible = Math.abs(c.x) < HIGHWAY.portal + 230;
+
+    const [hx, hz] = footprint(m, c.h);
+    Object.assign(c.box, { minX: c.x - hx, maxX: c.x + hx, minZ: c.z - hz, maxZ: c.z + hz });
+    Object.assign(c.box.car, { x: c.x, z: c.z, h: c.h });
   }
 
   // --- drivers ---
@@ -7388,6 +7543,7 @@
       const template = chosen || pick(npcTemplates);
       const body = THREE.SkeletonUtils.clone(template.scene);
       figure.userData.template = template; // so the same person can be turned out onto the road
+      body.traverse((o) => { o.castShadow = false; }); // sat inside: the vehicle's shadow covers him
       figure.add(body);
       figure.position.set(seat[1], model.seatY - 0.9, seat[0] - 0.12);
       const bone = (name) => body.getObjectByName(name);
@@ -8443,9 +8599,20 @@
       const pace = scripted ? w.actSpeed || 0 : w.state === 'goto' ? 2.3 : Math.abs(w.speed);
       w.moving += ((scripted ? w.actMove || 0 : walking && !(w.state === 'walk' && w.paused) ? 1 : 0) - w.moving) * Math.min(1, 10 * dt);
       w.running = (w.running || 0) + ((Math.abs(pace) > 3 ? 1 : 0) - (w.running || 0)) * Math.min(1, 6 * dt);
+      if (!w.skin) {
+        const far = w.isPerson ? gq.people : gq.dogs;
+        g.visible = Math.abs(g.position.x - car.x) < far && Math.abs(g.position.z - car.z) < far;
+      }
       if (w.skin) {
-        // only people near the player are drawn and animated
-        g.visible = Math.abs(g.position.x - car.x) < 140 && Math.abs(g.position.z - car.z) < 140;
+        // only people near the player are drawn and animated, and only the nearest cast a shadow
+        const dx = g.position.x - car.x;
+        const dz = g.position.z - car.z;
+        g.visible = Math.abs(dx) < gq.people && Math.abs(dz) < gq.people;
+        const shadow = g.visible && dx * dx + dz * dz < gq.shadowPeople * gq.shadowPeople;
+        if (w.shadowed !== shadow) {
+          w.shadowed = shadow;
+          g.traverse((o) => { if (o.isMesh) o.castShadow = shadow; });
+        }
         if (g.visible) {
           const run = w.skin.run ? w.running : 0;
           w.skin.walk.setEffectiveWeight(w.moving * (1 - run));
@@ -8460,8 +8627,8 @@
           if (w.pose || w.rig) poseWalker(w, w.pose);
         }
       } else if (w.isPerson) {
-        animateGait(w, w.phase, w.moving, 0, dt);
-      } else if (walking) {
+        if (g.visible) animateGait(w, w.phase, w.moving, 0, dt);
+      } else if (walking && g.visible) {
         const swing = Math.sin(w.phase) * 0.6;
         w.legs.forEach((leg, i) => {
           leg.rotation.x = i % 2 ? -swing : swing;
@@ -8669,6 +8836,11 @@
   }
 
   function updateAnimals(dt) {
+    if (picnic.on) {
+      // the jungle's own animals have the hills (see the picnic section)
+      for (const a of animals) a.group.visible = false;
+      return;
+    }
     const playerSpeed = Math.hypot(car.vx, car.vz);
     for (const a of animals) {
       if (a.down > 0) {
@@ -9227,6 +9399,7 @@
       dot(p.x, p.z, 6, '#fff');
       dot(p.x, p.z, 4.5, flash ? '#ff2020' : '#2060ff');
     }
+    drawPicnicMap(g, at, size);
     // the player: an arrow pointing the way they face
     const [px, py] = at(car.x, car.z, false);
     g.save();
@@ -9506,7 +9679,7 @@
     const onFoot = mode === 'foot';
     const speed = Math.hypot(car.vx, car.vz);
     const airborne = onFoot && !hero.climb && !act && car.y > groundAt(car.x, car.z, car.y) + 0.05;
-    const moving = onFoot && !hero.climb && !airborne && speed > 0.3;
+    const moving = onFoot && !hero.climb && !airborne && speed > 0.3 && picnic.crawl < 0.5; // (a crawl is all overlay)
 
     // --- base clips: stand and breathe, walk, or run, cross-faded by speed
     const run = moving ? Math.max(0, Math.min(1, (speed - WALK_SPEED) / (RUN_SPEED - WALK_SPEED))) : 0;
@@ -9567,6 +9740,7 @@
       const falling = hero.jetpack ? 0 : smooth((-car.vy - 5) / 5);
       for (const key of new Set([...Object.keys(leap), ...Object.keys(flail)])) want[key] = (leap[key] || 0) * (1 - falling) + (flail[key] || 0) * falling;
     }
+    if (onFoot && !act && !hero.dead && !hero.down) picnicPose(want, dt); // crawling, carrying, chopping, working
     const fighting = hero.fightPose && onFoot && !act && !hero.dead && !hero.down && !hero.climb;
     const fallen = onFoot && !act && hero.collapse && (hero.dead || hero.down);
     if (hero.fade && (fallen || !onFoot)) hero.fade = null;
@@ -9590,7 +9764,7 @@
         want[key] = v * g * (key.startsWith('leg') || key.startsWith('knee') || key === 'crouch' ? legs : 1);
       }
     } else if (onFoot && !hero.climb) {
-      if (hero.weapon !== 'fist') {
+      if (hero.weapon === 'gun' || (hero.weapon === 'bow' && !inHand.bow)) {
         want.armR = -Math.PI / 2 - hero.pitch + 0.12; // straight out along the aim
         want.foreR = 0;
       } else if (hero.punch > 0) {
@@ -9661,6 +9835,13 @@
         aimTowards(b[key].bone, b[child].bone, m.group, dir, hero.fight.guard);
       }
     }
+    // the picnic bow drawn by both arms, and whatever tool is in hand
+    if (inHand.bow && onFoot && !fallen) {
+      poseBow(m, b);
+      poseTools(m, b);
+    } else if (inHand.bow) {
+      hideHeld();
+    }
     // in a car nothing shows below the window line, so the legs are tucked out of sight
     const tucked = mode === 'car' && !player.moto ? 0.01 : 1;
     b.legR.bone.scale.setScalar(tucked);
@@ -9672,7 +9853,7 @@
 
     // --- weapon in the right hand
     k.gun.visible = onFoot && hero.weapon === 'gun';
-    k.bow.visible = onFoot && hero.weapon === 'bow';
+    k.bow.visible = onFoot && hero.weapon === 'bow' && !inHand.bow;
     if (k.gun.visible || k.bow.visible) {
       const held = k.gun.visible ? k.gun : k.bow;
       m.group.updateWorldMatrix(true, false);
@@ -9779,8 +9960,10 @@
       return;
     }
 
-    const ahead = (held('KeyW', 'ArrowUp') ? 1 : 0) - (held('KeyS', 'ArrowDown') ? 1 : 0);
-    const strafe = (held('KeyD') ? 1 : 0) - (held('KeyA') ? 1 : 0);
+    // (busy with something in picnic mode, or asleep, he stays where he is)
+    const still = picnic.on && (picnic.task || picnic.sleep || picnic.tipsOpen);
+    const ahead = still ? 0 : (held('KeyW', 'ArrowUp') ? 1 : 0) - (held('KeyS', 'ArrowDown') ? 1 : 0);
+    const strafe = still ? 0 : (held('KeyD') ? 1 : 0) - (held('KeyA') ? 1 : 0);
     const fx = Math.sin(hero.yaw);
     const fz = Math.cos(hero.yaw);
     let mx = fx * ahead - fz * strafe; // the hero's right is (-fz, fx)
@@ -9790,11 +9973,14 @@
     const flying = hero.jetpack && car.y > groundAt(car.x, car.z, car.y) + 0.02;
     // running costs breath, and out of it he walks. Breaking into a run ends a fight at
     // once (only a blow already on its way is let finish); squared up, he steps lighter.
+    // Crawling, carrying a deer, drawing the bow or worn out (picnic mode), he cannot run.
     const swinging = hero.fight.move && !hero.fight.move.landed;
-    const canRun = shift && length > 0 && !hero.exhausted && hero.landing <= 0 && !swinging && !hero.fight.react;
+    const hampered = picnic.crawling || picnic.carry || (hero.draw && hero.draw.raise > 0) || (picnic.on && picnic.energy < 12);
+    const canRun = shift && length > 0 && !hero.exhausted && hero.landing <= 0 && !swinging && !hero.fight.react && !hampered;
     const fighting = !canRun && hero.fight.guard > 0.6;
     const busy = !canRun && (hero.fight.move || hero.fight.react) ? 0.35 : 1; // little ground covered mid-punch
-    const pace = (flying ? JETPACK_SPEED : canRun ? RUN_SPEED : fighting ? WALK_SPEED * 0.8 : WALK_SPEED) * busy;
+    const slow = picnic.crawling ? 0.4 : picnic.carry ? 0.8 : hero.draw && hero.draw.raise > 0.5 ? 0.55 : picnic.on && picnic.energy <= 0 ? 0.65 : 1;
+    const pace = (flying ? JETPACK_SPEED : canRun ? RUN_SPEED : fighting ? WALK_SPEED * 0.8 : WALK_SPEED) * busy * slow;
     hero.sprinting = canRun && length > 0 && !flying;
     if (length > 0) {
       mx = (mx / length) * pace;
@@ -9835,7 +10021,10 @@
       }
     } else {
       airborne = settle(dt);
-      if (!airborne && held('Space')) {
+      if (!airborne && held('Space') && picnic.crawling) {
+        setCrawl(false); // Space stands him up from a crawl
+        keys.delete('Space');
+      } else if (!airborne && held('Space') && !picnic.carry && !still) {
         // Space climbs onto a ledge in front if there is one, otherwise jumps
         const ledge = findLedge(Math.sin(hero.facing), Math.cos(hero.facing)); // climbs what he faces
         if (ledge) {
@@ -9852,15 +10041,20 @@
     // The body turns to face the way it is moving, whichever way the camera looks. With a
     // weapon out, or mid-punch, it squares up to the crosshair instead.
     updateHeroFight(dt, length > 0, canRun);
-    const aiming = hero.weapon !== 'fist' || hero.punch > 0;
+    // (the camp tools and the picnic bow only square him up while in use; drawing the bow
+    // he stands side-on, his left shoulder to the target)
+    const drawing = realBow() && hero.draw && hero.draw.raise > 0;
+    const inUse = hero.chop || hero.punch > 0 || (TOOLS[hero.weapon] && hero.weapon !== 'bow' ? hero.weapon === 'torch' : hero.weapon !== 'fist' && !realBow());
+    const aiming = inUse || drawing;
     // squared up for a fight he keeps facing his man (updateHeroFight turns him)
     const squared = hero.fight.guard > 0.4 && (hero.fight.move || hero.fight.react || length === 0);
-    const heading = aiming ? hero.yaw : squared ? hero.facing : length > 0 ? Math.atan2(mx, mz) : hero.facing;
-    hero.facing += wrapAngle(heading - hero.facing) * Math.min(1, 12 * dt);
+    const heading = drawing ? hero.yaw - 1.25 * Math.min(1, hero.draw.raise * 1.4) : aiming ? hero.yaw : squared ? hero.facing : length > 0 ? Math.atan2(mx, mz) : hero.facing;
+    hero.facing += wrapAngle(heading - hero.facing) * Math.min(1, (picnic.crawling ? 5 : 12) * dt);
 
     const m = hero.model;
     m.group.position.set(car.x, car.y, car.z);
     m.group.rotation.set(0, hero.facing, 0); // upright, whatever came before
+    crawlPlacement(m);
     const moving = length > 0 ? 1 : 0;
     hero.run += ((pace === RUN_SPEED ? 1 : 0) - hero.run) * Math.min(1, 7 * dt);
     hero.phase += moving * (9 + 4 * hero.run) * dt;
@@ -10716,11 +10910,23 @@
   }
 
   function setWeapon(name) {
+    // the camp tools come out of the camper's storage first
+    if (TOOLS[name] && picnic.on && !picnic.tools.has(name)) {
+      showToast(`The ${TOOLS[name].name.toLowerCase()} is still in the camper's storage`, true);
+      return;
+    }
+    if (TOOLS[name] && name !== 'bow' && !picnic.on) return;
     hero.weapon = name;
+    hero.draw = null;
+    hero.chop = null;
     hero.model.gun.visible = name === 'gun';
-    hero.model.bow.visible = name === 'bow';
-    $('weapon').textContent = { fist: 'Fist', gun: 'Gun', bow: 'Bow' }[name];
-    $('weapon').parentElement.dataset.kind = name; // its icon
+    hero.model.bow.visible = name === 'bow' && !inHand.bow;
+    $('weapon').textContent = { fist: 'Fist', gun: 'Gun', bow: 'Bow', axe: 'Axe', torch: 'Torch', knife: 'Knife', hammer: 'Hammer' }[name];
+    const chip = $('weapon').parentElement;
+    chip.dataset.kind = name; // its icon
+    // the camp tools show a picture of the tool itself
+    chip.querySelector('.icon').style.backgroundImage = icons[name] && TOOLS[name] ? `url(${icons[name]})` : '';
+    chip.querySelector('.icon').style.backgroundSize = icons[name] && TOOLS[name] ? 'contain' : '';
   }
 
   // Hits the nearest person or dog within arm's reach in front of the hero.
@@ -10777,9 +10983,23 @@
       }
     }
     for (const a of animals) {
-      if (a.down > 0) continue;
+      if (a.down > 0 || picnic.on) continue;
       const size = a.sp.girth + 0.45;
       yield { x: a.x, y: a.y + a.sp.leg + a.sp.girth * 0.8, z: a.z, r: size, animal: a };
+    }
+    // the jungle's animals: the head, and the body as two spheres along it
+    if (picnic.on) {
+      for (const b of picnic.beasts) {
+        if (b.dead || !b.group.visible) continue;
+        const sp = b.sp;
+        if (b.head) {
+          b.head.getWorldPosition(wheelPoint);
+          yield { x: wheelPoint.x, y: wheelPoint.y, z: wheelPoint.z, r: 0.2, beast: b, head: true };
+        }
+        for (const along of [sp.half * 0.45, -sp.half * 0.4]) {
+          yield { x: b.x + Math.sin(b.h) * along, y: b.y + sp.high * 0.72 - (b.low ? 0.12 : 0), z: b.z + Math.cos(b.h) * along, r: sp.girth + 0.08, beast: b };
+        }
+      }
     }
   }
 
@@ -10801,6 +11021,10 @@
     if (t.animal) {
       t.animal.down = KNOCKED_SECONDS;
       t.animal.group.rotation.z = Math.PI / 2;
+      return;
+    }
+    if (t.beast) {
+      hurtBeast(t.beast, damage, dirX, dirZ, t.head);
       return;
     }
     const w = t.walker;
@@ -10861,11 +11085,35 @@
   const arrowMat = new THREE.MeshBasicMaterial({ color: 0x3a2a18 });
 
   function fire() {
-    if (mode !== 'foot' || hero.dead || hero.down || act) return;
-    if (hero.weapon === 'fist') {
-      heroAttack();
+    if (mode !== 'foot' || hero.dead || hero.down || act || picnic.inside) return;
+    if (picnic.build) {
+      placeBuild();
       return;
     }
+    if (hero.weapon === 'fist') {
+      if (!picnic.carry) heroAttack();
+      return;
+    }
+    // the camp tools: the axe swings (and fells trees), the knife stabs; the bow from the
+    // picnic kit is drawn by holding the button (see startDraw)
+    if (hero.weapon === 'axe') {
+      chopSwing();
+      return;
+    }
+    if (hero.weapon === 'knife') {
+      if (hero.cooldown > 0) return;
+      hero.cooldown = 0.5;
+      hero.punch = PUNCH_SECONDS;
+      const beast = beastInFront(1.8);
+      if (beast) {
+        hurtBeast(beast, 22, Math.sin(hero.facing), Math.cos(hero.facing), false);
+        playPunch(false, 0.8);
+      } else {
+        playWhoosh();
+      }
+      return;
+    }
+    if (hero.weapon === 'hammer' || hero.weapon === 'torch' || realBow()) return;
     if (hero.cooldown > 0) return;
     const origin = camera.position;
     camera.getWorldDirection(aimDir);
@@ -10917,19 +11165,28 @@
       if (a.stuck) continue;
 
       const p = a.mesh.position;
+      arrowFrom.copy(p);
       a.velocity.y -= GRAVITY * 0.5 * dt;
       p.addScaledVector(a.velocity, dt);
       a.mesh.lookAt(p.x + a.velocity.x, p.y + a.velocity.y, p.z + a.velocity.z);
 
+      // anything the arrow passed through this frame (a fast arrow covers a metre or more)
       let hit = null;
+      const margin = a.picnic ? 0.1 : 0.4;
+      arrowStep.copy(p).sub(arrowFrom);
+      const stepLength = arrowStep.length() || 1e-6;
       for (const t of shootables()) {
-        if (Math.hypot(t.x - p.x, t.y - p.y, t.z - p.z) < t.r + 0.4) {
+        const along = Math.max(0, Math.min(stepLength, ((t.x - arrowFrom.x) * arrowStep.x + (t.y - arrowFrom.y) * arrowStep.y + (t.z - arrowFrom.z) * arrowStep.z) / stepLength));
+        const k = along / stepLength;
+        if (Math.hypot(t.x - (arrowFrom.x + arrowStep.x * k), t.y - (arrowFrom.y + arrowStep.y * k), t.z - (arrowFrom.z + arrowStep.z * k)) < t.r + margin) {
           hit = t;
-          break;
+          if (t.head) break; // a head shot counts first
         }
       }
       if (hit) {
-        applyHit(hit, 60, a.velocity.x, a.velocity.z);
+        // a bow arrow hits as hard as it was drawn
+        applyHit(hit, a.picnic ? 38 + 75 * a.power : 60, a.velocity.x, a.velocity.z);
+        if (hit.beast) playArrowHit();
         a.life = 0;
         continue;
       }
@@ -10938,9 +11195,19 @@
         p.y > (b.minY ?? 0) && p.y < (b.maxY ?? 3));
       if (inWall || p.y <= terrain(p.x, p.z) + 0.05) {
         a.stuck = true;
-        a.life = Math.min(a.life, 5);
+        a.life = Math.min(a.life, a.picnic && picnic.on ? 120 : 5); // a picnic arrow stays to be picked up
+        if (a.picnic) {
+          p.addScaledVector(a.velocity, -0.25 / a.velocity.length()); // only its point goes in
+          playArrowHit(0.4);
+        }
       }
     }
+  }
+  const arrowFrom = new THREE.Vector3();
+  const arrowStep = new THREE.Vector3();
+  function playArrowHit(volume = 1) {
+    burst('lowpass', 520, 0.3 * volume, 0.08);
+    burst('bandpass', 1700, 0.12 * volume, 0.04, 0, 2);
   }
 
   // ---------- Fire, smoke and explosions ----------
@@ -11014,6 +11281,7 @@
   let flameCloud = null;
 
   function puff(cloud, x, y, z, o) {
+    cloud.awake = true;
     const p = cloud.list[cloud.next];
     cloud.next = (cloud.next + 1) % cloud.list.length;
     Object.assign(p, {
@@ -11026,6 +11294,9 @@
 
   function updateClouds(dt) {
     for (const cloud of [smokeCloud, flameCloud]) {
+      cloud.points.visible = !!cloud.awake;
+      if (!cloud.awake) continue; // all burnt out: nothing to move, nothing to upload
+      let live = 0;
       const geo = cloud.points.geometry;
       const pos = geo.attributes.position.array;
       const size = geo.attributes.size.array;
@@ -11037,6 +11308,7 @@
           return;
         }
         p.life -= dt;
+        live += 1;
         const k = 1 - Math.max(0, p.life) / p.max; // 0 new, 1 gone
         const drag = Math.exp(-p.drag * dt);
         p.vx *= drag;
@@ -11057,6 +11329,7 @@
       geo.attributes.alpha.needsUpdate = true;
       geo.attributes.shade.needsUpdate = true;
       cloud.points.material.uniforms.scale.value = renderer.domElement.height / (2 * Math.tan((camera.fov * Math.PI) / 360));
+      if (!live) cloud.awake = false;
     }
   }
 
@@ -11066,7 +11339,7 @@
   // good crash takes at most a third of it, so the first big hit leaves it smoking grey,
   // the second smoking thick and black out of the bonnet and the cabin, and the third sets
   // it on fire; the fire takes a few seconds to grow, and then it explodes.
-  const VEHICLE_HEALTH = { bus: 1700, truck: 1500, moto: 550, sports: 950 };
+  const VEHICLE_HEALTH = { bus: 1700, truck: 1500, moto: 550, sports: 950, rv: 1500 };
   const vehicleHealth = (model) => VEHICLE_HEALTH[model.kind] || 1000;
   const CRASH_SHARE = 0.36; // the most one crash can take
   const FUSE = 5.5; // seconds from catching fire to going up
@@ -11464,12 +11737,15 @@
   const STAMINA_RUN = 15; // per second spent running
   const STAMINA_BACK = 22; // per second recovered standing still (less when walking)
 
+  const healthBar = $('health-bar');
+  const staminaBar = $('stamina-bar');
+  const painFrame = $('pain');
+  let painLevel = 0; // the red at the edge of the screen: 0 to 1, fading
   function hurtHero(amount, cause, dx = 0, dz = 0) {
     if (hero.dead || amount <= 0) return;
     hero.health -= amount;
     hero.lastHurt = clock;
-    const pain = $('pain');
-    pain.style.opacity = Math.min(0.85, 0.25 + amount / 60);
+    painLevel = Math.max(painLevel, Math.min(0.85, 0.25 + amount / 60));
     if (hero.health <= 0) killHero(cause, dx, dz);
   }
 
@@ -11545,13 +11821,12 @@
     hero.landing = Math.max(0, hero.landing - dt);
 
     const health = Math.max(0, hero.health);
-    $('health-bar').style.width = `${health}%`;
-    $('health-bar').parentElement.classList.toggle('low', health < 25);
-    $('stamina-bar').style.width = `${hero.stamina}%`;
-    $('stamina-bar').parentElement.classList.toggle('low', hero.exhausted);
-    const pain = $('pain');
-    const fade = Math.max(health < 25 ? 0.3 : 0, Number(pain.style.opacity || 0) - dt * 1.2);
-    pain.style.opacity = fade;
+    show('health', Math.round(health), (v) => { healthBar.style.width = `${v}%`; });
+    show('healthLow', health < 25, (v) => healthBar.parentElement.classList.toggle('low', v));
+    show('stamina', Math.round(hero.stamina), (v) => { staminaBar.style.width = `${v}%`; });
+    show('tired', hero.exhausted, (v) => staminaBar.parentElement.classList.toggle('low', v));
+    painLevel = Math.max(health < 25 ? 0.3 : 0, painLevel - dt * 1.2);
+    show('pain', Math.round(painLevel * 50) / 50, (v) => { painFrame.style.opacity = v; });
 
     if (hero.dead) {
       hero.dead.t += dt;
@@ -11596,7 +11871,30 @@
     hero.model.group.rotation.set(0, hero.facing, 0);
     setWanted(0);
     $('wasted').hidden = true;
+    if (picnic.on) respawnAtCamp();
     updateCamera(0, 0, true);
+  }
+
+  // In picnic mode you come round at the camp: by the fire if there is one, else by the
+  // camper, a little hungry, with what you carried (except a kill on your shoulders).
+  function respawnAtCamp() {
+    if (picnic.carry) {
+      picnic.carry.carried = false;
+      jungle.group.add(picnic.carry.group);
+      picnic.carry = null;
+    }
+    picnic.crawling = false;
+    picnic.crawl = 0;
+    picnic.task = null;
+    hero.draw = null;
+    hero.chop = null;
+    const fire = picnic.structures.find((s) => s.kind === 'bonfire');
+    const rv = camperAt();
+    const at = fire ? { x: fire.x + 2.5, z: fire.z } : rv ? { x: camperWorld(rv, CAMPER_DOOR.x + 1, 0)[0], z: camperWorld(rv, CAMPER_DOOR.x + 1, 0)[1] } : { x: CAMP.x, z: CAMP.z };
+    Object.assign(car, { x: at.x, z: at.z, y: groundAt(at.x, at.z, terrain(at.x, at.z) + 2) });
+    picnic.energy = Math.max(picnic.energy, 40);
+    hero.model.group.position.set(car.x, car.y, car.z);
+    setGuide('You came round at the camp. Rest and eat before heading out again', 'warn', 6);
   }
 
   const heroBone = (key) => hero.skin && hero.skin.bones[key] && hero.skin.bones[key].bone;
@@ -13116,6 +13414,4193 @@
     for (const flame of hero.model.flames) flame.visible = false;
   }
 
+  // ---------- Picnic: the camper, the jungle camp and survival ----------
+
+  // Picnic mode is off unless it is switched on (the button at the top right, or J). Then a
+  // camper van turns up beside you, the main hill turns to dense jungle crossed by a dirt
+  // road, and the clearing on its summit is yours to camp in: gather branches and stones
+  // for a fire, fell trees for logs, build a palisade and a raised platform, hunt deer with
+  // the bow, carry them back and cook them. The jungle has rings: deer within 200 m of the
+  // camp, bears beyond that, tigers past 400 m, and after dark the bears and tigers come
+  // hunting. What you carry, what you have built and where you left off are kept in the
+  // browser's IndexedDB, and picnic mode picks up where it was left next time.
+  //
+  // The camper, the camp kit, the plants and the animals are real models (picnic-models.js,
+  // a large file): the page only fetches it when picnic mode is first switched on.
+
+  const CAMP = { x: HILLS[0].x, z: HILLS[0].z, clear: 44 }; // the summit clearing, kept free of jungle
+  const ZONE_RINGS = { camp: 60, deer: 200, bear: 400 }; // how far each ring reaches from the camp
+  const ZONES = {
+    camp: {
+      name: 'Camp clearing', level: 0,
+      tips: [
+        'Set up camp here in the open, with the camper close by: you can lock yourself in it.',
+        'Light a fire before dusk and keep it fed. Bears will not come near the flames.',
+        'Build the palisade all the way round, gate included: nothing gets through it.',
+        'Tigers climb trees and leap low walls. Sleep on the raised platform, not in a tree.',
+        'Hunting and felling trees use up energy. Eat fruit or cooked meat, or rest a minute.',
+      ],
+    },
+    deer: {
+      name: 'Deer woods', level: 1,
+      tips: [
+        'Deer graze here by day, with fruit and fallen branches all about.',
+        'They hear you running a long way off. Walk, or crawl (C) through the undergrowth.',
+        'In among ferns and bushes you are almost invisible to them.',
+        'Arrows drop with distance: aim a little high at long range. Draw fully for power.',
+      ],
+    },
+    bear: {
+      name: 'Bear country', level: 2,
+      tips: [
+        'Brown bears roam past 200 m from camp. Never run from one: back away slowly.',
+        'A bear you surprise up close will charge. It takes several arrows to stop it.',
+        'They fear fire, and a fence keeps them out. At night they follow your scent to camp.',
+      ],
+    },
+    tiger: {
+      name: 'Tiger territory', level: 3,
+      tips: [
+        'Tigers live past 400 m from camp. They stalk from cover and sprint far faster than you can run.',
+        'A tiger climbs trees and leaps low walls: a tree is no escape.',
+        'Keep out of here at dusk and at night. If one stalks you, face it and back away.',
+        'Only a full palisade or the raised platform keeps a tiger out.',
+      ],
+    },
+  };
+
+  // Is (x, z) in the jungle: the hills' wild land, not the edge of the city.
+  const inJungle = (x, z) => x > HILL_BOUNDS.minX && x < HILL_BOUNDS.maxX && z > HILL_BOUNDS.minZ && z < HILL_BOUNDS.maxZ && !(x > -300 && z < 300);
+  function zoneAt(x, z) {
+    if (!inJungle(x, z)) return null;
+    const d = Math.hypot(x - CAMP.x, z - CAMP.z);
+    return d < ZONE_RINGS.camp ? 'camp' : d < ZONE_RINGS.deer ? 'deer' : d < ZONE_RINGS.bear ? 'bear' : 'tiger';
+  }
+
+  // Things carried, counted; and tools, owned or not.
+  const ITEMS = {
+    branch: { name: 'Dry branches' }, stone: { name: 'Stones' }, log: { name: 'Logs' }, leaves: { name: 'Big leaves' },
+    mango: { name: 'Mangoes', food: 16 }, banana: { name: 'Bananas', food: 12 },
+    meat: { name: 'Raw meat' }, cooked: { name: 'Cooked meat', food: 40, heal: 18 },
+    arrow: { name: 'Arrows' }, petrol: { name: 'Petrol', unit: 'L' }, gas: { name: 'Stove gas', unit: 'uses' },
+    bolts: { name: 'Nuts & bolts' }, hide: { name: 'Hides' },
+  };
+  const TOOLS = {
+    axe: { name: 'Axe', key: '3' }, torch: { name: 'Torch', key: '4' }, knife: { name: 'Knife', key: '5' }, hammer: { name: 'Hammer', key: '6' },
+    bow: { name: 'Bow', key: '2' }, screwdriver: { name: 'Screwdriver' }, pot: { name: 'Cooking pots' }, tent: { name: 'Camp kit' },
+    lantern: { name: 'Lantern' },
+  };
+  // the camper's storage when you first set off
+  const RV_KIT = { tools: ['axe', 'hammer', 'screwdriver', 'torch', 'knife', 'pot', 'tent', 'lantern', 'bow'], items: { arrow: 16, petrol: 20, gas: 12, bolts: 70 } };
+
+  // What can be built at camp, and what it takes. The palisade goes up a section at a time,
+  // the platform in stages; the rest at once.
+  const BUILDS = {
+    bonfire: { name: 'Bonfire', cost: { branch: 6, stone: 8 }, time: 2.5, radius: 1.4 },
+    tent: { name: 'Tent', need: 'tent', cost: {}, time: 4, radius: 2.2 },
+    palisade: { name: 'Palisade fence', need: 'hammer', section: { log: 1, bolts: 2 }, gate: { log: 2, bolts: 6 }, sections: 18, ring: 10, radius: 10.6 },
+    platform: {
+      name: 'Raised platform', need: 'hammer', radius: 2.6,
+      stages: [
+        { name: 'posts', cost: { log: 4, bolts: 4 }, time: 3 },
+        { name: 'deck and stairs', cost: { log: 4, bolts: 10 }, time: 3.5, need: 'screwdriver' },
+        { name: 'leaf roof', cost: { leaves: 8, log: 1 }, time: 3 },
+      ],
+    },
+    bench: { name: 'Log bench', need: 'hammer', cost: { log: 2, bolts: 4 }, time: 3, radius: 1.2 },
+    table: { name: 'Camp table', need: 'screwdriver', cost: { log: 3, bolts: 6, leaves: 2 }, time: 4, radius: 1.3 },
+  };
+  const BUILD_ORDER = ['bonfire', 'tent', 'palisade', 'platform', 'bench', 'table'];
+  const PLATFORM_HEIGHT = 2.6;
+  const PALISADE_HEIGHT = 2.6;
+
+  const picnic = {
+    on: false, built: false, busy: false,
+    inv: {}, tools: new Set(), storage: null, energy: 100,
+    felled: new Set(), picked: new Map(), // instance ids: felled trees; picked things and the game day they come back
+    structures: [], beasts: [], carcasses: [],
+    stats: { deer: 0, bears: 0, tigers: 0, nights: 0 },
+    step: 0, seen: {}, zone: null, zoneShown: 0, wasNight: false,
+    rv: null, inside: null, carry: null, crawl: 0, crawling: false, build: null, menu: null,
+    task: null, sleep: null, saveDue: 20, dirty: false, day: 0,
+  };
+  for (const key of Object.keys(ITEMS)) picnic.inv[key] = 0;
+
+  // --- keeping it: IndexedDB, or local storage where that is not to be had ---
+
+  let picnicDbOpen = null;
+  function picnicDb() {
+    if (picnicDbOpen) return picnicDbOpen;
+    picnicDbOpen = new Promise((resolve) => {
+      try {
+        const request = window.indexedDB.open('car-drive-picnic', 1);
+        request.onupgradeneeded = () => request.result.createObjectStore('state');
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => resolve(null);
+        request.onblocked = () => resolve(null);
+      } catch (error) {
+        resolve(null);
+      }
+    });
+    return picnicDbOpen;
+  }
+
+  async function readPicnicSave() {
+    const db = await picnicDb();
+    const fromLocal = () => {
+      try {
+        return JSON.parse(localStorage.getItem('car-drive-picnic') || 'null');
+      } catch (error) {
+        return null;
+      }
+    };
+    if (!db) return fromLocal();
+    return new Promise((resolve) => {
+      try {
+        const request = db.transaction('state').objectStore('state').get('save');
+        request.onsuccess = () => resolve(request.result || fromLocal());
+        request.onerror = () => resolve(fromLocal());
+      } catch (error) {
+        resolve(fromLocal());
+      }
+    });
+  }
+
+  // Everything worth keeping, as plain data.
+  function picnicSnapshot() {
+    const rv = picnic.rv;
+    const at = picnic.inside ? picnic.inside.door : { x: car.x, y: car.y, z: car.z };
+    return {
+      version: 1, on: picnic.on, savedAt: Date.now(), day: picnic.day, hour: env.hour,
+      inv: { ...picnic.inv }, tools: [...picnic.tools], storage: picnic.storage, energy: picnic.energy, health: hero.health,
+      hero: mode === 'foot' || picnic.inside ? { x: at.x, y: at.y, z: at.z, facing: hero.facing } : null,
+      rv: rv ? { x: rv.x, y: rv.y, z: rv.z, h: rv.h, health: rv.model.health ?? null } : null,
+      felled: [...picnic.felled], picked: [...picnic.picked],
+      structures: picnic.structures.map((s) => ({ kind: s.kind, x: s.x, z: s.z, h: s.h, done: s.done, sections: s.sections, stage: s.stage, fuel: s.fuel, lit: s.lit, gateOpen: s.gateOpen })),
+      carcasses: picnic.beasts.filter((b) => b.dead && !b.butchered).map((b) => ({ species: b.species, x: b.x, z: b.z, h: b.h })),
+      stats: { ...picnic.stats }, step: picnic.step, seen: { ...picnic.seen },
+    };
+  }
+
+  async function storePicnic() {
+    picnic.dirty = false;
+    const data = picnicSnapshot();
+    try {
+      localStorage.setItem('car-drive-picnic', JSON.stringify(data)); // a quick copy, kept even if the page is closing
+    } catch (error) {
+      // storage full or unavailable: IndexedDB below still has it
+    }
+    const db = await picnicDb();
+    if (!db) return;
+    try {
+      db.transaction('state', 'readwrite').objectStore('state').put(data, 'save');
+    } catch (error) {
+      // not saved this time; the next autosave tries again
+    }
+  }
+  const picnicChanged = () => {
+    picnic.dirty = true;
+    picnic.saveDue = Math.min(picnic.saveDue, 2);
+  };
+  window.addEventListener('visibilitychange', () => {
+    if (document.hidden && (picnic.on || picnic.dirty)) storePicnic();
+  });
+  window.addEventListener('pagehide', () => {
+    if (picnic.on) {
+      try {
+        localStorage.setItem('car-drive-picnic', JSON.stringify(picnicSnapshot()));
+      } catch (error) {
+        // nothing more to be done while the page closes
+      }
+    }
+  });
+
+  // --- the models ---
+
+  const picnicModels = {}; // name -> { root, animations }
+  const picnicParts = new Map(); // "model/part" -> [{ geometry, material }]
+  let picnicLoading = null;
+
+  // Adds picnic-models.js to the page the first time it is wanted, then decodes the models
+  // one after another, a frame apart, so the game keeps moving while they come in.
+  function loadPicnicModels() {
+    if (picnicLoading) return picnicLoading;
+    picnicLoading = new Promise((resolve) => {
+      const decode = async () => {
+        const all = window.PICNIC_MODELS || {};
+        for (const [name, data] of Object.entries(all)) {
+          await new Promise((next) => setTimeout(next, 0));
+          await new Promise((done) => {
+            const text = atob(data);
+            const bytes = new Uint8Array(text.length);
+            for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
+            new THREE.GLTFLoader().parse(bytes.buffer, '', (gltf) => {
+              preparePicnicModel(name, gltf);
+              done();
+            }, (error) => {
+              console.warn(`The picnic model ${name} failed to load.`, error);
+              done();
+            });
+          });
+        }
+        delete window.PICNIC_MODELS; // decoded: the text is not needed again
+        resolve();
+      };
+      if (window.PICNIC_MODELS) {
+        decode();
+        return;
+      }
+      const tag = document.createElement('script');
+      tag.src = 'picnic-models.js';
+      tag.onload = decode;
+      tag.onerror = () => {
+        console.warn('picnic-models.js could not be loaded.');
+        resolve();
+      };
+      document.body.appendChild(tag);
+    });
+    return picnicLoading;
+  }
+
+  // Plain materials like the rest of the world's: matte, the pictures shown as painted, leaves
+  // cut out by their alpha; animals keep their skinning.
+  function preparePicnicModel(name, gltf) {
+    const root = gltf.scene;
+    const made = new Map();
+    root.traverse((o) => {
+      if (!o.isMesh) return;
+      o.castShadow = true;
+      o.receiveShadow = true;
+      const source = o.material;
+      if (!made.has(source)) {
+        if (source.map) {
+          source.map.encoding = THREE.LinearEncoding;
+          source.map.anisotropy = anisotropy();
+          madeTextures.push(source.map);
+        }
+        const cutOut = source.alphaTest > 0 || source.transparent;
+        const metal = /metal|blade|steel|knife|Sel_Red|Rope|Aluminium/i.test(source.name);
+        const options = {
+          color: source.color, map: source.map, vertexColors: !!o.geometry.attributes.color, skinning: !!o.isSkinnedMesh,
+          side: cutOut || source.side === THREE.DoubleSide ? THREE.DoubleSide : THREE.FrontSide,
+          alphaTest: cutOut ? 0.45 : 0, transparent: false,
+        };
+        const material = metal
+          ? new THREE.MeshPhongMaterial({ ...options, shininess: 60, specular: 0x666666 })
+          : new THREE.MeshLambertMaterial(options);
+        material.name = source.name;
+        if (cutOut) material.userData.snow = 'foliage';
+        if (o.isSkinnedMesh) o.frustumCulled = false; // its bounds do not follow the animation
+        made.set(source, material);
+      }
+      o.material = made.get(source);
+    });
+    picnicModels[name] = { root, animations: gltf.animations };
+  }
+
+  // One named part of a picnic model (or all of it), baked into the part's own frame and
+  // joined by material, ready to be drawn many times over: [{ geometry, material }].
+  function picnicPart(model, part = null) {
+    const key = `${model}/${part || ''}`;
+    if (picnicParts.has(key)) return picnicParts.get(key);
+    const entry = picnicModels[model];
+    const node = entry && (part ? entry.root.getObjectByName(part) : entry.root);
+    if (!node) return [];
+    entry.root.updateMatrixWorld(true);
+    const inverse = new THREE.Matrix4().copy(node.matrixWorld).invert();
+    const byMaterial = new Map();
+    node.traverse((o) => {
+      if (!o.isMesh || o.isSkinnedMesh) return;
+      const geometry = joinGeometries([o.geometry]).applyMatrix4(new THREE.Matrix4().multiplyMatrices(inverse, o.matrixWorld));
+      if (!byMaterial.has(o.material)) byMaterial.set(o.material, []);
+      byMaterial.get(o.material).push(geometry);
+    });
+    const parts = [...byMaterial].map(([material, list]) => {
+      const geometry = list.length > 1 ? joinGeometries(list) : list[0];
+      geometry.computeBoundingBox();
+      geometry.computeBoundingSphere();
+      return { geometry, material };
+    });
+    picnicParts.set(key, parts);
+    return parts;
+  }
+
+  // A copy of a part to place on its own (it shares the geometry and materials).
+  function picnicMesh(model, part = null) {
+    const group = new THREE.Group();
+    for (const { geometry, material } of picnicPart(model, part)) {
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      group.add(mesh);
+    }
+    return group;
+  }
+
+  // The size of a part: { min, max } in its own frame.
+  function picnicBounds(model, part = null) {
+    const box = new THREE.Box3();
+    for (const { geometry } of picnicPart(model, part)) box.union(geometry.boundingBox);
+    return box;
+  }
+
+  // --- the jungle ---
+
+  // Tens of thousands of plants, so each kind is drawn two ways: the real model for those
+  // near the camera (rebuilt a few times a second from a grid of cells, only those roughly
+  // in view), and for trees further off, a picture of the tree on two crossed cards, taken
+  // from the model itself once it has loaded. Undergrowth past its near distance is left
+  // to the haze and the jungle floor.
+  //   per: plants per hectare; near: metres within which the model is drawn (on High; less
+  //   on the other presets); card: drawn as a picture out to the haze; trunk: radius that
+  //   blocks you; cover: hides you while you crawl; chop: axe blows to fell it; lazy: so
+  //   many that they are only worked out, a square at a time, where you are
+  const JUNGLE_PLANTS = {
+    jungletree: { model: 'jungletree', per: 58, scale: [0.72, 1.12], near: 58, card: true, trunk: 0.85, chop: 7, logs: 4, shadow: true },
+    palm: { model: 'palm', per: 40, scale: [0.85, 1.25], near: 60, card: true, trunk: 0.32, chop: 4, logs: 2, shadow: true },
+    banana: { model: 'banana', per: 85, scale: [0.85, 1.3], near: 38, card: true, trunk: 0.16, soft: true, leaves: true },
+    monstera: { model: 'monstera', per: 150, scale: [0.75, 1.35], near: 38, cover: true, leaves: true, lazy: true },
+    fern: { model: 'fern', per: 80, scale: [0.9, 1.6], near: 30, cover: true, lazy: true },
+    fernA: { model: 'foliage', part: 'fernA', per: 480, scale: [0.9, 1.7], near: 30, cover: true, lazy: true },
+    fernB: { model: 'foliage', part: 'fernB', per: 380, scale: [0.9, 1.6], near: 30, cover: true, lazy: true },
+    grassA: { model: 'foliage', part: 'grassA', per: 520, scale: [0.8, 1.4], near: 24, lazy: true },
+    grassB: { model: 'foliage', part: 'grassB', per: 480, scale: [0.8, 1.4], near: 24, lazy: true },
+    grassC: { model: 'foliage', part: 'grassC', per: 420, scale: [0.8, 1.5], near: 22, lazy: true },
+    deadbush: { model: 'foliage', part: 'deadbush', per: 40, scale: [0.8, 1.3], near: 30, lazy: true },
+    boulder: { model: 'rocks', part: 'boulder', per: 2.5, scale: [0.7, 1.4], near: 160, trunk: 0.8, solid: true, shadow: true },
+    rock: { model: 'rocks', part: 'rock', per: 5, scale: [0.6, 1.3], near: 110, trunk: 0.5, solid: true, shadow: true },
+    slab: { model: 'rocks', part: 'slab', per: 6, scale: [0.6, 1.4], near: 80, shadow: true },
+  };
+  const JUNGLE_CELL = 32;
+  const jungle = {
+    group: new THREE.Group(), // everything drawn for the jungle; hidden when picnic mode is off
+    kinds: {}, // name -> { spec, list: [{ id, x, y, z, turn, s, gone }], cells: Map, near: [InstancedMesh], card: InstancedMesh }
+    eye: new THREE.Vector3(1e9, 0, 0), look: 0, due: 0, cardsDue: 0,
+    floor: null, // the hill ground: [{ mesh, plain, wild, material }]
+    canopyBoxes: [], // the canopy trees' trunks
+  };
+  jungle.group.visible = false;
+  scene.add(jungle.group);
+
+  // A repeatable random number from a seed, so the jungle grows the same each time.
+  const seeded = (seed) => {
+    let s = seed >>> 0;
+    return () => {
+      s = (s + 0x6d2b79f5) >>> 0;
+      let t = s;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+
+  // Is (x, z) somewhere a plant can grow: in the jungle, off the road, out of the clearing.
+  function jungleGround(x, z, keepClear = CAMP.clear) {
+    if (!inJungle(x, z) || Math.hypot(x - CAMP.x, z - CAMP.z) < keepClear) return false;
+    terrainExact(x, z);
+    if (roadDist < ROAD_FLAT + 1.5) return false;
+    return lakeEdge(x, z) > 6;
+  }
+
+  function plantJungle() {
+    const random = seeded(20251005);
+    const b = HILL_BOUNDS;
+    const area = ((b.maxX - b.minX) * (b.maxZ - b.minZ)) / 10000;
+    let id = 0;
+    for (const [name, spec] of Object.entries(JUNGLE_PLANTS)) {
+      const list = [];
+      const cells = new Map();
+      if (spec.lazy) {
+        jungle.kinds[name] = { spec, list, cells, near: [], card: null, nearCount: 0, seed: Object.keys(JUNGLE_PLANTS).indexOf(name), name };
+        continue;
+      }
+      const wanted = Math.round(spec.per * area);
+      for (let n = 0; n < wanted; n++) {
+        const x = b.minX + random() * (b.maxX - b.minX);
+        const z = b.minZ + random() * (b.maxZ - b.minZ);
+        const roll = random();
+        const turn = random() * Math.PI * 2;
+        const size = spec.scale[0] + random() * (spec.scale[1] - spec.scale[0]);
+        // trees keep back from the clearing's edge a little further than the undergrowth
+        if (!jungleGround(x, z, spec.card || spec.solid ? CAMP.clear + 6 : CAMP.clear - 4 + roll * 8)) continue;
+        const plant = { id: id++, kind: name, x, y: terrain(x, z) - 0.05, z, turn, s: size, gone: false };
+        list.push(plant);
+        const key = Math.floor(x / JUNGLE_CELL) * 8192 + Math.floor(z / JUNGLE_CELL);
+        if (!cells.has(key)) cells.set(key, []);
+        cells.get(key).push(plant);
+        if (spec.trunk) {
+          const r = spec.trunk * size;
+          plant.box = { minX: x - r, maxX: x + r, minZ: z - r, maxZ: z + r, minY: plant.y - 1, maxY: plant.y + (spec.solid ? 1.4 * size : 12), soft: spec.soft, plant };
+          if (spec.solid) plant.box.top = plant.y + 1.2 * size;
+        }
+      }
+      jungle.kinds[name] = { spec, list, cells, near: [], card: null, nearCount: 0, name };
+    }
+  }
+
+  // The undergrowth of one square of the jungle, worked out the first time it is wanted
+  // (from the square's own seed, so it is the same each time).
+  function growCell(k, cx, cz) {
+    const key = cx * 8192 + cz;
+    const list = [];
+    k.cells.set(key, list);
+    const spec = k.spec;
+    const random = seeded((key * 31 + k.seed * 7919) >>> 0);
+    const count = spec.per * (JUNGLE_CELL * JUNGLE_CELL) / 10000;
+    const n = Math.floor(count) + (random() < count % 1 ? 1 : 0);
+    for (let i = 0; i < n; i++) {
+      const x = (cx + random()) * JUNGLE_CELL;
+      const z = (cz + random()) * JUNGLE_CELL;
+      const turn = random() * Math.PI * 2;
+      const size = spec.scale[0] + random() * (spec.scale[1] - spec.scale[0]);
+      const edge = CAMP.clear - 4 + random() * 8;
+      if (!jungleGround(x, z, edge)) continue;
+      list.push({ id: key * 1000 + k.seed * 100000000 + i, kind: k.name, x, y: terrain(x, z) - 0.04, z, turn, s: size, gone: false });
+    }
+    return list;
+  }
+
+  // The plants of one kind within `reach` of (x, z).
+  function plantsNear(kind, x, z, reach, out = []) {
+    const k = jungle.kinds[kind];
+    if (!k) return out;
+    const x0 = Math.floor((x - reach) / JUNGLE_CELL);
+    const x1 = Math.floor((x + reach) / JUNGLE_CELL);
+    const z0 = Math.floor((z - reach) / JUNGLE_CELL);
+    const z1 = Math.floor((z + reach) / JUNGLE_CELL);
+    for (let cx = x0; cx <= x1; cx++) {
+      for (let cz = z0; cz <= z1; cz++) {
+        let list = k.cells.get(cx * 8192 + cz);
+        if (!list && k.spec.lazy) list = growCell(k, cx, cz);
+        if (list) for (const p of list) if (!p.gone && (p.x - x) ** 2 + (p.z - z) ** 2 < reach * reach) out.push(p);
+      }
+    }
+    return out;
+  }
+
+  // A picture of a plant from two sides, for its distant cards: the model drawn flat-lit
+  // into a texture, the front view on the left half and the side view on the right.
+  function bakeCard(spec) {
+    const parts = picnicPart(spec.model, spec.part);
+    const box = picnicBounds(spec.model, spec.part);
+    const size = box.getSize(new THREE.Vector3());
+    const w = Math.max(size.x, size.z);
+    const target = new THREE.WebGLRenderTarget(1024, 512, {
+      minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: true,
+    });
+    const studio = new THREE.Scene();
+    const flat = parts.map(({ geometry, material }) => new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
+      map: material.map, color: material.color.clone().multiplyScalar(0.92), alphaTest: 0.45, side: THREE.DoubleSide,
+    })));
+    flat.forEach((m) => studio.add(m));
+    const lens = new THREE.OrthographicCamera(-w / 2, w / 2, box.max.y, box.min.y, -100, 100);
+    const before = renderer.getRenderTarget();
+    const clear = renderer.getClearColor(new THREE.Color());
+    const alpha = renderer.getClearAlpha();
+    const autoClear = renderer.autoClear;
+    renderer.autoClear = false; // both views go into the one picture
+    renderer.setRenderTarget(target);
+    renderer.setClearColor(0x1e2a14, 0);
+    renderer.clear(true, true, false);
+    for (const [view, x, z] of [[0, 0, 1], [1, 1, 0]]) {
+      target.viewport.set(view * 512, 0, 512, 512); // (a render target keeps its own viewport)
+      renderer.setRenderTarget(target);
+      lens.position.set(x * 50, 0, z * 50);
+      lens.lookAt(0, 0, 0);
+      renderer.render(studio, lens);
+    }
+    target.viewport.set(0, 0, 1024, 512);
+    renderer.setRenderTarget(before);
+    renderer.autoClear = autoClear;
+    renderer.setClearColor(clear, alpha);
+    flat.forEach((m) => m.material.dispose());
+    // two crossed cards, each showing its own view, standing on the ground
+    const card = new THREE.BufferGeometry();
+    const h0 = box.min.y;
+    const h1 = box.max.y;
+    const hw = w / 2;
+    card.setAttribute('position', new THREE.Float32BufferAttribute([
+      -hw, h0, 0, hw, h0, 0, hw, h1, 0, -hw, h1, 0,
+      0, h0, hw, 0, h0, -hw, 0, h1, -hw, 0, h1, hw,
+    ], 3));
+    card.setAttribute('normal', new THREE.Float32BufferAttribute(new Array(8).fill([0, 1, 0]).flat(), 3)); // lit like a canopy, from above
+    card.setAttribute('uv', new THREE.Float32BufferAttribute([0, 0, 0.5, 0, 0.5, 1, 0, 1, 0.5, 0, 1, 0, 1, 1, 0.5, 1], 2));
+    card.setIndex([0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
+    const material = new THREE.MeshLambertMaterial({ map: target.texture, alphaTest: 0.5, side: THREE.DoubleSide });
+    material.userData.snow = 'foliage';
+    return { geometry: card, material, target };
+  }
+
+  // Builds the instanced meshes for every kind; they are filled in by updateJungle.
+  function buildJungleMeshes() {
+    for (const k of Object.values(jungle.kinds)) {
+      const spec = k.spec;
+      const reach = spec.near;
+      // the most that can be near at once, with room to spare
+      const room = Math.ceil((spec.per * Math.PI * reach * reach) / 10000 * 1.6) + 12;
+      for (const { geometry, material } of picnicPart(spec.model, spec.part)) {
+        const mesh = new THREE.InstancedMesh(geometry, material, room);
+        mesh.count = 0;
+        mesh.frustumCulled = false;
+        mesh.castShadow = !!spec.shadow;
+        mesh.receiveShadow = true;
+        jungle.group.add(mesh);
+        k.near.push(mesh);
+      }
+      k.room = room;
+      if (spec.card) {
+        const baked = bakeCard(spec);
+        k.card = new THREE.InstancedMesh(baked.geometry, baked.material, k.list.length);
+        k.card.count = 0;
+        k.card.frustumCulled = false;
+        k.card.receiveShadow = true;
+        jungle.group.add(k.card);
+      }
+    }
+  }
+
+  const plantMatrix = new THREE.Matrix4();
+  const plantQ = new THREE.Quaternion();
+  const plantPos = new THREE.Vector3();
+  const plantScale = new THREE.Vector3();
+  const yAxis = new THREE.Vector3(0, 1, 0);
+  function plantMatrixOf(p) {
+    plantQ.setFromAxisAngle(yAxis, p.turn);
+    return plantMatrix.compose(plantPos.set(p.x, p.y, p.z), plantQ, plantScale.setScalar(p.s));
+  }
+
+  // Which plants are drawn as models and which as cards, from where the camera is. Redone
+  // when the camera has moved or turned enough, at most a few times a second; the cards,
+  // which change less, more rarely still.
+  function updateJungle(dt, force = false) {
+    if (!jungle.group.visible) return;
+    jungle.due -= dt;
+    jungle.cardsDue -= dt;
+    const eye = camera.position;
+    camera.getWorldDirection(plantPos);
+    const look = Math.atan2(plantPos.x, plantPos.z);
+    const moved = Math.hypot(eye.x - jungle.eye.x, eye.z - jungle.eye.z);
+    const turned = Math.abs(wrapAngle(look - jungle.look));
+    if (!force && !(jungle.due <= 0 && (moved > 2.5 || turned > 0.12)) && moved < 9 && turned < 0.35) return;
+    jungle.due = 0.2;
+    jungle.eye.copy(eye);
+    jungle.look = look;
+    const lx = Math.sin(look);
+    const lz = Math.cos(look);
+    // a plant is drawn if it is in front of the camera, with a wide margin either side for
+    // turning before the next update, or close by
+    const spread = Math.cos(Math.min(Math.PI, (camera.fov * camera.aspect * Math.PI) / 360 + 0.55));
+    const scale = graphics.quality === 'high' ? 1 : graphics.quality === 'medium' ? 0.8 : 0.62;
+    const doCards = force || jungle.cardsDue <= 0 || moved > 25;
+    if (doCards) jungle.cardsDue = 1.2;
+    const found = [];
+    for (const [name, k] of Object.entries(jungle.kinds)) {
+      const reach = k.spec.near * scale;
+      found.length = 0;
+      plantsNear(name, eye.x, eye.z, reach, found);
+      let n = 0;
+      for (const p of found) {
+        if (n >= k.room) break;
+        const dx = p.x - eye.x;
+        const dz = p.z - eye.z;
+        const d = Math.hypot(dx, dz);
+        if (d > 14 + p.s * 6 && (dx * lx + dz * lz) / d < spread) continue;
+        plantMatrixOf(p);
+        for (const mesh of k.near) mesh.setMatrixAt(n, plantMatrix);
+        n++;
+      }
+      for (const mesh of k.near) {
+        mesh.count = n;
+        mesh.instanceMatrix.needsUpdate = true;
+      }
+      if (k.card && doCards) {
+        let c = 0;
+        const far = Math.min(camera.far, scene.fog.far + 40);
+        for (const p of k.list) {
+          if (p.gone) continue;
+          const d2 = (p.x - eye.x) ** 2 + (p.z - eye.z) ** 2;
+          if (d2 < reach * reach || d2 > far * far) continue;
+          k.card.setMatrixAt(c++, plantMatrixOf(p));
+        }
+        k.card.count = c;
+        k.card.instanceMatrix.needsUpdate = true;
+      }
+    }
+  }
+
+  // The jungle floor: under the trees the hill's grass gives way to fallen leaves, twigs
+  // and moss (the ground's material and colours are swapped while picnic mode is on). How
+  // much is leaves rides along each corner of the ground as an extra number, and the
+  // ground's picture is blended from the grass to the leaves by it.
+  const litterTex = canvasTexture(256, 256, (g, w, h) => {
+    g.fillStyle = '#6e5e46';
+    g.fillRect(0, 0, w, h);
+    for (let n = 0; n < 1400; n++) {
+      const x = Math.random() * w;
+      const y = Math.random() * h;
+      const tone = Math.random();
+      g.fillStyle = tone < 0.45 ? `hsl(${rand(25, 40)}, ${rand(30, 50)}%, ${rand(22, 40)}%)` : tone < 0.8 ? `hsl(${rand(40, 55)}, ${rand(25, 45)}%, ${rand(30, 48)}%)` : `hsl(${rand(75, 100)}, ${rand(25, 40)}%, ${rand(22, 34)}%)`;
+      g.save();
+      g.translate(x, y);
+      g.rotate(Math.random() * Math.PI);
+      g.beginPath();
+      g.ellipse(0, 0, rand(3, 7.5), rand(1.5, 3.5), 0, 0, Math.PI * 2);
+      g.fill();
+      g.restore();
+    }
+    g.strokeStyle = 'rgba(50,35,20,0.6)';
+    for (let n = 0; n < 40; n++) {
+      g.lineWidth = rand(0.8, 1.8);
+      const x = Math.random() * w;
+      const y = Math.random() * h;
+      const a = Math.random() * Math.PI;
+      g.beginPath();
+      g.moveTo(x, y);
+      g.lineTo(x + Math.cos(a) * rand(10, 30), y + Math.sin(a) * rand(10, 30));
+      g.stroke();
+    }
+  });
+  let jungleGroundMat = null;
+  function makeJungleFloor() {
+    const random = seeded(77);
+    for (const mesh of terrainMeshes) {
+      const pos = mesh.geometry.attributes.position;
+      const plain = mesh.geometry.attributes.color.array.slice();
+      const wild = plain.slice();
+      const leaves = new Float32Array(pos.count);
+      const shade = new THREE.Color(0xd8d2c0);
+      let any = false;
+      for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i);
+        const z = pos.getZ(i);
+        if (!inJungle(x, z)) continue;
+        const fromCamp = Math.hypot(x - CAMP.x, z - CAMP.z);
+        const under = smooth((fromCamp - CAMP.clear + 10) / 16);
+        if (under <= 0) continue;
+        any = true;
+        leaves[i] = under * (0.75 + 0.25 * random());
+        // the leaves keep their own colours; a little darker and greener in patches
+        const k = under * 0.9;
+        const n = 0.82 + 0.18 * Math.sin(x * 0.17) * Math.cos(z * 0.13);
+        wild[i * 3] = plain[i * 3] + (shade.r * n * 0.92 - plain[i * 3]) * k;
+        wild[i * 3 + 1] = plain[i * 3 + 1] + (shade.g * n - plain[i * 3 + 1]) * k;
+        wild[i * 3 + 2] = plain[i * 3 + 2] + (shade.b * n * 0.9 - plain[i * 3 + 2]) * k;
+      }
+      if (!any) continue;
+      mesh.geometry.setAttribute('litter', new THREE.BufferAttribute(leaves, 1));
+      jungle.floor = [...(jungle.floor || []), { mesh, plain, wild, material: mesh.material }];
+    }
+    const base = jungle.floor && jungle.floor[0].material;
+    if (!base) return;
+    jungleGroundMat = new THREE.MeshLambertMaterial({ vertexColors: true, map: base.map });
+    jungleGroundMat.userData.snow = 'ground';
+    jungleGroundMat.onBeforeCompile = function (shader) {
+      THREE.Material.prototype.onBeforeCompile.call(this, shader); // the snow, as on every ground
+      shader.uniforms.litterMap = { value: litterTex };
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float litter;\nvarying float vLitter;')
+        .replace('#include <uv_vertex>', '#include <uv_vertex>\nvLitter = litter;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform sampler2D litterMap;\nvarying float vLitter;')
+        .replace('#include <map_fragment>', `
+          vec4 grassTexel = texture2D(map, vUv);
+          vec4 leafTexel = texture2D(litterMap, vUv * 1.6);
+          diffuseColor *= mix(grassTexel, leafTexel * 0.92, smoothstep(0.1, 0.9, vLitter));`);
+    };
+    jungleGroundMat.customProgramCacheKey = () => `jungle-floor:${snowMode(jungleGroundMat)}`;
+  }
+
+  // The canopy: tall broadleaf trees, each a trunk and a wide crown of leaf cards, closing
+  // over the jungle between the modelled trees. Cheap to draw (a few hundred triangles a
+  // tree), drawn in tiles like the city's trees, and dappling the floor with shade.
+  function growCanopy() {
+    const random = seeded(9001);
+    const b = HILL_BOUNDS;
+    const leafTex = canvasTexture(256, 256, (g, w) => {
+      for (let n = 0; n < 150; n++) {
+        const a = Math.random() * Math.PI * 2;
+        const r = 112 * Math.sqrt(Math.random());
+        const x = w / 2 + Math.cos(a) * r;
+        const y = w / 2 + Math.sin(a) * r;
+        const len = rand(14, 26);
+        g.save();
+        g.translate(x, y);
+        g.rotate(Math.random() * Math.PI * 2);
+        g.fillStyle = `hsl(${rand(85, 120)}, ${rand(30, 55)}%, ${rand(22, 48) + (n / 150) * 14}%)`;
+        g.beginPath();
+        g.ellipse(0, 0, len, len * rand(0.32, 0.45), 0, 0, Math.PI * 2);
+        g.fill();
+        g.strokeStyle = 'rgba(210,230,160,0.35)';
+        g.lineWidth = 1;
+        g.beginPath();
+        g.moveTo(-len, 0);
+        g.lineTo(len, 0);
+        g.stroke();
+        g.restore();
+      }
+    });
+    const cards = [];
+    const colors = [];
+    const trunks = [];
+    const dummy = new THREE.Object3D();
+    dummy.rotation.order = 'YXZ';
+    const area = ((b.maxX - b.minX) * (b.maxZ - b.minZ)) / 10000;
+    const tint = new THREE.Color();
+    for (let n = 0; n < 46 * area; n++) {
+      const x = b.minX + random() * (b.maxX - b.minX);
+      const z = b.minZ + random() * (b.maxZ - b.minZ);
+      if (!jungleGround(x, z, CAMP.clear + 10)) continue;
+      const y = terrain(x, z) - 0.1;
+      const s = 0.8 + random() * 0.6;
+      const height = 14 * s;
+      dummy.position.set(x, y, z);
+      dummy.rotation.set(0, random() * 6.3, 0);
+      dummy.scale.set(0.38 * s, height, 0.38 * s);
+      dummy.updateMatrix();
+      trunks.push(dummy.matrix.clone());
+      const green = 0.75 + random() * 0.35;
+      const box = { minX: x - 0.4 * s, maxX: x + 0.4 * s, minZ: z - 0.4 * s, maxZ: z + 0.4 * s, minY: y - 1, maxY: y + height };
+      jungle.canopyBoxes.push(box);
+      // a wide, flat-topped crown, thickest at its rim
+      for (let k = 0; k < 34; k++) {
+        const a = random() * Math.PI * 2;
+        const out = Math.sqrt(random()) * 6.5 * s;
+        const up = height - 1.5 * s + random() * 3.2 * s - (out / (6.5 * s)) * 1.6 * s;
+        dummy.position.set(x + Math.cos(a) * out, y + up, z + Math.sin(a) * out);
+        dummy.rotation.set(-Math.PI / 2 + (random() - 0.5) * 0.9, random() * 6.3, (random() - 0.5) * 0.9);
+        const size = (3.2 + random() * 2.2) * s;
+        dummy.scale.set(size, size, 1);
+        dummy.updateMatrix();
+        cards.push(dummy.matrix.clone());
+        const light = (0.6 + 0.4 * (up - height + 3 * s) / (4 * s)) * green;
+        colors.push(tint.setRGB(0.32 * light, 0.5 * light, 0.2 * light).clone());
+      }
+    }
+    const material = new THREE.MeshLambertMaterial({ map: leafTex, alphaTest: 0.45, side: THREE.DoubleSide });
+    material.userData.snow = 'foliage';
+    const depth = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking, map: leafTex, alphaTest: 0.45 });
+    tiledInstances(new THREE.PlaneGeometry(1, 1), material, cards, {
+      colors, reach: 900, owner: jungle.group, tile: 128,
+      setup: (mesh) => {
+        mesh.castShadow = true;
+        mesh.customDepthMaterial = depth;
+      },
+    });
+    const trunkMat = new THREE.MeshLambertMaterial({ color: 0x8a7a66, map: barkMaterial().map });
+    const trunkGeo = new THREE.CylinderGeometry(0.55, 1, 1, 9).translate(0, 0.5, 0);
+    tiledInstances(trunkGeo, trunkMat, trunks, { reach: 700, owner: jungle.group, tile: 128, setup: (mesh) => { mesh.castShadow = true; } });
+  }
+
+  // A dirt track: packed earth, gravel, and two worn ruts where the wheels run.
+  const dirtTrack = new THREE.MeshLambertMaterial({
+    color: 0xb39a78, side: THREE.DoubleSide,
+    map: canvasTexture(256, 256, (g, w, h) => {
+      g.fillStyle = '#9b7f5c';
+      g.fillRect(0, 0, w, h);
+      for (let n = 0; n < 5000; n++) {
+        const shade = rand(0.75, 1.2);
+        g.fillStyle = `rgba(${Math.round(150 * shade)},${Math.round(122 * shade)},${Math.round(88 * shade)},0.5)`;
+        g.fillRect(Math.random() * w, Math.random() * h, rand(1, 3), rand(1, 3));
+      }
+      // the ruts: where the road's 5 m picture puts each wheel line
+      for (const u of [0.18, 0.48, 0.52, 0.82]) {
+        const grad = g.createLinearGradient((u - 0.05) * w, 0, (u + 0.05) * w, 0);
+        grad.addColorStop(0, 'rgba(70,52,34,0)');
+        grad.addColorStop(0.5, 'rgba(70,52,34,0.45)');
+        grad.addColorStop(1, 'rgba(70,52,34,0)');
+        g.fillStyle = grad;
+        g.fillRect((u - 0.05) * w, 0, 0.1 * w, h);
+      }
+      for (let n = 0; n < 260; n++) {
+        g.fillStyle = `rgba(${rand(120, 200)},${rand(110, 180)},${rand(90, 150)},0.9)`;
+        g.beginPath();
+        g.arc(Math.random() * w, Math.random() * h, rand(0.8, 2.2), 0, Math.PI * 2);
+        g.fill();
+      }
+    }),
+  });
+  dirtTrack.userData.snow = 'ground';
+
+  // Swaps the hill between its ordinary look (pines, villas, tarmac, the boulders) and the
+  // jungle, colliders and all.
+  function showJungle(on) {
+    jungle.group.visible = on;
+    hillWoods.visible = !on;
+    // (the index is all that is asked when something might be in the way, so that is all
+    // that changes: thousands of trunks come and go at once)
+    for (const thing of hillThings.meshes) thing.visible = !on;
+    for (const box of hillThings.boxes) (on ? indexRemove : indexAdd)(colliderIndex, box);
+    for (const s of hillThings.surfaces) (on ? indexRemove : indexAdd)(surfaceIndex, s);
+    for (const k of Object.values(jungle.kinds)) {
+      for (const p of k.list) if (p.box && !p.gone) (on ? indexAdd : indexRemove)(colliderIndex, p.box);
+    }
+    for (const box of jungle.camp || []) (on ? indexAdd : indexRemove)(colliderIndex, box);
+    const road = ribbons.find((r) => r.name === 'hill');
+    if (road && road.meshes) {
+      road.meshes[0].material = on ? dirtTrack : road.tarmac;
+      for (const line of road.meshes.slice(1)) line.visible = !on;
+    }
+    for (const f of jungle.floor || []) {
+      f.mesh.geometry.attributes.color.array.set(on ? f.wild : f.plain);
+      f.mesh.geometry.attributes.color.needsUpdate = true;
+      f.mesh.material = on && jungleGroundMat ? jungleGroundMat : f.material;
+    }
+    for (const box of jungle.canopyBoxes) (on ? indexAdd : indexRemove)(colliderIndex, box);
+    for (const a of animals) a.group.visible = !on && a.group.visible;
+    if (on) updateJungle(0, true);
+  }
+
+  // --- the camper ---
+
+  // It drives like the bus and the truck (see VEHICLE_MODELS), made from its model once that
+  // has loaded. Parked, you can step inside through the side door: the shell is hidden and
+  // you stand in its living space, seen through your own eyes, with the world outside
+  // through the windows.
+  const CAMPER_DOOR = { x: 1.27, z: -0.08 }; // the side door, in the camper's own frame
+  const CAMPER_FLOOR = 0.62;
+
+  function makeCamper() {
+    const scanMaterial = (() => {
+      let name = null;
+      picnicModels.camper.root.traverse((o) => { if (o.isMesh && !name) name = o.material.name; });
+      return name;
+    })();
+    VEHICLE_MODELS.rv = {
+      paint: [scanMaterial], glass: [], chrome: [], inside: [], matte: true,
+      glows: {
+        head: [0.7, 0.98, 3.47, 0.28, 0.1],
+        tail: [1.0, 0.92, -3.51, 0.08, 0.24],
+        amberRear: [1.0, 0.7, -3.51, 0.08, 0.09],
+        amberFront: [0.98, 0.92, 3.34, 0.05, 0.07],
+      },
+      seat: [2.1, 0.46], eye: 2.0, roof: 2.66, stats: { top: 27, nitroTop: 31, engine: 7, nitroEngine: 10, brake: 22, grip: 13 },
+    };
+    vehicleTemplates.rv = prepareVehicle('rv', picnicModels.camper.root);
+    const model = createModelVehicle(0xffffff, 'rv');
+    model.noInside = true; // the scan's windscreen is painted, not glass: no view from the seat
+    model.shell = [...model.group.children];
+    model.living = buildCamperInside(model);
+    return model;
+  }
+
+  // Where the camper is now, whether parked or being driven: { x, y, z, h, parked }.
+  function camperAt() {
+    const model = picnic.rvModel;
+    if (!model) return null;
+    if (mode === 'car' && player === model) return { x: car.x, y: car.y, z: car.z, h: car.heading, parked: null };
+    const parked = idleCars.find((v) => v.model === model);
+    if (parked) return { x: parked.x, y: parked.y, z: parked.z, h: parked.h, parked };
+    return null;
+  }
+
+  // Parks the camper at (x, z) facing h, or takes it away (null).
+  function placeCamper(spot) {
+    const model = picnic.rvModel;
+    const at = camperAt();
+    if (at && at.parked) {
+      idleCars.splice(idleCars.indexOf(at.parked), 1);
+      indexRemove(colliderIndex, at.parked.box);
+    }
+    model.group.visible = !!spot;
+    if (!spot) return;
+    const y = groundAt(spot.x, spot.z, terrain(spot.x, spot.z) + 2);
+    addIdleCar(model, spot.x, y, spot.z, spot.h);
+  }
+
+  // Somewhere clear beside the hero to park it: a few spots around him, the first that is
+  // flat and empty.
+  function camperSpotNear(x, z, facing) {
+    for (const [side, ahead] of [[-4.6, 1], [4.6, 1], [-4.6, -5], [4.6, -5], [0, 8], [0, -9], [-9, 0], [9, 0]]) {
+      const px = x + Math.cos(facing) * side + Math.sin(facing) * ahead;
+      const pz = z - Math.sin(facing) * side + Math.cos(facing) * ahead;
+      const h0 = terrain(px - 2, pz - 3.6);
+      const h1 = terrain(px + 2, pz + 3.6);
+      if (Math.abs(h0 - h1) > 0.8 || inWater(px, pz)) continue;
+      const clash = collidersNear(px, pz, 4.2).some((b) => !b.soft && (b.maxY ?? 9) > terrain(px, pz) + 0.3 && px + 4 > b.minX && px - 4 < b.maxX && pz + 4 > b.minZ && pz - 4 < b.maxZ);
+      if (!clash) return { x: px, z: pz, h: facing };
+    }
+    return { x: x + Math.cos(facing) * -5, z: z - Math.sin(facing) * -5, h: facing };
+  }
+
+  // The living space: floor, walls with the door and windows, the bed across the back,
+  // the kitchen with its gas stove, a storage cupboard with the kit, a table and a bench.
+  // Built in the camper's frame (x to its left, z forward), hidden until you step in.
+  function buildCamperInside(model) {
+    const room = new THREE.Group();
+    room.visible = false;
+    const F = CAMPER_FLOOR;
+    const lit = []; // materials that glow a little when the lights are on
+    const mat = (color, map = null, extra = {}) => {
+      const m = new THREE.MeshLambertMaterial({ color, map, emissive: 0x000000, ...extra });
+      m.userData.noSnow = true;
+      m.userData.glow = extra.glow || 0.18;
+      lit.push(m);
+      return m;
+    };
+    const panel = canvasTexture(128, 128, (g, w, h) => {
+      g.fillStyle = '#efe8dc';
+      g.fillRect(0, 0, w, h);
+      speckle(g, w, h, 900, 0.035);
+    });
+    const oak = canvasTexture(256, 128, (g, w, h) => {
+      g.fillStyle = '#b48a5a';
+      g.fillRect(0, 0, w, h);
+      for (let y = 0; y < h; y += 2) {
+        g.fillStyle = `rgba(${Math.random() < 0.5 ? '60,35,15' : '255,230,190'},${rand(0.03, 0.12)})`;
+        g.fillRect(0, y, w, rand(1, 2));
+      }
+      g.fillStyle = 'rgba(40,25,10,0.35)';
+      for (let x = 0; x < w; x += 64) g.fillRect(x, 0, 1, h);
+    });
+    const fabric = canvasTexture(64, 64, (g, w, h) => {
+      g.fillStyle = '#d7d1c4';
+      g.fillRect(0, 0, w, h);
+      g.strokeStyle = 'rgba(90,70,50,0.18)';
+      for (let i = 0; i < w; i += 4) {
+        g.beginPath(); g.moveTo(i, 0); g.lineTo(i, h); g.stroke();
+        g.beginPath(); g.moveTo(0, i); g.lineTo(w, i); g.stroke();
+      }
+    });
+    const wall = mat(0xffffff, panel);
+    const wood = mat(0xffffff, oak);
+    const counterTop = mat(0x3b3a38);
+    const cushion = mat(0x5b6470, fabric);
+    const bedding = mat(0xf2efe8, fabric);
+    const blanket = mat(0x7c5a3c, fabric);
+    const metal = new THREE.MeshPhongMaterial({ color: 0xb8bcc2, shininess: 80, specular: 0x888888 });
+    metal.userData.noSnow = true;
+    const windowGlass = new THREE.MeshPhongMaterial({ color: 0x9fb4c6, transparent: true, opacity: 0.18, shininess: 100, specular: 0xffffff, depthWrite: false, side: THREE.DoubleSide });
+    windowGlass.userData.noSnow = true;
+    const box = (w, h, d, x, y, z, material) => {
+      const geometry = new THREE.BoxGeometry(w, h, d);
+      if (material.map) tileBoxFaces(geometry, w, h, d, 0.8);
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set(x, y, z);
+      mesh.castShadow = mesh.receiveShadow = true;
+      room.add(mesh);
+      return mesh;
+    };
+    const X = 1.15; // half the inside width
+    const Z0 = -3.38;
+    const Z1 = 1.62;
+    const top = F + 2.0;
+    box(X * 2, 0.04, Z1 - Z0, 0, F - 0.02, (Z0 + Z1) / 2, wood); // floor
+    box(X * 2, 0.05, Z1 - Z0, 0, top, (Z0 + Z1) / 2, wall); // ceiling
+    box(X * 2, 2.0, 0.05, 0, F + 1, Z0, wall); // back wall
+    // the cab curtain, drawn across the front
+    const curtain = new THREE.Mesh(new THREE.PlaneGeometry(X * 2, 2.0, 24, 1), mat(0x6d5a48, fabric));
+    const cp = curtain.geometry.attributes.position;
+    for (let i = 0; i < cp.count; i++) cp.setZ(i, Math.sin(cp.getX(i) * 14) * 0.035);
+    curtain.geometry.computeVertexNormals();
+    curtain.position.set(0, F + 1, Z1);
+    curtain.rotation.y = Math.PI;
+    room.add(curtain);
+    // a wall with openings: [z0, z1, y0, y1] cut out of it, glazed if a window
+    const sideWall = (x, openings) => {
+      const cuts = [...openings].sort((a, b) => a[0] - b[0]);
+      let z = Z0;
+      for (const [o0, o1, y0, y1, glazed] of cuts) {
+        if (o0 > z) box(0.05, 2.0, o0 - z, x, F + 1, (z + o0) / 2, wall);
+        if (y0 > 0) box(0.05, y0, o1 - o0, x, F + y0 / 2, (o0 + o1) / 2, wall);
+        if (y1 < 2) box(0.05, 2 - y1, o1 - o0, x, F + (y1 + 2) / 2, (o0 + o1) / 2, wall);
+        if (glazed) {
+          const pane = new THREE.Mesh(new THREE.PlaneGeometry(o1 - o0, y1 - y0), windowGlass);
+          pane.position.set(x, F + (y0 + y1) / 2, (o0 + o1) / 2);
+          pane.rotation.y = Math.PI / 2;
+          pane.renderOrder = 2;
+          room.add(pane);
+          // a dark frame round it
+          const frame = mat(0x24262a);
+          box(0.07, 0.05, o1 - o0 + 0.1, x, F + y0, (o0 + o1) / 2, frame);
+          box(0.07, 0.05, o1 - o0 + 0.1, x, F + y1, (o0 + o1) / 2, frame);
+        }
+        z = o1;
+      }
+      if (z < Z1) box(0.05, 2.0, Z1 - z, x, F + 1, (z + Z1) / 2, wall);
+    };
+    sideWall(X, [[CAMPER_DOOR.z - 0.36, CAMPER_DOOR.z + 0.36, 0, 1.9, false], [-2.95, -2.1, 1.0, 1.55, true], [0.55, 1.35, 0.95, 1.55, true]]);
+    sideWall(-X, [[-1.55, -0.55, 1.05, 1.5, true], [0.35, 1.3, 0.95, 1.55, true], [-3.1, -2.2, 1.0, 1.5, true]]);
+    // the door itself, standing open inward against the wall
+    const door = box(0.05, 1.86, 0.7, X - 0.4, F + 0.95, CAMPER_DOOR.z - 0.35, mat(0xe7e2d8, panel));
+    door.rotation.y = 1.1;
+
+    // --- the bed across the back
+    box(X * 2, 0.45, 1.5, 0, F + 0.22, -2.62, wood);
+    box(X * 2 - 0.08, 0.2, 1.42, 0, F + 0.55, -2.62, bedding);
+    const quilt = box(X * 2 - 0.1, 0.07, 0.95, 0, F + 0.68, -2.32, blanket);
+    quilt.rotation.x = -0.02;
+    for (const side of [-0.48, 0.48]) {
+      const pillow = box(0.62, 0.13, 0.36, side, F + 0.72, -3.1, bedding);
+      pillow.scale.set(1, 1, 1);
+    }
+    box(X * 2, 0.36, 0.34, 0, F + 1.82, -3.18, wood); // the cupboards over it
+
+    // --- the kitchen down the right-hand side
+    box(0.6, 0.9, 1.5, -X + 0.3, F + 0.45, -0.95, wood);
+    box(0.64, 0.04, 1.54, -X + 0.32, F + 0.92, -0.95, counterTop);
+    box(0.46, 0.04, 0.34, -X + 0.3, F + 0.945, -0.42, metal); // the sink
+    box(0.5, 0.42, 1.5, -X + 0.25, F + 1.78, -0.95, wood); // wall cupboards
+    const stove = picnicMesh('stove');
+    stove.position.set(-X + 0.32, F + 0.94, -1.3);
+    room.add(stove);
+    const pots = picnicMesh('pots', 'pot');
+    pots.position.set(-X + 0.32, F + 0.94 + 0.2, -1.3);
+    room.add(pots);
+    const kettle = picnicMesh('pots', 'kettle');
+    kettle.position.set(-X + 0.3, F + 0.94, -0.75);
+    kettle.rotation.y = 2.4;
+    room.add(kettle);
+
+    // --- the storage cupboard by the door, open, the kit on its shelves
+    box(0.5, 1.95, 0.05, X - 0.25, F + 0.98, -1.78, wood);
+    box(0.5, 1.95, 0.05, X - 0.25, F + 0.98, -0.62, wood);
+    for (const y of [0.05, 0.6, 1.1, 1.6, 1.95]) box(0.5, 0.03, 1.16, X - 0.25, F + y, -1.2, wood);
+    const kit = new THREE.Group(); // what you take: the tools on the shelves
+    room.add(kit);
+    const shelf = (name, part, x, y, z, turn = 0, tip = 0) => {
+      const thing = picnicMesh(name, part);
+      thing.position.set(x, F + y, z);
+      thing.rotation.set(tip, turn, 0);
+      kit.add(thing);
+      return thing;
+    };
+    shelf('axe', 'axe', X - 0.24, 1.12, -1.3, Math.PI / 2, 0);
+    shelf('hammer', null, X - 0.25, 1.62, -1.45, 0.3);
+    shelf('screwdriver', null, X - 0.25, 1.62, -1.05, 1.2);
+    shelf('torch', null, X - 0.28, 1.62, -0.85, -0.4);
+    shelf('knife', 'knife', X - 0.27, 1.12, -0.85, 2.0);
+    shelf('lantern', null, X - 0.25, 0.62, -1.5);
+    shelf('bolts', null, X - 0.25, 0.62, -1.05);
+    shelf('jerrycan', null, X - 0.28, 0.06, -1.42, Math.PI / 2);
+    shelf('jerrycan', null, X - 0.28, 0.06, -0.98, Math.PI / 2);
+    const bag = box(0.4, 0.3, 0.55, X - 0.27, F + 1.27 + 0.15, -1.2, mat(0x4f5a3a, fabric)); // the camp kit, rolled up
+    bag.scale.set(1, 1, 1);
+    room.remove(bag);
+    kit.add(bag);
+    const bow = picnicMesh('bow', 'bow');
+    bow.position.set(X - 0.06, F + 0.25, 1.0);
+    bow.rotation.set(0, Math.PI / 2, 0);
+    kit.add(bow);
+    for (let n = 0; n < 6; n++) {
+      const arrow = picnicMesh('bow', 'arrow');
+      arrow.position.set(X - 0.08, F + 0.45 + n * 0.02, 1.32 - n * 0.02);
+      arrow.rotation.set(-Math.PI / 2 + 0.08, 0, 0);
+      kit.add(arrow);
+    }
+
+    // --- the table and a bench at the front
+    box(0.75, 0.04, 0.78, -X + 0.4, F + 0.72, 0.85, wood);
+    box(0.06, 0.7, 0.06, -X + 0.6, F + 0.35, 0.85, metal);
+    box(0.44, 0.42, 0.95, X - 0.22, F + 0.21, 0.85, wood);
+    box(0.44, 0.1, 0.95, X - 0.22, F + 0.47, 0.85, cushion);
+    box(0.08, 0.5, 0.95, X - 0.04, F + 0.75, 0.85, cushion);
+    const lantern = picnicMesh('lantern');
+    lantern.position.set(-X + 0.42, F + 0.74, 0.8);
+    room.add(lantern);
+
+    // --- a strip of light along the ceiling, lit at night
+    const strip = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.02, 4.2), new THREE.MeshBasicMaterial({ color: 0xfff1d6 }));
+    strip.position.set(0, top - 0.04, -0.9);
+    room.add(strip);
+
+    model.group.add(room);
+    return { room, kit, lit, strip, stove, bed: { x: 0, z: -2.62 } };
+  }
+
+  // Inside the camper: walk about the floor (the furniture in the way), look around, and
+  // use what is in reach with E. Places are in the camper's frame.
+  const CAMPER_BLOCKS = [
+    [-1.15, 1.15, -3.38, -1.86], // the bed
+    [-1.15, -0.5, -1.72, -0.18], // the kitchen
+    [0.62, 1.15, -1.8, -0.6], // the storage cupboard
+    [-1.15, -0.02, 0.44, 1.26], // the table
+    [0.7, 1.15, 0.36, 1.34], // the bench
+  ];
+  function camperLocal(spot, x, z) {
+    const dx = x - spot.x;
+    const dz = z - spot.z;
+    const s = Math.sin(spot.h);
+    const c = Math.cos(spot.h);
+    return [dx * c - dz * s, dx * s + dz * c];
+  }
+  const camperWorld = (spot, lx, lz) => [spot.x + lx * Math.cos(spot.h) + lz * Math.sin(spot.h), spot.z - lx * Math.sin(spot.h) + lz * Math.cos(spot.h)];
+
+  function enterCamper() {
+    const spot = camperAt();
+    if (!spot || !spot.parked) return;
+    const model = picnic.rvModel;
+    for (const part of model.shell) part.visible = false;
+    model.living.room.visible = true;
+    model.living.kit.visible = !!picnic.storage;
+    picnic.inside = { spot, lx: CAMPER_DOOR.x - 0.55, lz: CAMPER_DOOR.z, door: { x: car.x, y: car.y, z: car.z } };
+    hero.model.group.visible = false;
+    hero.yaw = spot.h - Math.PI / 2 + 0.4; // looking in, toward the kitchen
+    hero.pitch = -0.1;
+    camera.near = 0.08;
+    camera.updateProjectionMatrix();
+    $('crosshair').hidden = false;
+    playDoor();
+    if (picnic.storage) setGuide('Your kit is in the open cupboard by the door: E to take it', 'tip');
+  }
+
+  function leaveCamper() {
+    const inside = picnic.inside;
+    if (!inside) return;
+    const model = picnic.rvModel;
+    for (const part of model.shell) part.visible = true;
+    model.living.room.visible = false;
+    const spot = inside.spot;
+    const [x, z] = camperWorld(spot, CAMPER_DOOR.x + 0.75, CAMPER_DOOR.z);
+    Object.assign(car, { x, y: groundAt(x, z, terrain(x, z) + 0.5), z, vx: 0, vz: 0 });
+    hero.facing = hero.yaw = spot.h + Math.PI / 2; // stepping out through the side door
+    hero.pitch = 0;
+    hero.model.group.visible = true;
+    hero.model.group.position.set(car.x, car.y, car.z);
+    hero.model.group.rotation.set(0, hero.facing, 0);
+    picnic.inside = null;
+    camera.near = 0.5;
+    camera.updateProjectionMatrix();
+    playDoor();
+    updateCamera(0, 0, true);
+  }
+
+  function updateInsideCamper(dt) {
+    const inside = picnic.inside;
+    const spot = inside.spot;
+    const held = (...codes) => codes.some((c) => keys.has(c));
+    hero.yaw += ((held('ArrowLeft') ? 1 : 0) - (held('ArrowRight') ? 1 : 0)) * 2.2 * dt;
+    const local = hero.yaw - spot.h; // facing, in the camper's frame
+    const ahead = (held('KeyW', 'ArrowUp') ? 1 : 0) - (held('KeyS', 'ArrowDown') ? 1 : 0);
+    const strafe = (held('KeyD') ? 1 : 0) - (held('KeyA') ? 1 : 0);
+    let mx = Math.sin(local) * ahead - Math.cos(local) * strafe;
+    let mz = Math.cos(local) * ahead + Math.sin(local) * strafe;
+    const length = Math.hypot(mx, mz);
+    if (length > 0) {
+      mx = (mx / length) * 1.3 * dt;
+      mz = (mz / length) * 1.3 * dt;
+    }
+    const r = 0.22;
+    const free = (x, z) => Math.abs(x) < 1.15 - r && z > -3.38 + r && z < 1.62 - r
+      && !CAMPER_BLOCKS.some(([x0, x1, z0, z1]) => x > x0 - r && x < x1 + r && z > z0 - r && z < z1 + r);
+    if (free(inside.lx + mx, inside.lz)) inside.lx += mx;
+    if (free(inside.lx, inside.lz + mz)) inside.lz += mz;
+    const [x, z] = camperWorld(spot, inside.lx, inside.lz);
+    Object.assign(car, { x, z, y: spot.y + CAMPER_FLOOR, vx: 0, vz: 0, heading: hero.yaw });
+    trackFootsteps(length > 0 ? 1.3 * dt : 0);
+    // the lights come on as it gets dark
+    const glow = Math.max(0.12, lampsOnNow);
+    for (const m of picnic.rvModel.living.lit) m.emissive.setRGB(1, 0.92, 0.78).multiplyScalar(glow * m.userData.glow);
+    picnic.rvModel.living.strip.material.color.setRGB(1, 0.95, 0.85).multiplyScalar(0.4 + 0.6 * glow);
+  }
+
+  // --- what is on screen ---
+
+  // Pictures of the things you carry, taken from their models (or from simple stand-ins
+  // for what has no model), for the inventory and the tool bar.
+  const ICON_SHOTS = {
+    axe: ['axe', 'axe'], hammer: ['hammer'], screwdriver: ['screwdriver'], torch: ['torch'], knife: ['knife', 'knife'],
+    bow: ['bow', 'bow'], pot: ['pots', 'pot'], tent: ['tent', 'tent'], lantern: ['lantern'], petrol: ['jerrycan'], gas: ['stove'],
+    bolts: ['bolts'], mango: ['mango'], banana: ['bananas'], stone: ['rocks', 'stone'], arrow: ['bow', 'arrow'],
+    log: 'log', branch: 'branch', leaves: ['monstera'], meat: 'meat', cooked: 'cooked', hide: 'hide', fist: 'fist', gun: 'gun',
+  };
+  const icons = {};
+  function makeIcons() {
+    const size = 96;
+    const target = new THREE.WebGLRenderTarget(size, size);
+    const studio = new THREE.Scene();
+    studio.add(new THREE.HemisphereLight(0xffffff, 0x666655, 0.95));
+    const key = new THREE.DirectionalLight(0xffffff, 0.75);
+    key.position.set(2, 3, 2.5);
+    studio.add(key);
+    const lens = new THREE.PerspectiveCamera(30, 1, 0.01, 100);
+    const pixels = new Uint8Array(size * size * 4);
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = size;
+    const g = canvas.getContext('2d');
+    const before = renderer.getRenderTarget();
+    const clear = renderer.getClearColor(new THREE.Color());
+    const alpha = renderer.getClearAlpha();
+    for (const [name, shot] of Object.entries(ICON_SHOTS)) {
+      let thing;
+      if (Array.isArray(shot)) thing = picnicMesh(shot[0], shot[1] || null);
+      else if (shot === 'log') thing = new THREE.Mesh(logGeometry, barkMaterial()).rotateZ(Math.PI / 2);
+      else if (shot === 'branch') thing = branchMesh(7).rotateX(0.5);
+      else if (shot === 'meat' || shot === 'cooked') thing = meatMesh(shot === 'cooked');
+      else if (shot === 'hide') thing = new THREE.Mesh(new THREE.CircleGeometry(0.5, 9).rotateX(-1.2), lambert(0x6b4a2e));
+      else continue; // fist and gun keep their drawn icons
+      if (shot === 'branch') thing.scale.set(1, 2.6, 2.6); // a thin thing: thickened to read at this size
+      studio.add(thing);
+      const box = new THREE.Box3().setFromObject(thing);
+      const centre = box.getCenter(new THREE.Vector3());
+      const reach = box.getSize(new THREE.Vector3()).length() * 1.15;
+      lens.position.set(centre.x + reach * 0.62, centre.y + reach * 0.45, centre.z + reach * 0.75);
+      lens.lookAt(centre);
+      renderer.setRenderTarget(target);
+      renderer.setClearColor(0x000000, 0);
+      renderer.clear();
+      renderer.render(studio, lens);
+      renderer.readRenderTargetPixels(target, 0, 0, size, size, pixels);
+      const picture = g.createImageData(size, size);
+      for (let y = 0; y < size; y++) picture.data.set(pixels.subarray((size - 1 - y) * size * 4, (size - y) * size * 4), y * size * 4); // the target is upside down
+      g.clearRect(0, 0, size, size);
+      g.putImageData(picture, 0, 0);
+      icons[name] = canvas.toDataURL();
+      studio.remove(thing);
+    }
+    renderer.setRenderTarget(before);
+    renderer.setClearColor(clear, alpha);
+    target.dispose();
+  }
+  const iconTag = (name) => (icons[name] ? `<img src="${icons[name]}" alt="">` : `<i class="glyph ${name}"></i>`);
+
+  // The panel at the top left: where you are, the time, what to do now and how far along.
+  const STEPS = [
+    {
+      text: 'Drive the camper to the jungle camp at the LOOKOUT',
+      hint: () => (mode === 'car' && player === picnic.rvModel ? 'Follow the purple line up the hill' : 'Get in with F; the purple line shows the way'),
+      done: () => { const at = camperAt(); return !!at && Math.hypot(at.x - CAMP.x, at.z - CAMP.z) < 70; },
+    },
+    {
+      text: 'Step into the camper and take your kit from the storage',
+      hint: () => (picnic.inside ? 'E at the open cupboard by the door' : 'E at the camper\'s side door'),
+      done: () => !picnic.storage,
+    },
+    {
+      text: 'Go for a bonfire: collect dry branches and stones',
+      hint: () => 'They lie all over the jungle floor: E to pick them up',
+      progress: () => `Branches ${Math.min(6, picnic.inv.branch)}/6 · Stones ${Math.min(8, picnic.inv.stone)}/8`,
+      done: () => (picnic.inv.branch >= 6 && picnic.inv.stone >= 8) || hasBuilt('bonfire'),
+    },
+    {
+      text: 'Build the bonfire near the camper (B), then light it (E)',
+      hint: () => (hasBuilt('bonfire') ? 'Petrol from the jerry can gets it going: E at the fire' : 'B opens the build menu; click to place'),
+      done: () => picnic.structures.some((s) => s.kind === 'bonfire' && s.lit),
+    },
+    {
+      text: 'Cut trees with the axe for logs',
+      hint: () => (hero.weapon === 'axe' ? 'Face a tree trunk up close and click to swing' : 'Press 3 for the axe'),
+      progress: () => `Logs ${Math.min(10, picnic.inv.log + logsUsed())}/10`,
+      done: () => picnic.inv.log + logsUsed() >= 10,
+    },
+    {
+      text: 'Before dark: build the palisade and the raised platform',
+      hint: () => 'B to place each; then E with the hammer to build it up, section by section',
+      progress: () => {
+        const fence = picnic.structures.find((s) => s.kind === 'palisade');
+        const deck = picnic.structures.find((s) => s.kind === 'platform');
+        return `Fence ${fence ? fence.sections.filter(Boolean).length : 0}/${BUILDS.palisade.sections} · Platform ${deck ? deck.stage : 0}/3`;
+      },
+      done: () => palisadeClosed() && picnic.structures.some((s) => s.kind === 'platform' && s.stage >= 3),
+    },
+    {
+      text: 'Hunt a deer with the bow',
+      hint: () => (picnic.crawling ? 'Hidden in the undergrowth: hold the mouse to draw, let go to shoot' : 'Press 2 for the bow. Crawl (C) through the undergrowth to get close'),
+      done: () => picnic.stats.deer > 0,
+    },
+    {
+      text: 'Carry the deer back to camp on your shoulders',
+      hint: () => (picnic.carry ? 'Walk it back to the fire; = to put it down' : 'Stand by it and press ='),
+      done: () => picnic.beasts.some((b) => b.dead && b.species === 'deer' && !picnic.carry && Math.hypot(b.x - CAMP.x, b.z - CAMP.z) < 40) || picnic.inv.meat > 0 || picnic.inv.cooked > 0,
+    },
+    {
+      text: 'Butcher it with the knife, then cook the meat over the fire',
+      hint: () => (picnic.inv.meat > 0 ? 'E at the burning fire to put the pot on' : 'E at the deer, with the knife in your kit'),
+      done: () => picnic.inv.cooked > 0 || picnic.ate,
+    },
+    {
+      text: 'Eat, and survive the night: bears and tigers hunt after dark',
+      hint: () => (env.night > 0.5 ? 'Stay in the fence, on the platform, or locked in the camper' : 'Q to eat. Keep the fire fed; sleep on the platform or in the camper'),
+      done: () => picnic.stats.nights > 0,
+    },
+    {
+      text: 'Free roam: hunt, gather and keep the fire burning',
+      hint: () => 'Check the map (M) for the camp and the rings of the jungle',
+      done: () => false,
+    },
+  ];
+  const hasBuilt = (kind) => picnic.structures.some((s) => s.kind === kind);
+  const logsUsed = () => picnic.structures.reduce((n, s) => n + (s.kind === 'palisade' ? s.sections.filter(Boolean).length : s.kind === 'platform' ? [0, 4, 8, 9][s.stage] : 0), 0);
+
+  let guideNote = null; // a passing hint shown under the step: { text, tone, until }
+  function setGuide(text, tone = 'tip', seconds = 6) {
+    guideNote = { text, tone, until: clock + seconds };
+  }
+
+  function updateGuide() {
+    // advance past every step already done
+    while (picnic.step < STEPS.length - 1 && STEPS[picnic.step].done()) {
+      picnic.step += 1;
+      picnicChanged();
+      if (picnic.step > 1) playChime();
+    }
+    const step = STEPS[picnic.step];
+    const zone = picnic.zone;
+    const hh = Math.floor(env.hour);
+    const mm = Math.floor((env.hour - hh) * 60);
+    show('guideZone', zone ? `${ZONES[zone].name}|${ZONES[zone].level}` : 'Outside the jungle|-1', (v) => {
+      const [name, level] = v.split('|');
+      $('guide-zone').textContent = name;
+      $('guide-zone').dataset.level = level;
+    });
+    show('guideTime', `${env.night > 0.5 ? 'Night' : env.hour > 16.5 && env.hour < 19 ? 'Dusk' : 'Day'} ${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`, (v) => { $('guide-time').textContent = v; });
+    show('guideText', step.text, (v) => { $('guide-text').textContent = v; });
+    let hint = step.hint();
+    let tone = 'tip';
+    if (guideNote && clock < guideNote.until) {
+      hint = guideNote.text;
+      tone = guideNote.tone;
+    } else if (picnic.energy < 15) {
+      hint = 'Energy low: eat (Q) or rest for a minute';
+      tone = 'warn';
+    } else if (env.hour > 16.8 && env.hour < 18.5 && zone && zone !== 'camp') {
+      hint = 'Dusk is coming: get back to camp before dark';
+      tone = 'warn';
+    } else if (env.night > 0.5 && (zone === 'bear' || zone === 'tiger')) {
+      hint = `Night in ${ZONES[zone].name.toLowerCase()}: get back to camp!`;
+      tone = 'danger';
+    } else if (picnic.crawling) {
+      hint = heroHidden ? 'Crawling, hidden in the undergrowth: animals will hardly notice you' : 'Crawling in the open: get in among the ferns to hide';
+      tone = heroHidden ? 'good' : 'tip';
+    }
+    show('guideHint', `${tone}|${hint}`, (v) => {
+      const [t, text] = v.split('|');
+      $('guide-hint').textContent = text;
+      $('guide-hint').dataset.tone = t;
+    });
+    show('guideProgress', step.progress ? step.progress() : '', (v) => {
+      $('guide-progress').textContent = v;
+      $('guide-progress').hidden = !v;
+    });
+    show('energy', Math.round(picnic.energy), (v) => { $('energy-bar').style.width = `${v}%`; });
+    show('energyLow', picnic.energy < 15, (v) => $('energy-bar').parentElement.classList.toggle('low', v));
+  }
+
+  // The tool bar along the bottom: what you can take in hand, and how many arrows are left.
+  function updateHotbar() {
+    const slots = [['fist', '0'], ...['bow', 'axe', 'torch', 'knife', 'hammer'].filter((t) => picnic.tools.has(t)).map((t) => [t, TOOLS[t].key])];
+    const text = slots.map(([t, k]) => `${t}:${k}:${hero.weapon === t ? 1 : 0}:${t === 'bow' ? picnic.inv.arrow : ''}`).join(',');
+    show('hotbar', text, () => {
+      $('hotbar').innerHTML = slots.map(([t, k]) => `<div class="slot${hero.weapon === t ? ' on' : ''}">${iconTag(t)}<kbd>${k}</kbd>${t === 'bow' ? `<em>${picnic.inv.arrow}</em>` : ''}</div>`).join('');
+    });
+  }
+
+  // --- the inventory (I) ---
+
+  function toggleInventory(open) {
+    picnic.menu = open ? 'inventory' : null;
+    $('inventory').hidden = !open;
+    if (open) {
+      $('build-menu').hidden = true;
+      keys.clear();
+      if (document.exitPointerLock) document.exitPointerLock();
+      drawInventory();
+    }
+  }
+
+  function drawInventory() {
+    const items = Object.entries(ITEMS).filter(([key]) => picnic.inv[key] > 0);
+    const tools = [...picnic.tools];
+    $('inventory-items').innerHTML = items.length ? items.map(([key, item]) => `
+      <div class="item">${iconTag(key)}<b>${picnic.inv[key]}${item.unit ? ` ${item.unit}` : ''}</b><span>${item.name}</span>
+      ${item.food ? `<button data-eat="${key}">Eat</button>` : ''}</div>`).join('') : '<p class="empty">Nothing yet: pick things up with E</p>';
+    $('inventory-tools').innerHTML = tools.length ? tools.map((key) => `
+      <div class="item tool">${iconTag(key)}<span>${TOOLS[key].name}</span>${TOOLS[key].key ? `<kbd>${TOOLS[key].key}</kbd>` : ''}</div>`).join('') : '<p class="empty">Your tools are in the camper\'s storage</p>';
+    $('inventory-stats').textContent = `Deer ${picnic.stats.deer} · Bears ${picnic.stats.bears} · Tigers ${picnic.stats.tigers} · Nights survived ${picnic.stats.nights}`;
+  }
+  $('inventory').addEventListener('click', (e) => {
+    const eat = e.target.closest('[data-eat]');
+    if (eat) {
+      eatFood(eat.dataset.eat);
+      drawInventory();
+    } else if (e.target === $('inventory')) {
+      toggleInventory(false);
+    }
+  });
+
+  // --- the build menu (B) ---
+
+  function toggleBuildMenu(open) {
+    picnic.menu = open ? 'build' : null;
+    $('build-menu').hidden = !open;
+    if (open) {
+      $('inventory').hidden = true;
+      drawBuildMenu();
+    }
+  }
+
+  const costText = (cost) => Object.entries(cost).map(([k, n]) => `<span class="${picnic.inv[k] >= n ? '' : 'short'}">${iconTag(k)}${n}</span>`).join('');
+  function drawBuildMenu() {
+    $('build-list').innerHTML = BUILD_ORDER.map((kind, i) => {
+      const b = BUILDS[kind];
+      const cost = b.cost || (b.section ? b.section : b.stages[0].cost);
+      const note = b.section ? `per section (${b.sections})` : b.stages ? 'first stage of 3' : '';
+      const placed = kind !== 'bench' && kind !== 'table' && hasBuilt(kind) && kind !== 'bonfire';
+      const missing = b.need && !picnic.tools.has(b.need) ? `needs the ${TOOLS[b.need].name.toLowerCase()}` : '';
+      return `<div class="recipe${placed || missing ? ' off' : ''}"><kbd>${i + 1}</kbd><b>${b.name}</b><div class="cost">${costText(cost)}</div><small>${placed ? 'already placed' : missing || note}</small></div>`;
+    }).join('');
+  }
+
+  // --- tips for each ring of the jungle, shown the first time you come to it ---
+
+  function showTips(zone, lead) {
+    const z = ZONES[zone];
+    picnic.tipsOpen = true;
+    $('tips').hidden = false;
+    $('tips').dataset.level = z.level;
+    $('tips-title').textContent = z.name;
+    $('tips-lead').textContent = lead;
+    $('tips-list').innerHTML = z.tips.map((t) => `<li>${t}</li>`).join('');
+    keys.clear();
+    if (document.exitPointerLock) document.exitPointerLock();
+  }
+  function closeTips() {
+    picnic.tipsOpen = false;
+    $('tips').hidden = true;
+  }
+  $('tips-ok').addEventListener('click', closeTips);
+
+  // A banner across the top as you cross into another ring.
+  let bannerTimer = 0;
+  function zoneBanner(zone) {
+    const z = ZONES[zone];
+    $('zone-banner').textContent = `${z.level >= 2 ? 'Entering ' : ''}${z.name}${z.level >= 2 ? ' — stay alert' : ''}`;
+    $('zone-banner').dataset.level = z.level;
+    $('zone-banner').hidden = false;
+    bannerTimer = 3.2;
+  }
+
+  // The prompt for what E does, and the bar while something takes a while.
+  function setActPrompt(text) {
+    show('actPrompt', text || '', (v) => {
+      $('act-prompt').innerHTML = v;
+      $('act-prompt').hidden = !v;
+    });
+  }
+
+  // --- wood, meat and the like, made here ---
+
+  let barkTexture = null;
+  function barkMaterial() {
+    if (!barkTexture) {
+      barkTexture = canvasTexture(128, 256, (g, w, h) => {
+        g.fillStyle = '#6e5843';
+        g.fillRect(0, 0, w, h);
+        for (let n = 0; n < 260; n++) {
+          g.fillStyle = Math.random() < 0.55 ? `rgba(30,20,12,${rand(0.15, 0.4)})` : `rgba(200,180,150,${rand(0.05, 0.18)})`;
+          g.fillRect(Math.random() * w, Math.random() * h, rand(1, 3), rand(10, 50));
+        }
+      });
+    }
+    const material = new THREE.MeshLambertMaterial({ color: 0xc9b39a, map: barkTexture });
+    return material;
+  }
+  const bark = { material: null };
+  const woodMat = () => bark.material || (bark.material = barkMaterial());
+  // a log lying along x: 1.8 m, with cut ends
+  const logGeometry = new THREE.CylinderGeometry(0.13, 0.15, 1.8, 10).rotateZ(Math.PI / 2);
+  // A fallen branch: a crooked limb with a few twigs, along +x from its base.
+  function branchGeometry(seed) {
+    const random = seeded(seed);
+    const pieces = [];
+    const limb = (x, y, z, length, radius, yaw, pitch, depth) => {
+      const piece = new THREE.CylinderGeometry(radius * 0.55, radius, length, 6).translate(0, length / 2, 0);
+      piece.rotateZ(-Math.PI / 2 + pitch);
+      piece.rotateY(yaw);
+      piece.translate(x, y, z);
+      pieces.push(piece);
+      if (depth > 0) {
+        for (let n = 0; n < 2; n++) {
+          const t = 0.35 + random() * 0.5;
+          const px = x + Math.cos(yaw) * Math.cos(pitch) * length * t;
+          const pz = z - Math.sin(yaw) * Math.cos(pitch) * length * t;
+          limb(px, y + Math.sin(pitch) * length * t, pz, length * (0.35 + random() * 0.25), radius * 0.5, yaw + (random() - 0.5) * 1.6, pitch + (random() - 0.3) * 0.5, depth - 1);
+        }
+      }
+    };
+    limb(0, 0.05, 0, 1.3 + random() * 0.8, 0.045 + random() * 0.03, 0, 0.04, 2);
+    const merged = joinGeometries(pieces);
+    return merged;
+  }
+  function branchMesh(seed) {
+    const mesh = new THREE.Mesh(branchGeometry(seed), woodMat());
+    mesh.castShadow = true;
+    return mesh;
+  }
+  // A cut of meat, raw or cooked.
+  function meatMesh(cooked) {
+    const geometry = new THREE.SphereGeometry(0.12, 10, 7);
+    const p = geometry.attributes.position;
+    for (let i = 0; i < p.count; i++) {
+      const wobble = 1 + 0.18 * Math.sin(p.getX(i) * 40) * Math.cos(p.getZ(i) * 35);
+      p.setXYZ(i, p.getX(i) * 1.4 * wobble, p.getY(i) * 0.55 * wobble, p.getZ(i) * wobble);
+    }
+    geometry.computeVertexNormals();
+    return new THREE.Mesh(geometry, new THREE.MeshPhongMaterial({ color: cooked ? 0x6b3a1c : 0xa8333a, shininess: cooked ? 20 : 60, specular: 0x442222 }));
+  }
+
+  // --- building ---
+
+  // What a structure looks like, made from its record { kind, x, z, h, ... }. Each kind
+  // keeps its meshes in s.group and its colliders and surfaces in s.boxes and s.surfaces.
+  function makeStructure(s) {
+    s.group = new THREE.Group();
+    s.boxes = [];
+    s.surfaces = [];
+    s.y = terrain(s.x, s.z);
+    s.group.position.set(s.x, s.y, s.z);
+    s.group.rotation.y = s.h;
+    scene.add(s.group);
+    ({ bonfire: makeBonfire, tent: makeTent, palisade: makePalisade, platform: makePlatform, bench: makeBench, table: makeTable })[s.kind](s);
+    s.group.traverse((o) => { if (o.isMesh) o.receiveShadow = true; });
+    for (const box of s.boxes) indexAdd(colliderIndex, box);
+    for (const surface of s.surfaces) indexAdd(surfaceIndex, surface);
+    return s;
+  }
+
+  function removeStructure(s) {
+    scene.remove(s.group);
+    for (const box of s.boxes) indexRemove(colliderIndex, box);
+    for (const surface of s.surfaces) indexRemove(surfaceIndex, surface);
+  }
+
+  // A point in a structure's frame (x to its left, z ahead), in the world.
+  const structureWorld = (s, lx, lz) => [s.x + lx * Math.cos(s.h) + lz * Math.sin(s.h), s.z - lx * Math.sin(s.h) + lz * Math.cos(s.h)];
+
+  function makeBonfire(s) {
+    const ring = picnicMesh('campfire', 'ring');
+    s.group.add(ring);
+    const tripod = picnicMesh('campfire', 'tripod');
+    tripod.scale.setScalar(0.85);
+    s.group.add(tripod);
+    // the wood: branches leant together over the middle
+    s.wood = new THREE.Group();
+    for (let n = 0; n < 7; n++) {
+      const stick = branchMesh(100 + n);
+      stick.scale.set(0.55, 1, 0.55);
+      stick.rotation.set(0, (n / 7) * Math.PI * 2, 0.75);
+      stick.position.set(Math.cos((n / 7) * Math.PI * 2) * 0.35, 0.05, -Math.sin((n / 7) * Math.PI * 2) * 0.35);
+      s.wood.add(stick);
+    }
+    s.group.add(s.wood);
+    s.embers = picnicMesh('campfire', 'embers');
+    s.embers.scale.setScalar(0.85);
+    s.embers.visible = false;
+    s.group.add(s.embers);
+    // the pot hangs from the tripod's bar while something cooks
+    s.pot = picnicMesh('campfire', 'kettle');
+    s.pot.scale.setScalar(0.8);
+    s.pot.position.y = 0.28;
+    s.pot.visible = false;
+    s.group.add(s.pot);
+    s.fuel = s.fuel ?? 0;
+    s.lit = !!s.lit;
+    s.boxes.push({ minX: s.x - 0.55, maxX: s.x + 0.55, minZ: s.z - 0.55, maxZ: s.z + 0.55, minY: s.y - 1, maxY: s.y + 0.3, top: s.y + 0.25, soft: true });
+  }
+
+  function makeTent(s) {
+    const tent = picnicMesh('tent', 'tent');
+    tent.scale.setScalar(0.85);
+    s.group.add(tent);
+    const box = picnicBounds('tent', 'tent');
+    const hw = (box.max.x - box.min.x) * 0.42;
+    const hd = (box.max.z - box.min.z) * 0.42;
+    const [cx, cz] = [s.x, s.z];
+    const r = Math.max(hw, hd);
+    s.boxes.push({ minX: cx - r * 0.7, maxX: cx + r * 0.7, minZ: cz - r * 0.7, maxZ: cz + r * 0.7, minY: s.y - 1, maxY: s.y + 1.5, car: { x: cx, z: cz, h: s.h, hl: hd, hw } });
+  }
+
+  // The palisade: a ring of sharpened stakes round the camp, in sections, one of them a
+  // gate. Sections not yet built show as a faint outline while you work on it.
+  const stakeGeometry = (() => {
+    const shaft = new THREE.CylinderGeometry(0.1, 0.11, PALISADE_HEIGHT - 0.3, 7).translate(0, (PALISADE_HEIGHT - 0.3) / 2 - 0.35, 0);
+    const point = new THREE.ConeGeometry(0.1, 0.42, 7).translate(0, PALISADE_HEIGHT - 0.65 + 0.21 - 0.02, 0);
+    return joinGeometries([shaft, point]);
+  })();
+  const railGeometry = new THREE.CylinderGeometry(0.06, 0.06, 1, 6).rotateZ(Math.PI / 2);
+  const ghostMat = new THREE.MeshBasicMaterial({ color: 0x8fd16a, transparent: true, opacity: 0.22, depthWrite: false });
+  const ghostBad = new THREE.MeshBasicMaterial({ color: 0xff5a4a, transparent: true, opacity: 0.25, depthWrite: false });
+
+  function palisadeSection(s, i) {
+    const n = BUILDS.palisade.sections;
+    const R = BUILDS.palisade.ring;
+    const a0 = (i / n) * Math.PI * 2;
+    const a1 = ((i + 1) / n) * Math.PI * 2;
+    return { a0, a1, ax: Math.sin(a0) * R, az: Math.cos(a0) * R, bx: Math.sin(a1) * R, bz: Math.cos(a1) * R };
+  }
+
+  function makePalisade(s) {
+    const n = BUILDS.palisade.sections;
+    s.sections = s.sections || new Array(n).fill(false);
+    s.gate = 0; // the section facing the way it was placed
+    s.gateOpen = s.gateOpen ?? true;
+    s.parts = [];
+    const wood = woodMat();
+    for (let i = 0; i < n; i++) {
+      const sec = palisadeSection(s, i);
+      const built = new THREE.Group();
+      const ghost = new THREE.Group();
+      const len = Math.hypot(sec.bx - sec.ax, sec.bz - sec.az);
+      const angle = Math.atan2(sec.bx - sec.ax, sec.bz - sec.az);
+      if (i === s.gate) {
+        // a gate of planks on two posts, hinged at one side
+        const hinge = new THREE.Group();
+        hinge.position.set(sec.ax, 0, sec.az);
+        hinge.rotation.y = angle - Math.PI / 2;
+        for (let k = 0; k < 6; k++) {
+          const plank = new THREE.Mesh(new THREE.BoxGeometry(0.06, 2.1, len / 6 - 0.02), wood);
+          plank.position.set(0, 1.05, (k + 0.5) * (len / 6));
+          plank.castShadow = true;
+          hinge.add(plank);
+        }
+        for (const y of [0.45, 1.65]) {
+          const bar = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.12, len - 0.1), wood);
+          bar.position.set(0.06, y, len / 2);
+          hinge.add(bar);
+        }
+        built.add(hinge);
+        s.hinge = hinge;
+        for (const [px, pz] of [[sec.ax, sec.az], [sec.bx, sec.bz]]) {
+          const post = new THREE.Mesh(stakeGeometry, wood);
+          post.position.set(px, 0, pz);
+          post.scale.set(1.4, 1.08, 1.4);
+          post.castShadow = true;
+          built.add(post);
+        }
+      } else {
+        const count = 8;
+        for (let k = 0; k < count; k++) {
+          const t = (k + 0.5) / count;
+          const stake = new THREE.Mesh(stakeGeometry, wood);
+          const ground = terrain(...structureWorld(s, sec.ax + (sec.bx - sec.ax) * t, sec.az + (sec.bz - sec.az) * t)) - s.y;
+          stake.position.set(sec.ax + (sec.bx - sec.ax) * t, ground, sec.az + (sec.bz - sec.az) * t);
+          stake.rotation.set(rand(-0.04, 0.04), rand(0, 6), rand(-0.04, 0.04));
+          stake.scale.set(rand(0.85, 1.1), rand(0.95, 1.06), rand(0.85, 1.1));
+          stake.castShadow = true;
+          built.add(stake);
+        }
+        for (const y of [0.55, 1.55]) {
+          const rail = new THREE.Mesh(railGeometry, wood);
+          rail.position.set((sec.ax + sec.bx) / 2, y, (sec.az + sec.bz) / 2);
+          rail.rotation.y = angle - Math.PI / 2;
+          rail.scale.x = len;
+          built.add(rail);
+        }
+      }
+      const outline = new THREE.Mesh(new THREE.BoxGeometry(0.14, PALISADE_HEIGHT, len), ghostMat);
+      outline.position.set((sec.ax + sec.bx) / 2, PALISADE_HEIGHT / 2 - 0.3, (sec.az + sec.bz) / 2);
+      outline.rotation.y = angle;
+      ghost.add(outline);
+      s.group.add(built, ghost);
+      const [wax, waz] = structureWorld(s, sec.ax, sec.az);
+      const [wbx, wbz] = structureWorld(s, sec.bx, sec.bz);
+      const box = { ...segmentBox(wax, waz, wbx, wbz, 0.16, s.y - 1, s.y + PALISADE_HEIGHT - 0.1), palisade: true };
+      s.parts.push({ built, ghost, box, mid: structureWorld(s, (sec.ax + sec.bx) / 2, (sec.az + sec.bz) / 2) });
+    }
+    refreshPalisade(s);
+  }
+
+  // The collider for a straight run from a to b (see addSegmentCollider), not yet added.
+  function segmentBox(ax, az, bx, bz, half, y0, y1) {
+    const len = Math.hypot(bx - ax, bz - az) || 0.01;
+    const x = (ax + bx) / 2;
+    const z = (az + bz) / 2;
+    const reach = len / 2 + half;
+    return { minX: x - reach, maxX: x + reach, minZ: z - reach, maxZ: z + reach, minY: y0, maxY: y1, car: { x, z, h: Math.atan2(bx - ax, bz - az), hl: len / 2, hw: half } };
+  }
+
+  // Shows each section built or as an outline, and makes the built ones solid (the gate
+  // only while it is shut).
+  function refreshPalisade(s) {
+    s.parts.forEach((part, i) => {
+      const built = s.sections[i];
+      part.built.visible = built;
+      part.ghost.visible = !built;
+      const solid = built && !(i === s.gate && s.gateOpen);
+      if (solid && !part.solid) indexAdd(colliderIndex, part.box);
+      if (!solid && part.solid) indexRemove(colliderIndex, part.box);
+      part.solid = solid;
+    });
+    if (s.hinge) s.hinge.rotation.y = Math.atan2(palisadeSection(s, s.gate).bx - palisadeSection(s, s.gate).ax, palisadeSection(s, s.gate).bz - palisadeSection(s, s.gate).az) - Math.PI / 2 + (s.gateOpen ? -1.6 : 0);
+  }
+  const palisadeClosed = () => picnic.structures.some((s) => s.kind === 'palisade' && s.sections.every(Boolean) && !s.gateOpen);
+  // Is (x, z) inside a finished palisade?
+  const insidePalisade = (x, z) => picnic.structures.some((s) => s.kind === 'palisade' && s.sections.every(Boolean) && Math.hypot(x - s.x, z - s.z) < BUILDS.palisade.ring - 0.4);
+
+  // The raised platform: a deck on four log posts, stairs up one side, a rail round the
+  // rest and a roof of leaves, built in three stages.
+  function makePlatform(s) {
+    s.stage = s.stage ?? 0;
+    s.parts = [new THREE.Group(), new THREE.Group(), new THREE.Group()];
+    const wood = woodMat();
+    const H = PLATFORM_HEIGHT;
+    const half = 1.5;
+    const planks = new THREE.MeshLambertMaterial({ color: 0xb08a62, map: barkTexture });
+    // stage 1: posts
+    for (const [x, z] of [[-half, -half], [half, -half], [-half, half], [half, half]]) {
+      const ground = terrain(...structureWorld(s, x, z)) - s.y;
+      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.15, H + 2.4 - ground + 0.4, 8), wood);
+      post.position.set(x, (H + 2.4 + ground - 0.4) / 2, z);
+      post.castShadow = true;
+      s.parts[0].add(post);
+    }
+    // stage 2: the deck, its rail and the stairs (which come down off the front edge)
+    const deck = new THREE.Mesh(new THREE.BoxGeometry(half * 2 + 0.3, 0.12, half * 2 + 0.3), planks);
+    deck.position.y = H - 0.06;
+    deck.castShadow = true;
+    s.parts[1].add(deck);
+    for (let k = -half; k <= half; k += 0.25) {
+      const board = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.01, half * 2 + 0.3), new THREE.MeshLambertMaterial({ color: 0x5c432c }));
+      board.position.set(k, H + 0.001, 0);
+      s.parts[1].add(board);
+    }
+    const rails = [[-half, -half, half, -half], [-half, -half, -half, half], [half, -half, half, half], [-half, half, -0.45, half], [0.45, half, half, half]];
+    for (const [ax, az, bx, bz] of rails) {
+      const len = Math.hypot(bx - ax, bz - az);
+      for (const y of [0.5, 1.0]) {
+        const rail = new THREE.Mesh(railGeometry, wood);
+        rail.position.set((ax + bx) / 2, H + y, (az + bz) / 2);
+        rail.rotation.y = Math.atan2(bx - ax, bz - az) - Math.PI / 2;
+        rail.scale.x = len;
+        s.parts[1].add(rail);
+      }
+      const [wax, waz] = structureWorld(s, ax, az);
+      const [wbx, wbz] = structureWorld(s, bx, bz);
+      s.railBoxes = s.railBoxes || [];
+      s.railBoxes.push(segmentBox(wax, waz, wbx, wbz, 0.1, s.y + H - 0.2, s.y + H + 1.1));
+    }
+    const run = 3.4; // the stairs: from the deck's front edge down and out
+    const steps = 12;
+    for (let k = 0; k < steps; k++) {
+      const t = (k + 0.5) / steps;
+      const step = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.06, run / steps + 0.04), planks);
+      step.position.set(0, H - (H * t) + 0.02, half + run * t);
+      step.castShadow = true;
+      s.parts[1].add(step);
+    }
+    for (const side of [-0.45, 0.45]) {
+      const stringer = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.22, Math.hypot(run, H)), wood);
+      stringer.position.set(side, H / 2, half + run / 2);
+      stringer.rotation.x = Math.atan2(H, run);
+      s.parts[1].add(stringer);
+    }
+    const [dx0, dz0] = structureWorld(s, 0, half + run);
+    const [dx1, dz1] = structureWorld(s, 0, half);
+    s.deckSurfaces = [
+      { minX: 0, maxX: 0, minZ: 0, maxZ: 0, ax: dx0, az: dz0, bx: dx1, bz: dz1, ha: s.y + 0.02, hb: s.y + H, half: 0.42 },
+    ];
+    // the deck itself as a rotated square: two strips across it
+    for (const off of [-0.8, 0.8]) {
+      const [ax, az] = structureWorld(s, off, -half - 0.1);
+      const [bx, bz] = structureWorld(s, off, half + 0.1);
+      s.deckSurfaces.push({ ax, az, bx, bz, ha: s.y + H, hb: s.y + H, half: 0.78 });
+    }
+    for (const surface of s.deckSurfaces) {
+      surface.minX = Math.min(surface.ax, surface.bx) - surface.half;
+      surface.maxX = Math.max(surface.ax, surface.bx) + surface.half;
+      surface.minZ = Math.min(surface.az, surface.bz) - surface.half;
+      surface.maxZ = Math.max(surface.az, surface.bz) + surface.half;
+    }
+    // stage 3: a pitched roof of big leaves on the posts
+    const thatch = new THREE.MeshLambertMaterial({ color: 0x7d9a4a, map: leafThatch(), side: THREE.DoubleSide });
+    thatch.userData.snow = 'foliage';
+    // two panes from the ridge down to the eaves on the post tops, overhanging a little
+    const eave = half + 0.45;
+    const rise = 1.15;
+    const slope = Math.hypot(eave, rise);
+    for (const side of [-1, 1]) {
+      const pane = new THREE.Mesh(new THREE.PlaneGeometry(slope, half * 2 + 0.9).rotateX(-Math.PI / 2), thatch);
+      pane.position.set(side * eave / 2, H + 2.35 + rise / 2, 0);
+      pane.rotation.z = -side * Math.atan2(rise, eave);
+      pane.castShadow = true;
+      s.parts[2].add(pane);
+    }
+    const ridge = new THREE.Mesh(railGeometry, wood);
+    ridge.position.set(0, H + 2.35 + rise + 0.02, 0);
+    ridge.rotation.y = Math.PI / 2;
+    ridge.scale.x = half * 2 + 0.9;
+    s.parts[2].add(ridge);
+    for (const z of [-half, half]) {
+      const beam = new THREE.Mesh(railGeometry, wood); // the tie beams the panes rest on
+      beam.position.set(0, H + 2.35, z);
+      beam.scale.x = half * 2 + 0.3;
+      s.parts[2].add(beam);
+    }
+    for (const part of s.parts) s.group.add(part);
+    s.ghost = new THREE.Mesh(new THREE.BoxGeometry(half * 2, H + 3.4, half * 2), ghostMat);
+    s.ghost.position.y = (H + 3.4) / 2;
+    s.group.add(s.ghost);
+    s.postBoxes = [[-half, -half], [half, -half], [-half, half], [half, half]].map(([x, z]) => {
+      const [wx, wz] = structureWorld(s, x, z);
+      return { minX: wx - 0.18, maxX: wx + 0.18, minZ: wz - 0.18, maxZ: wz + 0.18, minY: s.y - 1, maxY: s.y + H + 2.5 };
+    });
+    refreshPlatform(s);
+  }
+
+  function refreshPlatform(s) {
+    s.parts.forEach((part, i) => { part.visible = s.stage > i; });
+    s.ghost.visible = s.stage < 3;
+    s.ghost.scale.y = 1;
+    const want = [...(s.stage >= 1 ? s.postBoxes : []), ...(s.stage >= 2 ? s.railBoxes : [])];
+    for (const box of s.boxes) if (!want.includes(box)) indexRemove(colliderIndex, box);
+    for (const box of want) if (!s.boxes.includes(box)) indexAdd(colliderIndex, box);
+    s.boxes = want;
+    const surfaces = s.stage >= 2 ? s.deckSurfaces : [];
+    for (const surface of s.surfaces) if (!surfaces.includes(surface)) indexRemove(surfaceIndex, surface);
+    for (const surface of surfaces) if (!s.surfaces.includes(surface)) indexAdd(surfaceIndex, surface);
+    s.surfaces = surfaces;
+  }
+  // Standing on a finished platform: out of reach of anything on the ground.
+  const onPlatform = () => picnic.structures.some((s) => s.kind === 'platform' && s.stage >= 2 && car.y > s.y + PLATFORM_HEIGHT - 0.4
+    && Math.abs(camperLocal(s, car.x, car.z)[0]) < 1.7 && Math.abs(camperLocal(s, car.x, car.z)[1]) < 1.7);
+
+  // Overlapping banana leaves, for the thatch.
+  let thatchTexture = null;
+  function leafThatch() {
+    if (!thatchTexture) {
+      thatchTexture = canvasTexture(256, 256, (g, w, h) => {
+        g.fillStyle = '#4f6a2c';
+        g.fillRect(0, 0, w, h);
+        for (let row = -1; row < 9; row++) {
+          for (let n = 0; n < 7; n++) {
+            const x = n * 40 + (row % 2) * 20 + rand(-5, 5);
+            const y = row * 30;
+            g.fillStyle = `hsl(${rand(78, 98)}, ${rand(30, 45)}%, ${rand(28, 42)}%)`;
+            g.beginPath();
+            g.ellipse(x, y + 22, 17, 30, rand(-0.2, 0.2), 0, Math.PI * 2);
+            g.fill();
+            g.strokeStyle = 'rgba(220,230,170,0.35)';
+            g.beginPath();
+            g.moveTo(x, y - 6);
+            g.lineTo(x, y + 50);
+            g.stroke();
+          }
+        }
+      });
+    }
+    return thatchTexture;
+  }
+
+  function makeBench(s) {
+    const wood = woodMat();
+    const seat = new THREE.Mesh(new THREE.CylinderGeometry(0.17, 0.17, 1.7, 10).rotateZ(Math.PI / 2), wood);
+    seat.scale.set(1, 1, 0.6);
+    seat.position.y = 0.45;
+    seat.castShadow = true;
+    s.group.add(seat);
+    for (const x of [-0.6, 0.6]) {
+      const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.15, 0.36, 8), wood);
+      leg.position.set(x, 0.18, 0);
+      s.group.add(leg);
+    }
+    s.boxes.push({ minX: s.x - 0.9, maxX: s.x + 0.9, minZ: s.z - 0.9, maxZ: s.z + 0.9, minY: s.y - 1, maxY: s.y + 0.55, top: s.y + 0.55, car: { x: s.x, z: s.z, h: s.h + Math.PI / 2, hl: 0.85, hw: 0.22 } });
+  }
+
+  function makeTable(s) {
+    const wood = woodMat();
+    const top = new THREE.MeshLambertMaterial({ color: 0xa47d55, map: barkTexture });
+    for (let k = 0; k < 5; k++) {
+      const plank = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.06, 0.17), top);
+      plank.position.set(0, 0.78, -0.36 + k * 0.18);
+      plank.castShadow = true;
+      s.group.add(plank);
+    }
+    for (const [x, z] of [[-0.6, -0.3], [0.6, -0.3], [-0.6, 0.3], [0.6, 0.3]]) {
+      const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.07, 0.76, 7), wood);
+      leg.position.set(x, 0.38, z);
+      s.group.add(leg);
+    }
+    const leaf = new THREE.Mesh(new THREE.PlaneGeometry(0.8, 0.5), new THREE.MeshLambertMaterial({ color: 0x6f8f3a, map: leafThatch(), side: THREE.DoubleSide }));
+    leaf.rotation.x = -Math.PI / 2;
+    leaf.position.y = 0.815;
+    s.group.add(leaf);
+    s.boxes.push({ minX: s.x - 0.9, maxX: s.x + 0.9, minZ: s.z - 0.9, maxZ: s.z + 0.9, minY: s.y - 1, maxY: s.y + 0.82, top: s.y + 0.82, car: { x: s.x, z: s.z, h: s.h + Math.PI / 2, hl: 0.76, hw: 0.42 } });
+  }
+
+  // Placing something from the build menu: a see-through copy follows your aim, green
+  // where it fits and red where it does not; click (or E) to set it down, R turns it.
+  function startPlacing(kind) {
+    const b = BUILDS[kind];
+    if (b.need && !picnic.tools.has(b.need)) {
+      showToast(`You need the ${TOOLS[b.need].name.toLowerCase()} for that`, true);
+      return;
+    }
+    if (['tent', 'palisade', 'platform'].includes(kind) && hasBuilt(kind)) {
+      showToast(`The ${b.name.toLowerCase()} is already placed`, true);
+      return;
+    }
+    const cost = b.cost || {};
+    if (!b.section && !b.stages && Object.entries(cost).some(([k, n]) => picnic.inv[k] < n)) {
+      showToast(`Not enough for the ${b.name.toLowerCase()}: ${Object.entries(cost).map(([k, n]) => `${n} ${ITEMS[k].name.toLowerCase()}`).join(', ')}`, true);
+      return;
+    }
+    toggleBuildMenu(false);
+    const ghost = new THREE.Group();
+    const r = b.radius;
+    if (kind === 'palisade') {
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(BUILDS.palisade.ring, 0.12, 6, 64).rotateX(Math.PI / 2), ghostMat);
+      ring.position.y = 0.4;
+      const gate = new THREE.Mesh(new THREE.BoxGeometry(2.6, 2.2, 0.2), ghostMat);
+      gate.position.set(Math.sin(Math.PI / 18) * BUILDS.palisade.ring, 1.1, Math.cos(Math.PI / 18) * BUILDS.palisade.ring);
+      ghost.add(ring, gate);
+    } else {
+      const shape = new THREE.Mesh(new THREE.CylinderGeometry(r, r, kind === 'platform' ? PLATFORM_HEIGHT + 3 : 1.2, 24, 1, true), ghostMat);
+      shape.position.y = kind === 'platform' ? (PLATFORM_HEIGHT + 3) / 2 : 0.6;
+      ghost.add(shape);
+    }
+    scene.add(ghost);
+    picnic.build = { kind, ghost, h: hero.facing + Math.PI, ok: false };
+  }
+
+  function updatePlacing() {
+    const p = picnic.build;
+    if (!p) return;
+    const b = BUILDS[p.kind];
+    const ahead = p.kind === 'palisade' ? 0 : b.radius + 1.6;
+    const fx = Math.sin(hero.yaw);
+    const fz = Math.cos(hero.yaw);
+    // the palisade goes round the camp's middle (round the bonfire if there is one)
+    let x = car.x + fx * ahead;
+    let z = car.z + fz * ahead;
+    if (p.kind === 'palisade') {
+      const fire = picnic.structures.find((s) => s.kind === 'bonfire');
+      const centre = fire || { x: CAMP.x, z: CAMP.z };
+      x = centre.x;
+      z = centre.z;
+    }
+    const y = terrain(x, z);
+    p.x = x;
+    p.z = z;
+    p.ghost.position.set(x, y, z);
+    p.ghost.rotation.y = p.h;
+    // it fits on fairly level ground, clear of what is already there
+    const r = b.radius;
+    const slope = Math.abs(terrain(x + r, z) - terrain(x - r, z)) + Math.abs(terrain(x, z + r) - terrain(x, z - r));
+    const clear = p.kind === 'palisade' || !collidersNear(x, z, r).some((box) => !box.palisade && (box.maxY ?? 9) > y + 0.2 && (box.minY ?? -9) < y + 2
+      && x + r * 0.8 > box.minX && x - r * 0.8 < box.maxX && z + r * 0.8 > box.minZ && z - r * 0.8 < box.maxZ);
+    const nearCamp = Math.hypot(x - CAMP.x, z - CAMP.z) < 90 || p.kind === 'bonfire' || p.kind === 'tent';
+    p.ok = slope < (p.kind === 'palisade' ? 6 : 1.4) && clear && !inWater(x, z) && nearCamp;
+    p.why = !nearCamp ? 'Build it in the camp clearing' : slope >= 1.4 ? 'The ground is too steep here' : !clear ? 'Something is in the way' : '';
+    for (const o of p.ghost.children) o.material = p.ok ? ghostMat : ghostBad;
+    setActPrompt(p.ok ? `<kbd>Click</kbd> place the ${b.name.toLowerCase()} · <kbd>R</kbd> turn · <kbd>B</kbd> cancel` : `${p.why} · <kbd>B</kbd> cancel`);
+  }
+
+  function placeBuild() {
+    const p = picnic.build;
+    if (!p || !p.ok) return;
+    const b = BUILDS[p.kind];
+    scene.remove(p.ghost);
+    picnic.build = null;
+    const s = { kind: p.kind, x: p.x, z: p.z, h: p.kind === 'palisade' ? Math.atan2(picnic.rvModel ? camperAt().x - p.x : 1, picnic.rvModel ? camperAt().z - p.z : 0) : p.h };
+    if (p.kind === 'palisade') s.sections = new Array(b.sections).fill(false);
+    if (p.kind === 'platform') s.stage = 0;
+    if (p.kind === 'bonfire') s.fuel = 200; // the branches it is built from: ready to light
+    if (b.cost) {
+      // built on the spot: a moment kneeling at it
+      startTask(b.name, b.time, 'build', () => {
+        for (const [k, n] of Object.entries(b.cost)) picnic.inv[k] -= n;
+        picnic.structures.push(makeStructure(s));
+        playKnock();
+        picnicChanged();
+        if (p.kind === 'bonfire') setGuide('Bonfire built: E to light it', 'tip');
+      });
+    } else {
+      // a blueprint, built up a piece at a time
+      picnic.structures.push(makeStructure(s));
+      setGuide(p.kind === 'palisade' ? 'Walk to each outlined section and press E to build it' : 'E at the outline to build each stage', 'tip');
+      picnicChanged();
+    }
+  }
+
+  // --- things to pick up ---
+
+  // Dry branches and stones all over the jungle floor (thickest near camp), mangoes fallen
+  // under some trees, bunches on the banana plants. Each has an id; picked, it is gone
+  // until the next day but one.
+  const pickups = { kinds: {}, cells: new Map(), all: [] };
+  const PICKUPS = {
+    branch: { gives: ['branch', 2], count: 420, near: 70 },
+    stone: { gives: ['stone', 2], count: 320, near: 60 },
+    mango: { gives: ['mango', 2], count: 110, near: 50 },
+    log: { gives: ['log', 1], count: 0, near: 90 }, // logs from felled trees
+    bunch: { gives: ['banana', 4], count: 0, near: 60 }, // on banana plants
+  };
+  function placePickups() {
+    const random = seeded(4242);
+    let id = 900000;
+    const add = (kind, x, z, turn, extra = {}) => {
+      const p = { id: id++, kind, x, y: terrain(x, z), z, turn, ...extra };
+      pickups.all.push(p);
+      const key = Math.floor(x / JUNGLE_CELL) * 8192 + Math.floor(z / JUNGLE_CELL);
+      if (!pickups.cells.has(key)) pickups.cells.set(key, []);
+      pickups.cells.get(key).push(p);
+      return p;
+    };
+    for (const kind of ['branch', 'stone', 'mango']) {
+      let placed = 0;
+      for (let tries = 0; placed < PICKUPS[kind].count && tries < 20000; tries++) {
+        // most within 260 m of the camp, the rest anywhere
+        const a = random() * Math.PI * 2;
+        const d = random() < 0.75 ? CAMP.clear - 6 + random() ** 0.8 * 230 : random() * 600;
+        const x = CAMP.x + Math.cos(a) * d;
+        const z = CAMP.z + Math.sin(a) * d;
+        if (!inJungle(x, z) || (kind !== 'branch' && d < CAMP.clear)) continue;
+        terrainExact(x, z);
+        if (roadDist < ROAD_HALF + 1 || lakeEdge(x, z) < 4) continue;
+        if (kind === 'mango') {
+          // under a jungle tree, a few together
+          const tree = plantsNear('jungletree', x, z, 12)[0];
+          if (!tree) continue;
+          add(kind, tree.x + (random() - 0.5) * 5, tree.z + (random() - 0.5) * 5, random() * 6);
+        } else {
+          add(kind, x, z, random() * 6, { seed: Math.floor(random() * 8) });
+        }
+        placed++;
+      }
+    }
+    // banana bunches on some of the plants near camp
+    for (const plant of jungle.kinds.banana.list) {
+      if (Math.hypot(plant.x - CAMP.x, plant.z - CAMP.z) > 330 || random() > 0.45) continue;
+      const h = plant.turn + 0.8;
+      add('bunch', plant.x + Math.sin(h) * 0.35 * plant.s, plant.z + Math.cos(h) * 0.35 * plant.s, h, { lift: 1.7 * plant.s, plant });
+    }
+  }
+
+  function addLogPickup(x, z, turn) {
+    const p = { id: 800000 + Math.floor(Math.random() * 99999), kind: 'log', x, y: terrain(x, z), z, turn, temp: true };
+    pickups.all.push(p);
+    const key = Math.floor(x / JUNGLE_CELL) * 8192 + Math.floor(z / JUNGLE_CELL);
+    if (!pickups.cells.has(key)) pickups.cells.set(key, []);
+    pickups.cells.get(key).push(p);
+    pickupsDue = 0;
+  }
+
+  const pickupGone = (p) => p.taken || (picnic.picked.has(p.id) && picnic.picked.get(p.id) > picnic.day);
+  function pickupsNear(x, z, reach, out = []) {
+    const x0 = Math.floor((x - reach) / JUNGLE_CELL);
+    const x1 = Math.floor((x + reach) / JUNGLE_CELL);
+    const z0 = Math.floor((z - reach) / JUNGLE_CELL);
+    const z1 = Math.floor((z + reach) / JUNGLE_CELL);
+    for (let cx = x0; cx <= x1; cx++) {
+      for (let cz = z0; cz <= z1; cz++) {
+        const list = pickups.cells.get(cx * 8192 + cz);
+        if (list) for (const p of list) if (!pickupGone(p) && (p.x - x) ** 2 + (p.z - z) ** 2 < reach * reach) out.push(p);
+      }
+    }
+    return out;
+  }
+
+  // Each kind is drawn as instances near the camera, like the undergrowth.
+  let pickupsDue = 0;
+  function buildPickupMeshes() {
+    const shapes = {
+      branch: Array.from({ length: 8 }, (_, seed) => [{ geometry: branchGeometry(seed + 11), material: woodMat() }]),
+      stone: [picnicPart('rocks', 'stone')],
+      mango: [picnicPart('mango')],
+      log: [[{ geometry: logGeometry.clone().translate(0, 0.14, 0), material: woodMat() }]],
+      bunch: [bananaBunch()],
+    };
+    for (const [kind, variants] of Object.entries(shapes)) {
+      pickups.kinds[kind] = variants.map((parts) => parts.map(({ geometry, material }) => {
+        const mesh = new THREE.InstancedMesh(geometry, material, 160);
+        mesh.count = 0;
+        mesh.frustumCulled = false;
+        mesh.castShadow = false; // small things on the ground: their shadows would hardly show
+        mesh.receiveShadow = true;
+        jungle.group.add(mesh);
+        return mesh;
+      }));
+    }
+  }
+
+  // Bananas in a hanging bunch, from the one banana model.
+  function bananaBunch() {
+    const [banana] = picnicPart('bananas');
+    if (!banana) return [];
+    const pieces = [];
+    for (let tier = 0; tier < 2; tier++) {
+      for (let n = 0; n < 6; n++) {
+        const a = (n / 6) * Math.PI * 2 + tier * 0.5;
+        const g = banana.geometry.clone();
+        g.rotateX(-1.1);
+        g.rotateY(a);
+        g.translate(Math.sin(a) * 0.06, -tier * 0.09, Math.cos(a) * 0.06);
+        pieces.push(g);
+      }
+    }
+    pieces.push(new THREE.CylinderGeometry(0.018, 0.022, 0.5, 6).translate(0, -0.1, 0));
+    return [{ geometry: joinGeometries(pieces), material: banana.material }];
+  }
+
+  const pickMatrix = new THREE.Matrix4();
+  function updatePickups(dt) {
+    pickupsDue -= dt;
+    if (pickupsDue > 0) return;
+    pickupsDue = 0.3;
+    const near = pickupsNear(camera.position.x, camera.position.z, 80);
+    const counts = new Map();
+    for (const p of near) {
+      const spec = PICKUPS[p.kind];
+      if ((p.x - camera.position.x) ** 2 + (p.z - camera.position.z) ** 2 > spec.near * spec.near) continue;
+      const variants = pickups.kinds[p.kind];
+      const variant = variants[(p.seed || 0) % variants.length];
+      const n = counts.get(variant) || 0;
+      if (n >= 160) continue;
+      counts.set(variant, n + 1);
+      plantQ.setFromAxisAngle(yAxis, p.turn);
+      pickMatrix.compose(plantPos.set(p.x, p.y + (p.lift || 0), p.z), plantQ, plantScale.setScalar(p.kind === 'mango' ? 1 : 1));
+      for (const mesh of variant) mesh.setMatrixAt(n, pickMatrix);
+    }
+    for (const variants of Object.values(pickups.kinds)) {
+      for (const variant of variants) {
+        for (const mesh of variant) {
+          mesh.count = counts.get(variant) || 0;
+          mesh.instanceMatrix.needsUpdate = true;
+        }
+      }
+    }
+  }
+
+  function takePickup(p) {
+    const [item, n] = PICKUPS[p.kind].gives;
+    picnic.inv[item] += n;
+    if (p.temp) p.taken = true;
+    else picnic.picked.set(p.id, picnic.day + 2);
+    pickupsDue = 0;
+    playPickup();
+    showToast(`+${n} ${ITEMS[item].name.toLowerCase()}`);
+    picnicChanged();
+  }
+
+  // --- felling trees ---
+
+  // With the axe in hand, a click swings it; a swing that lands on a trunk in front of you
+  // chips at it, and enough of them bring the tree down. It falls away from you, and where
+  // it lies it leaves logs to pick up and a stump.
+  const fallingTrees = [];
+  const stumps = [];
+
+  function treeInFront(reach = 2.6) {
+    const fx = Math.sin(hero.facing);
+    const fz = Math.cos(hero.facing);
+    let best = null;
+    let bestD = Infinity;
+    for (const kind of ['jungletree', 'palm', 'banana']) {
+      for (const p of plantsNear(kind, car.x, car.z, reach + 1.5)) {
+        const spec = JUNGLE_PLANTS[kind];
+        const dx = p.x - car.x;
+        const dz = p.z - car.z;
+        const d = Math.hypot(dx, dz) - spec.trunk * p.s;
+        if (d > reach || (dx * fx + dz * fz) < Math.hypot(dx, dz) * 0.35) continue;
+        if (d < bestD) {
+          bestD = d;
+          best = p;
+        }
+      }
+    }
+    return best;
+  }
+
+  function chopSwing() {
+    if (hero.chop || picnic.energy <= 1) {
+      if (picnic.energy <= 1) setGuide('Too tired to swing the axe: eat or rest', 'warn');
+      return;
+    }
+    hero.chop = { t: 0, landed: false };
+    useEnergy(1.6);
+  }
+
+  function updateChop(dt) {
+    const c = hero.chop;
+    if (!c) return;
+    c.t += dt;
+    if (!c.landed && c.t > 0.42) {
+      c.landed = true;
+      // a beast in front takes the blow first
+      const beast = beastInFront(2.4);
+      if (beast) {
+        hurtBeast(beast, 34, Math.sin(hero.facing), Math.cos(hero.facing), false);
+        playPunch(false, 1);
+      } else {
+        const tree = treeInFront();
+        if (tree) hitTree(tree);
+        else playWhoosh();
+      }
+    }
+    if (c.t > 0.8) hero.chop = null;
+  }
+
+  function hitTree(tree) {
+    const spec = JUNGLE_PLANTS[tree.kind];
+    tree.hits = (tree.hits || 0) + 1;
+    playChop();
+    // chips fly from the cut
+    const fx = Math.sin(hero.facing);
+    const fz = Math.cos(hero.facing);
+    for (let n = 0; n < 6; n++) {
+      smoke(tree.x - fx * spec.trunk * tree.s, tree.y + 1.0, tree.z - fz * spec.trunk * tree.s, {
+        vx: -fx * rand(1, 3) + rand(-1, 1), vy: rand(1, 3), vz: -fz * rand(1, 3) + rand(-1, 1), life: rand(0.4, 0.8), size: 0.06, grow: 0.08, alpha: 0.9, shade: 0.55, rise: -9, drag: 0.5,
+      });
+    }
+    if (!spec.chop) {
+      // a banana plant gives way at once: its leaves, and maybe a bunch
+      takeLeaves(tree, true);
+      return;
+    }
+    const left = spec.chop - tree.hits;
+    if (left > 0) {
+      setGuide(`${left} more ${left === 1 ? 'blow' : 'blows'} and it comes down`, 'tip', 2);
+      return;
+    }
+    fellTree(tree, Math.atan2(tree.x - car.x, tree.z - car.z));
+  }
+
+  // `restore`: felled on an earlier visit, so only its stump is left.
+  function fellTree(tree, away, restore = false) {
+    const spec = JUNGLE_PLANTS[tree.kind];
+    tree.gone = true;
+    picnic.felled.add(tree.id);
+    if (tree.box && jungle.group.visible) indexRemove(colliderIndex, tree.box);
+    // a stump where it stood
+    const stump = picnicMesh('axe', 'stump');
+    stump.position.set(tree.x, tree.y, tree.z);
+    stump.scale.set(spec.trunk * tree.s * 2.6, Math.min(1.4, spec.trunk * tree.s * 2), spec.trunk * tree.s * 2.6);
+    stump.rotation.y = tree.turn;
+    stumps.push(stump);
+    jungle.group.add(stump);
+    if (restore) return;
+    updateJungle(0, true);
+    // the tree itself, tipping over away from the axe
+    const pivot = new THREE.Group();
+    pivot.position.set(tree.x, tree.y + 0.4, tree.z);
+    pivot.rotation.y = away;
+    const body = picnicMesh(spec.model, spec.part);
+    body.scale.setScalar(tree.s);
+    body.rotation.y = tree.turn - away;
+    body.position.y = -0.4;
+    pivot.add(body);
+    scene.add(pivot);
+    fallingTrees.push({ pivot, tree, away, t: 0, logs: spec.logs, height: picnicBounds(spec.model, spec.part).max.y * tree.s });
+    playCreak();
+    picnicChanged();
+  }
+
+  function updateFallingTrees(dt) {
+    for (let i = fallingTrees.length - 1; i >= 0; i--) {
+      const f = fallingTrees[i];
+      f.t += dt;
+      // slow at first, then faster, a bounce as it lands
+      const k = Math.min(1, (f.t / 2.4) ** 2.2);
+      const tip = (Math.PI / 2 - 0.12) * k + (f.t > 2.4 ? Math.sin((f.t - 2.4) * 14) * 0.05 * Math.exp(-(f.t - 2.4) * 5) : 0);
+      f.pivot.rotation.set(tip, f.away, 0, 'YXZ');
+      if (f.t > 2.4 && !f.landed) {
+        f.landed = true;
+        playThud(1);
+        bump = Math.max(bump, Math.max(0, 0.7 - Math.hypot(car.x - f.tree.x, car.z - f.tree.z) / 30));
+        for (let n = 0; n < 14; n++) {
+          const along = rand(0.2, 1) * f.height;
+          smoke(f.tree.x + Math.sin(f.away) * along, f.tree.y + 0.4, f.tree.z + Math.cos(f.away) * along, { vx: rand(-1, 1), vy: rand(0.5, 1.5), vz: rand(-1, 1), life: rand(1.2, 2.2), size: 1.2, grow: 3, alpha: 0.35, shade: 0.62, rise: 0.3 });
+        }
+        // anyone under it is hurt
+        const along = (car.x - f.tree.x) * Math.sin(f.away) + (car.z - f.tree.z) * Math.cos(f.away);
+        const off = Math.abs((car.x - f.tree.x) * Math.cos(f.away) - (car.z - f.tree.z) * Math.sin(f.away));
+        if (mode === 'foot' && along > 0 && along < f.height && off < 1.2) {
+          hurtHero(45, 'Crushed by a falling tree');
+          if (!hero.dead) knockHeroDown(Math.sin(f.away), Math.cos(f.away), 1.6);
+        }
+      }
+      if (f.t > 3.4) {
+        scene.remove(f.pivot);
+        fallingTrees.splice(i, 1);
+        for (let n = 0; n < f.logs; n++) {
+          const along = 2.5 + n * (f.height * 0.5) / f.logs;
+          addLogPickup(f.tree.x + Math.sin(f.away) * along, f.tree.z + Math.cos(f.away) * along, f.away + Math.PI / 2 + rand(-0.2, 0.2));
+        }
+        setGuide(`Timber! ${f.logs} logs to pick up`, 'tip', 4);
+      }
+    }
+  }
+
+  // Big leaves from a banana plant or a monstera, cut with the knife (or torn off a felled
+  // banana plant). The plant has none left for a day.
+  function takeLeaves(plant, felled = false) {
+    picnic.inv.leaves += felled ? 4 : 2;
+    picnic.picked.set(plant.id, picnic.day + 1);
+    playRustle();
+    showToast(`+${felled ? 4 : 2} big leaves`);
+    picnicChanged();
+  }
+
+  // --- a moment's work: kneeling to build, butchering, lighting the fire, eating ---
+
+  // { name, t, time, pose, done }: the hero holds a pose while it runs, a bar fills up, and
+  // walking off cancels it.
+  function startTask(name, time, pose, done) {
+    if (picnic.task) return;
+    picnic.task = { name, t: 0, time, pose, done };
+    car.vx = car.vz = 0;
+  }
+
+  function updateTask(dt) {
+    const task = picnic.task;
+    if (!task) {
+      show('task', '', () => { $('task-bar').hidden = true; });
+      return;
+    }
+    task.t += dt;
+    const moving = ['KeyW', 'KeyA', 'KeyS', 'KeyD'].some((c) => keys.has(c));
+    if (moving && task.t > 0.25) {
+      picnic.task = null;
+      setGuide(`${task.name}: stopped`, 'warn', 2);
+      return;
+    }
+    show('task', `${task.name}|${Math.round((task.t / task.time) * 40)}`, () => {
+      $('task-bar').hidden = false;
+      $('task-name').textContent = task.name;
+      $('task-fill').style.width = `${Math.min(100, (task.t / task.time) * 100)}%`;
+    });
+    if (task.pose === 'build' && Math.floor(task.t * 2.6) !== Math.floor((task.t - dt) * 2.6)) playKnock();
+    if (task.pose === 'butcher' && Math.floor(task.t * 3) !== Math.floor((task.t - dt) * 3)) playChop(0.5);
+    if (task.t >= task.time) {
+      picnic.task = null;
+      task.done();
+    }
+  }
+
+  // --- food and energy ---
+
+  function useEnergy(amount) {
+    picnic.energy = Math.max(0, picnic.energy - amount);
+  }
+
+  function eatFood(key) {
+    const item = ITEMS[key];
+    if (!item || !item.food || picnic.inv[key] <= 0) return false;
+    picnic.inv[key] -= 1;
+    picnic.energy = Math.min(100, picnic.energy + item.food);
+    if (item.heal) hero.health = Math.min(100, hero.health + item.heal);
+    picnic.ate = true;
+    playEat();
+    showToast(`Ate ${key === 'cooked' ? 'cooked meat' : `a ${key}`}: +${item.food} energy`);
+    picnicChanged();
+    return true;
+  }
+
+  // Q: the best food you have, after a moment's eating.
+  function eatSomething() {
+    const key = ['cooked', 'mango', 'banana'].find((k) => picnic.inv[k] > 0);
+    if (!key) {
+      showToast(picnic.inv.meat > 0 ? 'Cook the meat first: E at a burning fire, or the camper\'s stove' : 'Nothing to eat: find fruit, or hunt', true);
+      return;
+    }
+    startTask('Eating', 1.4, 'eat', () => eatFood(key));
+  }
+
+  // Energy goes as you work and comes back as you rest: lying still for a minute and a
+  // half brings it back from nothing, quicker by the fire or inside the camper.
+  function updateEnergy(dt) {
+    const speed = Math.hypot(car.vx, car.vz);
+    let use = 0.012;
+    if (mode === 'foot' && !picnic.inside) {
+      if (hero.sprinting) use = 0.22;
+      else if (picnic.crawling && speed > 0.2) use = 0.09;
+      else if (speed > 0.3) use = 0.03;
+      if (picnic.carry) use += 0.12;
+    }
+    const resting = (mode === 'foot' && speed < 0.2 && !hero.chop && !hero.draw && !picnic.task) || picnic.inside;
+    if (resting) {
+      const cosy = picnic.inside || nearFire(car.x, car.z, 6) || picnic.seated;
+      picnic.energy = Math.min(100, picnic.energy + (cosy ? 1.6 : 1.0) * dt);
+    } else {
+      picnic.energy = Math.max(0, picnic.energy - use * dt);
+    }
+  }
+  const nearFire = (x, z, reach) => picnic.structures.some((s) => s.kind === 'bonfire' && s.lit && Math.hypot(x - s.x, z - s.z) < reach);
+
+  // --- the animals ---
+
+  // Deer graze in herds in the woods round the camp and run from you. Bears roam the ring
+  // beyond, tigers the land past that; either attacks if you come too close, and after dark
+  // both come looking for you. The deer move with their own walk and run; the bear's and
+  // the tiger's legs are placed on the ground step by step (the tiger runs with its own
+  // gallop). Killed, an animal drops onto its side and its legs kick for a few seconds.
+  //   ring: how far from the camp it lives; sight: how far off it notices you walking
+  const BEASTS = {
+    deer: { model: 'deer', health: 100, walk: 1.3, run: 11, turn: 3.2, girth: 0.34, half: 0.95, high: 1.25, sight: 1, count: 18, ring: [CAMP.clear + 25, 330], meat: 4 },
+    bear: { model: 'bear', health: 300, walk: 1.2, run: 9, turn: 2.2, girth: 0.55, half: 1.0, high: 1.05, sight: 0.75, count: 3, ring: [215, 395], damage: 24, reach: 2.4, meat: 6 },
+    tiger: { model: 'tiger', health: 230, walk: 1.45, run: 13.5, turn: 3.4, girth: 0.4, half: 1.05, high: 0.95, sight: 1.25, count: 2, ring: [425, 700], damage: 36, reach: 2.7, meat: 0 },
+  };
+
+  // Bones found by the start of their (tidied-up) names: the loader drops dots and turns
+  // spaces into underscores.
+  function boneNamed(root, pattern) {
+    let found = null;
+    root.traverse((o) => { if (!found && o.isBone && pattern.test(o.name)) found = o; });
+    return found;
+  }
+
+  // Each animal's legs for the stepping: upper, middle, end bone, then the bone at the sole.
+  const GAIT_LEGS = {
+    bear: [
+      ['front_thighL', 'front_shinL', 'front_footL', 'front_toeL', 1, 1], ['front_thighR', 'front_shinR', 'front_footR', 'front_toeR', -1, 1],
+      ['thighL', 'shinL', 'footL', 'toeL', 1, -1], ['thighR', 'shinR', 'footR', 'toeR', -1, -1],
+    ],
+    tiger: [
+      ['Bip01_L_UpperArm', 'Bip01_L_Forearm', 'Bip01_L_Hand', 'Bip01_L_Finger0', 1, 1], ['Bip01_R_UpperArm', 'Bip01_R_Forearm', 'Bip01_R_Hand', 'Bip01_R_Finger0', -1, 1],
+      ['Bip01_L_Thigh', 'Bip01_L_Calf', 'Bip01_L_HorseLink', 'Bip01_L_Foot', 1, -1], ['Bip01_R_Thigh', 'Bip01_R_Calf', 'Bip01_R_HorseLink', 'Bip01_R_Foot', -1, -1],
+    ],
+  };
+  // bones that kick as it dies, and the neck that lowers to graze
+  const TWITCH = {
+    deer: [/^leg_back__06/, /^leg_back__012/, /^leg_front_l/, /^leg_front_r/, /^knee_back_l/, /^knee_front_r/, /^neck_020/],
+    bear: [/^front_thighL/, /^front_thighR/, /^thighL/, /^thighR/, /^front_shinL/, /^shinR/, /^spine010/],
+    tiger: [/^Bip01_L_UpperArm/, /^Bip01_R_UpperArm/, /^Bip01_L_Thigh/, /^Bip01_R_Thigh/, /^Bip01_L_Calf/, /^Bip01_Tail/, /^Bip01_Neck/],
+  };
+
+  function makeBeast(species, x, z, herd = null) {
+    const sp = BEASTS[species];
+    const template = picnicModels[sp.model];
+    const group = new THREE.Group(); // where it is and which way it faces
+    group.rotation.order = 'YXZ';
+    const tilt = new THREE.Group(); // leaning with the slope, rolling over when it dies
+    const body = THREE.SkeletonUtils.clone(template.root);
+    body.traverse((o) => {
+      if (o.isMesh) {
+        o.castShadow = true;
+        o.frustumCulled = false;
+      }
+    });
+    tilt.add(body);
+    group.add(tilt);
+    jungle.group.add(group);
+    const b = {
+      species, sp, group, tilt, body, x, z, y: terrain(x, z), h: Math.random() * Math.PI * 2, speed: 0, goal: 0,
+      health: sp.health, state: 'wander', timer: rand(1, 6), tx: x, tz: z, home: { x, z }, herd, dodge: 0, stuck: 0,
+      graze: 0, alert: 0, attackT: 0, roarT: rand(10, 40), hunting: false, dead: null, phase: Math.random(),
+    };
+    // clips
+    if (template.animations.length) {
+      b.mixer = new THREE.AnimationMixer(body);
+      b.actions = {};
+      for (const clip of template.animations) {
+        const action = b.mixer.clipAction(clip);
+        action.play();
+        action.setEffectiveWeight(0);
+        b.actions[clip.name] = action;
+      }
+      if (b.actions.idle) b.actions.idle.setEffectiveWeight(1);
+    }
+    // stepping legs
+    if (GAIT_LEGS[species]) {
+      body.updateMatrixWorld(true);
+      const inverse = new THREE.Matrix4().copy(group.matrixWorld).invert();
+      b.legs = GAIT_LEGS[species].map(([u, m, e, s, side, front]) => {
+        const leg = { upper: boneNamed(body, new RegExp(`^${u}`)), mid: boneNamed(body, new RegExp(`^${m}`)), end: boneNamed(body, new RegExp(`^${e}`)), sole: boneNamed(body, new RegExp(`^${s}`)), side, front };
+        if (!leg.upper || !leg.mid || !leg.end || !leg.sole) return null;
+        leg.rest = leg.end.getWorldPosition(new THREE.Vector3()).applyMatrix4(inverse);
+        leg.lift = leg.rest.y - leg.sole.getWorldPosition(new THREE.Vector3()).applyMatrix4(inverse).y; // the end bone above the sole
+        leg.endLen = leg.end.getWorldPosition(new THREE.Vector3()).distanceTo(leg.sole.getWorldPosition(new THREE.Vector3()));
+        return leg;
+      });
+      if (b.legs.some((leg) => !leg)) b.legs = null;
+      else {
+        // the same stance both sides, feet square under the body
+        for (const front of [1, -1]) {
+          const pair = b.legs.filter((leg) => leg.front === front);
+          const x0 = (Math.abs(pair[0].rest.x) + Math.abs(pair[1].rest.x)) / 2;
+          const z0 = (pair[0].rest.z + pair[1].rest.z) / 2;
+          for (const leg of pair) {
+            leg.rest.set(leg.side * x0, 0, z0);
+            leg.foot = new THREE.Vector3();
+          }
+        }
+        b.hips = body.children[0];
+      }
+    }
+    b.twitch = TWITCH[species].map((p) => boneNamed(body, p)).filter(Boolean);
+    b.neck = boneNamed(body, species === 'deer' ? /^neck_020/ : species === 'bear' ? /^spine010/ : /^Bip01_Neck/);
+    b.head = boneNamed(body, species === 'deer' ? /^head_022/ : species === 'bear' ? /^spine011/ : /^Bip01_Head/);
+    // a doe has no antlers
+    if (species === 'deer' && herd && herd.members.length > 0 && Math.random() < 0.7) {
+      body.traverse((o) => { if (o.isMesh && /jiao/.test(o.material.name)) o.visible = false; });
+    }
+    if (species === 'deer') body.scale.multiplyScalar(rand(0.86, 1.04));
+    picnic.beasts.push(b);
+    if (herd) herd.members.push(b);
+    return b;
+  }
+
+  // Somewhere for a species to be: in its ring of the jungle, on open ground.
+  function beastSpot(species, random = Math.random) {
+    const [r0, r1] = BEASTS[species].ring;
+    for (let tries = 0; tries < 200; tries++) {
+      const a = random() * Math.PI * 2;
+      const d = r0 + random() * (r1 - r0);
+      const x = CAMP.x + Math.cos(a) * d;
+      const z = CAMP.z + Math.sin(a) * d;
+      if (jungleGround(x, z) && Math.hypot(x - car.x, z - car.z) > 60) return { x, z };
+    }
+    return null;
+  }
+
+  function spawnBeasts() {
+    const random = seeded(31337 + picnic.day);
+    for (let n = 0; n < BEASTS.deer.count;) {
+      const spot = beastSpot('deer', random);
+      if (!spot) break;
+      const herd = { members: [], panic: 0, x: spot.x, z: spot.z };
+      const size = 3 + Math.floor(random() * 3);
+      for (let k = 0; k < size && n < BEASTS.deer.count; k++, n++) makeBeast('deer', spot.x + (random() - 0.5) * 10, spot.z + (random() - 0.5) * 10, herd);
+    }
+    for (const species of ['bear', 'tiger']) {
+      for (let n = 0; n < BEASTS[species].count; n++) {
+        const spot = beastSpot(species, random);
+        if (spot) makeBeast(species, spot.x, spot.z);
+      }
+    }
+  }
+
+  // How far off an animal notices you, before its own keenness: far when you run, close
+  // when you crawl, closer still crawling through ferns and bushes, less by night.
+  let heroLoud = 0;
+  let heroHidden = false;
+  function heroCovered() {
+    for (const kind of ['fern', 'fernA', 'fernB', 'monstera', 'banana']) {
+      if (plantsNear(kind, car.x, car.z, 1.7).length) return true;
+    }
+    return false;
+  }
+  function updateHeroLoud() {
+    heroHidden = picnic.crawling && heroCovered();
+    if (picnic.inside) heroLoud = 0;
+    else if (mode === 'car') heroLoud = 75;
+    else if (mode !== 'foot') heroLoud = 45;
+    else {
+      const speed = Math.hypot(car.vx, car.vz);
+      heroLoud = picnic.crawling ? (speed > 0.2 ? 9 : 6) : hero.sprinting ? 62 : speed > 0.3 ? 28 : 15;
+      if (heroHidden) heroLoud *= 0.4;
+    }
+    if (env.night > 0.5) heroLoud *= 0.8;
+  }
+
+  // Can anything on the ground get at you where you are?
+  function heroReachable(b) {
+    if (picnic.inside || mode !== 'foot' || hero.dead) return false;
+    if (onPlatform()) return false;
+    if (insidePalisade(car.x, car.z) && !insidePalisade(b.x, b.z) && palisadeClosed()) return false;
+    const ground = terrain(car.x, car.z);
+    return car.y - ground < (b.species === 'tiger' ? 3.4 : 1.2); // a tiger leaps onto things
+  }
+
+  function updateBeasts(dt) {
+    updateHeroLoud();
+    const night = env.night > 0.5;
+    for (const b of picnic.beasts) {
+      const d2 = (b.x - camera.position.x) ** 2 + (b.z - camera.position.z) ** 2;
+      b.group.visible = b.carried || d2 < 200 * 200;
+      if (b.dead) {
+        updateDeadBeast(b, dt);
+        continue;
+      }
+      // far off and unseen: only a slow wander, no animating
+      const near = d2 < 140 * 140;
+      thinkBeast(b, dt, night);
+      moveBeast(b, dt);
+      if (near && b.group.visible) animateBeast(b, dt);
+    }
+  }
+
+  function thinkBeast(b, dt, night) {
+    const sp = b.sp;
+    const dx = car.x - b.x;
+    const dz = car.z - b.z;
+    const dist = Math.hypot(dx, dz) || 1;
+    const noticed = dist < heroLoud * sp.sight;
+    b.timer -= dt;
+    b.attackT = Math.max(0, b.attackT - dt);
+    b.roarT -= dt;
+    if (b.species === 'deer') {
+      const herd = b.herd;
+      if (herd) herd.panic = Math.max(0, herd.panic - dt / Math.max(1, herd.members.length));
+      if (noticed || b.hurt > 0) {
+        if (herd && herd.panic <= 0) playSnort(dist);
+        if (herd) herd.panic = 7;
+        else b.panic = 7;
+      }
+      const panic = herd ? herd.panic : b.panic || 0;
+      if (panic > 0) {
+        // run directly away from you, the whole herd with it
+        b.state = 'flee';
+        b.tx = b.x - (dx / dist) * 60;
+        b.tz = b.z - (dz / dist) * 60;
+        b.goal = sp.run * (b.hurt > 0 ? 0.7 : 1);
+        b.graze = 0;
+      } else if (b.state === 'flee' || b.timer <= 0) {
+        // graze a while, then wander a few steps round the herd
+        if (b.state !== 'graze' && Math.random() < 0.55) {
+          b.state = 'graze';
+          b.timer = rand(4, 11);
+          b.goal = 0;
+        } else {
+          b.state = 'wander';
+          const cx = herd ? herd.x : b.home.x;
+          const cz = herd ? herd.z : b.home.z;
+          b.tx = cx + rand(-18, 18);
+          b.tz = cz + rand(-18, 18);
+          b.timer = rand(5, 10);
+          b.goal = sp.walk;
+        }
+      }
+      b.hurt = Math.max(0, (b.hurt || 0) - dt);
+      if (herd && panic <= 0) {
+        // the herd drifts where its members are
+        herd.x += (b.x - herd.x) * 0.02 * dt;
+        herd.z += (b.z - herd.z) * 0.02 * dt;
+      }
+      return;
+    }
+
+    // bears and tigers
+    const reachable = heroReachable(b);
+    const range = night ? (b.species === 'tiger' ? 330 : 240) : 0;
+    const provoked = b.hurt > 0 || (noticed && dist < (b.species === 'tiger' ? 45 : 16)) || (b.species === 'bear' && dist < 9);
+    if (!b.hunting && (provoked || (dist < range && mode === 'foot')) && !hero.dead) {
+      b.hunting = true;
+      b.state = b.species === 'tiger' && !provoked ? 'stalk' : 'hunt';
+      if (dist < 60) playRoar(b.species, dist);
+    }
+    if (b.hunting && (hero.dead || (!night && dist > 70 && b.hurt <= 0) || dist > range + 120 && !provoked)) {
+      b.hunting = false;
+      b.state = 'wander';
+      b.timer = 0;
+    }
+    b.hurt = Math.max(0, (b.hurt || 0) - dt);
+    if (!b.hunting) {
+      if (b.timer <= 0) {
+        b.state = Math.random() < 0.4 ? 'rest' : 'wander';
+        b.timer = rand(6, 16);
+        const back = Math.hypot(b.x - CAMP.x, b.z - CAMP.z) > sp.ring[1] || Math.hypot(b.x - CAMP.x, b.z - CAMP.z) < sp.ring[0];
+        b.tx = back ? b.home.x + rand(-30, 30) : b.x + rand(-40, 40);
+        b.tz = back ? b.home.z + rand(-30, 30) : b.z + rand(-40, 40);
+      }
+      b.goal = b.state === 'rest' ? 0 : sp.walk;
+      if (b.roarT <= 0) {
+        b.roarT = rand(25, 60);
+        if (dist < 90) playRoar(b.species, dist, 0.5);
+      }
+      return;
+    }
+    // after you: the bear plods until close then charges; the tiger creeps up low and
+    // fast-walks until it is near enough to rush you
+    b.tx = car.x;
+    b.tz = car.z;
+    const fire = picnic.structures.find((s) => s.kind === 'bonfire' && s.lit && Math.hypot(s.x - car.x, s.z - car.z) < 16);
+    if (b.species === 'bear' && fire && Math.hypot(b.x - fire.x, b.z - fire.z) < 15) {
+      // the flames hold a bear off: it paces round at a distance and roars
+      const a = Math.atan2(b.x - fire.x, b.z - fire.z) + 0.6;
+      b.tx = fire.x + Math.sin(a) * 15;
+      b.tz = fire.z + Math.cos(a) * 15;
+      b.goal = sp.walk;
+      if (b.roarT <= 0) {
+        b.roarT = rand(6, 12);
+        playRoar('bear', dist);
+        setGuide('A bear is pacing round the fire: keep it burning!', 'danger', 4);
+      }
+      return;
+    }
+    if (!reachable) {
+      // can't get at you: circle, and give up after a while
+      const a = Math.atan2(b.x - car.x, b.z - car.z) + 0.5;
+      const ring = picnic.inside ? 6 : insidePalisade(car.x, car.z) ? BUILDS.palisade.ring + 2.5 : 5;
+      b.tx = car.x + Math.sin(a) * ring;
+      b.tz = car.z + Math.cos(a) * ring;
+      b.goal = sp.walk * 1.4;
+      b.circling = (b.circling || 0) + dt;
+      if (b.roarT <= 0) {
+        b.roarT = rand(5, 10);
+        playRoar(b.species, dist);
+        if (picnic.inside && b.species === 'bear' && dist < 7) {
+          // a bear will have a go at the camper
+          hurtVehicle(picnic.rvModel, 55);
+          bump = Math.max(bump, 0.6);
+          setGuide('A bear is clawing at the camper!', 'danger', 4);
+        }
+      }
+      if (b.circling > 70) {
+        b.hunting = false;
+        b.circling = 0;
+        b.home = beastSpot(b.species) || b.home;
+        b.state = 'wander';
+      }
+      return;
+    }
+    b.circling = 0;
+    if (b.state === 'stalk') {
+      b.goal = dist > 60 ? sp.walk * 2.2 : sp.walk * 0.9;
+      b.low = 1;
+      if (dist < 17 || (dist < 30 && !picnic.crawling)) {
+        b.state = 'hunt';
+        playRoar('tiger', dist);
+      }
+    } else {
+      b.low = 0;
+      b.goal = dist > 45 && b.species === 'bear' ? sp.walk * 2.6 : sp.run;
+    }
+    // close enough: a swipe (the bear) or a leap (the tiger)
+    if (dist < sp.reach && b.attackT <= 0) {
+      b.attackT = b.species === 'tiger' ? 1.4 : 1.7;
+      b.lunge = 0.45;
+      playRoar(b.species, dist, 0.8);
+      hurtHero(sp.damage * rand(0.85, 1.15), b.species === 'tiger' ? 'Killed by a tiger' : 'Mauled by a bear', dx / dist, dz / dist);
+      if (!hero.dead && Math.random() < (b.species === 'tiger' ? 0.55 : 0.35)) knockHeroDown(dx / dist, dz / dist, 1.6);
+      setGuide(b.species === 'tiger' ? 'The tiger is on you! Fight back or get to safety' : 'The bear is attacking! Back off, or fight it', 'danger', 3);
+    }
+  }
+
+  // Walking, turning and keeping out of trees and walls.
+  function moveBeast(b, dt) {
+    const sp = b.sp;
+    let want = Math.atan2(b.tx - b.x, b.tz - b.z);
+    const left = Math.hypot(b.tx - b.x, b.tz - b.z);
+    let goal = left < 1.2 && b.state !== 'flee' ? 0 : b.goal;
+    if (b.state === 'graze' || b.state === 'rest') goal = 0;
+    if (b.dodge) want += b.dodge * 1.1;
+    b.h += Math.max(-sp.turn * dt, Math.min(sp.turn * dt, wrapAngle(want - b.h)));
+    b.speed = approach(b.speed, goal, (goal > b.speed ? 7 : 10) * dt);
+    if (b.lunge > 0) {
+      b.lunge -= dt;
+      b.speed = Math.max(b.speed, sp.run * 0.6);
+    }
+    const nx = b.x + Math.sin(b.h) * b.speed * dt;
+    const nz = b.z + Math.cos(b.h) * b.speed * dt;
+    let px = nx;
+    let pz = nz;
+    const r = sp.girth + 0.25;
+    let blocked = false;
+    for (const box of collidersNear(px, pz, r + sp.half)) {
+      if (box.soft || (box.minY ?? -9) > b.y + 1.2 || (box.maxY ?? 9) < b.y + 0.2) continue;
+      for (const along of [sp.half * 0.6, -sp.half * 0.4]) {
+        const cx = px + Math.sin(b.h) * along;
+        const cz = pz + Math.cos(b.h) * along;
+        const touch = boxContact(box, cx, cz, r);
+        if (!touch) continue;
+        px += touch.nx * (r - touch.dist);
+        pz += touch.nz * (r - touch.dist);
+        blocked = true;
+      }
+    }
+    // keep to the jungle
+    if (!inJungle(px, pz)) {
+      px = b.x;
+      pz = b.z;
+      b.tx = b.home.x;
+      b.tz = b.home.z;
+      blocked = true;
+    }
+    if (blocked && b.speed > 0.3) {
+      b.stuck += dt;
+      if (b.stuck > 0.4 && !b.dodge) b.dodge = Math.random() < 0.5 ? 1 : -1;
+    } else {
+      b.stuck = Math.max(0, b.stuck - dt);
+      if (b.stuck <= 0) b.dodge = 0;
+    }
+    b.x = px;
+    b.z = pz;
+    b.y = terrain(b.x, b.z);
+    b.group.position.set(b.x, b.y, b.z);
+    b.group.rotation.y = b.h;
+    // lean with the slope
+    const ahead = terrain(b.x + Math.sin(b.h) * sp.half, b.z + Math.cos(b.h) * sp.half) - terrain(b.x - Math.sin(b.h) * sp.half, b.z - Math.cos(b.h) * sp.half);
+    b.tilt.rotation.x = -Math.atan2(ahead, sp.half * 2) * 0.8;
+    // you can't walk through it
+    if (mode === 'foot') {
+      const ex = car.x - b.x;
+      const ez = car.z - b.z;
+      const d = Math.hypot(ex, ez);
+      const reach = sp.girth + 0.5;
+      if (d > 0.01 && d < reach && Math.abs(car.y - b.y) < 1.2) {
+        car.x += (ex / d) * (reach - d);
+        car.z += (ez / d) * (reach - d);
+      }
+    }
+  }
+
+  const gaitTarget = new THREE.Vector3();
+  const gaitPole = new THREE.Vector3();
+  const gaitDown = new THREE.Vector3();
+  function animateBeast(b, dt) {
+    const sp = b.sp;
+    b.body.position.y = -0.12 * (b.low || 0);
+    if (b.mixer) {
+      const a = b.actions;
+      if (b.species === 'deer') {
+        const run = smooth((b.speed - 2.5) / 3);
+        const walk = b.speed > 0.15 ? 1 - run : 0;
+        a.idle.setEffectiveWeight(1 - walk - run);
+        a.walk.setEffectiveWeight(walk);
+        a.run.setEffectiveWeight(run);
+        a.walk.timeScale = Math.max(0.5, Math.min(2, b.speed / 1.3));
+        a.run.timeScale = Math.max(0.6, Math.min(1.6, b.speed / 10));
+      } else if (b.species === 'tiger') {
+        const run = smooth((b.speed - 4) / 3);
+        a.run.setEffectiveWeight(run);
+        a.run.timeScale = Math.max(0.6, Math.min(1.5, b.speed / 11));
+      } else if (b.species === 'bear' && a.roar) {
+        b.roaring = Math.max(0, (b.roaring || 0) - dt);
+        a.roar.setEffectiveWeight(b.roaring > 0 ? 1 : 0);
+      }
+      b.mixer.update(dt);
+    }
+    // the deer lowers its head to graze, lifts it when alert
+    if (b.species === 'deer' && b.neck) {
+      b.graze += ((b.state === 'graze' ? 1 : 0) - b.graze) * Math.min(1, 2.5 * dt);
+      const n = b.neck;
+      if (b.neckOut && n.quaternion.equals(b.neckOut)) n.quaternion.copy(b.neckBase);
+      else (b.neckBase || (b.neckBase = new THREE.Quaternion())).copy(n.quaternion);
+      if (b.graze > 0.01) n.rotateX(1.05 * b.graze);
+      (b.neckOut || (b.neckOut = new THREE.Quaternion())).copy(n.quaternion);
+    }
+    // stepping, where there is no clip to do it
+    const stepping = b.legs && !(b.species === 'tiger' && b.speed > 5.5);
+    if (!stepping) return;
+    // one gait cycle covers `cycle` metres; each foot is on the ground for `duty` of it,
+    // sweeping back under the body as far as the body goes forward, so it does not slide
+    const trot = b.speed > sp.walk * 1.8;
+    const cycle = Math.min(trot ? 2.6 : 1.5, 0.7 + b.speed * (trot ? 0.36 : 0.6));
+    const duty = trot ? 0.48 : 0.66;
+    b.phase = (b.phase + (b.speed / cycle) * dt) % 1;
+    const moving = smooth(b.speed / 0.35);
+    b.group.updateMatrixWorld(true);
+    // the body bobs a little with the steps
+    b.body.position.y += b.speed > 0.1 ? -0.025 * Math.cos(b.phase * Math.PI * 4) : 0;
+    b.group.updateMatrixWorld(true);
+    const offsets = trot ? [0, 0.5, 0.5, 0] : [0.25, 0.75, 0, 0.5]; // front left, front right, hind left, hind right
+    const scale = 1;
+    b.legs.forEach((leg, i) => {
+      const phase = (b.phase + offsets[i]) % 1;
+      const reach = cycle * duty * moving;
+      let along;
+      let lift = 0;
+      if (phase < duty) {
+        along = reach * (0.5 - phase / duty);
+      } else {
+        const t = (phase - duty) / (1 - duty);
+        along = reach * (-0.5 + t);
+        lift = Math.sin(t * Math.PI) * Math.min(0.16, 0.05 + b.speed * 0.03) * moving;
+      }
+      gaitTarget.set(leg.rest.x * scale, 0, leg.rest.z * scale + along);
+      b.group.localToWorld(gaitTarget);
+      gaitTarget.y = terrain(gaitTarget.x, gaitTarget.z) + leg.lift * scale + lift;
+      // knees forward on the hind legs, elbows back on the front
+      gaitPole.set(Math.sin(b.h) * leg.front * -1, 0.2, Math.cos(b.h) * leg.front * -1);
+      reachFor(leg.upper, leg.mid, leg.end, gaitTarget, gaitPole, 1);
+      // the paw or hoof flat to the ground, toes forward
+      gaitDown.set(Math.sin(b.h) * 0.35, -1, Math.cos(b.h) * 0.35).normalize();
+      aimTowards(leg.end, leg.sole, scene, gaitDown, 0.85);
+    });
+  }
+
+  // --- hits, death and what is left ---
+
+  function hurtBeast(b, damage, dx, dz, head) {
+    if (b.dead) return;
+    b.health -= damage * (head ? 2.4 : 1);
+    b.hurt = 8;
+    if (b.species !== 'deer') b.roaring = 1.2;
+    if (b.health <= 0) {
+      killBeast(b, dx, dz);
+    } else if (b.species !== 'deer') {
+      playRoar(b.species, Math.hypot(b.x - car.x, b.z - car.z));
+      b.hunting = true;
+      b.state = 'hunt';
+    }
+  }
+
+  function killBeast(b, dx, dz) {
+    // it falls onto the side the blow came from, or whichever
+    const side = (dx * Math.cos(b.h) - dz * Math.sin(b.h)) > 0 ? 1 : -1;
+    b.dead = { t: 0, side, base: b.twitch.map((bone) => bone.quaternion.clone()), seeds: b.twitch.map(() => [rand(9, 16), rand(0, 6), rand(0.4, 1)]) };
+    b.speed = 0;
+    picnic.stats[b.species === 'deer' ? 'deer' : b.species === 'bear' ? 'bears' : 'tigers'] += 1;
+    playThud(0.7);
+    if (b.species !== 'deer') playRoar(b.species, 10, 0.6);
+    showToast(`${b.species === 'deer' ? 'Deer' : b.species === 'bear' ? 'Bear' : 'Tiger'} down`);
+    setGuide(b.species === 'deer' ? 'Got it! Walk up to it and press = to carry it' : 'It\'s down. Butcher it with the knife (E)', 'tip', 6);
+    picnicChanged();
+  }
+
+  // On its side, kicking for a few seconds, then still. The clips stop where they were and
+  // the kicks are added on top.
+  const twitchQ = new THREE.Quaternion();
+  const twitchAxis = new THREE.Vector3(1, 0, 0);
+  function updateDeadBeast(b, dt) {
+    const d = b.dead;
+    if (b.carried) return;
+    d.t += dt;
+    const sp = b.sp;
+    const roll = Math.min(1, d.t / 0.6) ** 2 * 1.42;
+    const pivot = sp.girth * 1.05 * d.side;
+    b.tilt.position.set(pivot, 0, 0);
+    b.body.position.set(-pivot, 0, 0);
+    b.tilt.rotation.set(0, 0, -d.side * roll);
+    b.group.position.set(b.x, terrain(b.x, b.z) + Math.sin(roll) * 0.02, b.z);
+    b.group.rotation.set(0, b.h, 0);
+    if (d.t > 3.6 || !b.group.visible) return;
+    // the kicks: sharp and big at first, weaker and further apart, then nothing
+    const u = Math.max(0, (d.t - 0.45) / 3);
+    const strength = u <= 0 ? 0 : (1 - u) ** 1.6;
+    b.twitch.forEach((bone, i) => {
+      const [speed, offset, size] = d.seeds[i];
+      const kick = Math.max(0, Math.sin(d.t * speed + offset)) ** 3 * Math.sin(d.t * speed * 0.37 + offset * 2);
+      twitchQ.setFromAxisAngle(twitchAxis, kick * 0.7 * size * strength);
+      bone.quaternion.copy(d.base[i]).multiply(twitchQ);
+    });
+  }
+
+  // The nearest live animal in front of you, within `reach`.
+  function beastInFront(reach) {
+    const fx = Math.sin(hero.facing);
+    const fz = Math.cos(hero.facing);
+    let best = null;
+    let bestD = reach;
+    for (const b of picnic.beasts) {
+      if (b.dead) continue;
+      const dx = b.x - car.x;
+      const dz = b.z - car.z;
+      const d = Math.hypot(dx, dz) - b.sp.girth;
+      if (d < bestD && dx * fx + dz * fz > 0) {
+        best = b;
+        bestD = d;
+      }
+    }
+    return best;
+  }
+
+  // Shoulders a dead deer (=), or puts it down again.
+  function toggleCarry() {
+    if (picnic.carry) {
+      const b = picnic.carry;
+      picnic.carry = null;
+      b.carried = false;
+      b.x = car.x + Math.sin(hero.facing) * 1.1;
+      b.z = car.z + Math.cos(hero.facing) * 1.1;
+      b.h = hero.facing + Math.PI / 2;
+      b.dead.t = 1; // lying still, no more kicking
+      jungle.group.add(b.group);
+      updateDeadBeast(b, 0);
+      playThud(0.5);
+      picnicChanged();
+      return;
+    }
+    const b = picnic.beasts.find((x) => x.dead && !x.butchered && Math.hypot(x.x - car.x, x.z - car.z) < 2.4);
+    if (!b) {
+      showToast('Nothing here to carry', true);
+      return;
+    }
+    if (b.species !== 'deer') {
+      showToast(`Too heavy to carry: butcher the ${b.species} where it lies (E)`, true);
+      return;
+    }
+    picnic.carry = b;
+    b.carried = true;
+    b.dead.t = Math.max(b.dead.t, 3.7);
+    hero.weapon !== 'fist' && setWeapon('fist');
+    setGuide('Carrying the deer: walk it back to camp, = to put it down', 'tip', 5);
+  }
+
+  // The carried deer lies across the shoulders, legs hanging down in front.
+  const carryBasis = new THREE.Matrix4();
+  const carryX = new THREE.Vector3();
+  const carryY = new THREE.Vector3();
+  const carryZ = new THREE.Vector3();
+  const carryAt = new THREE.Vector3();
+  function placeCarried() {
+    const b = picnic.carry;
+    if (!b) return;
+    const m = hero.model;
+    const shoulders = heroBone('spine2') || m.group;
+    shoulders.getWorldPosition(carryAt);
+    const f = hero.facing;
+    const forward = new THREE.Vector3(Math.sin(f), 0, Math.cos(f));
+    carryZ.set(-Math.cos(f), 0, Math.sin(f)); // its length across his shoulders
+    carryY.copy(forward).multiplyScalar(-0.45).add(new THREE.Vector3(0, 0.9, 0)).normalize(); // its back up and behind him
+    carryX.crossVectors(carryY, carryZ).normalize();
+    carryY.crossVectors(carryZ, carryX).normalize();
+    carryBasis.makeBasis(carryX, carryY, carryZ);
+    b.group.quaternion.setFromRotationMatrix(carryBasis);
+    b.group.rotation.order = 'YXZ';
+    b.tilt.position.set(0, 0, 0);
+    b.tilt.rotation.set(0, 0, 0);
+    b.body.position.set(0, 0, 0);
+    // its middle over the back of his neck
+    const middle = new THREE.Vector3(0, b.sp.high * 0.8, -0.1).applyQuaternion(b.group.quaternion);
+    b.group.position.copy(carryAt).add(new THREE.Vector3(0, 0.02, 0)).addScaledVector(forward, -0.22).sub(middle);
+  }
+
+  // --- in hand: the bow, the axe, the knife, the hammer and the torch ---
+
+  // The bow is the recurve model, held in the left hand. Hold the mouse to raise it, nock
+  // and draw: the bow arm reaches out along the aim, the string hand comes back to the
+  // jaw and the string follows it, and the red dot of the sight shows where it will go.
+  // Let go to loose; the further it was drawn, the faster and flatter the arrow flies.
+  const inHand = { bow: null, axe: null, knife: null, hammer: null, torch: null };
+  const STRING_TOP = new THREE.Vector3(0, 0.86, -0.22);
+  const STRING_BOTTOM = new THREE.Vector3(0, -0.76, -0.22);
+  function makeHeldTools() {
+    // the bow, its grip at the holder's origin, the arrow pointing along +z
+    const holder = new THREE.Group();
+    const bow = picnicMesh('bow', 'bow');
+    const box = picnicBounds('bow', 'bow');
+    bow.position.set(-(box.min.x + box.max.x) / 2, -box.min.y - 0.76, -0.065);
+    holder.add(bow);
+    STRING_TOP.set(0, box.max.y - box.min.y - 0.76 - 0.01, box.min.z + 0.005 - 0.065);
+    STRING_BOTTOM.set(0, -0.75, box.min.z + 0.005 - 0.065);
+    const string = new THREE.Line(new THREE.BufferGeometry().setFromPoints([STRING_TOP, new THREE.Vector3(), STRING_BOTTOM]), new THREE.LineBasicMaterial({ color: 0x1a1a1a }));
+    string.frustumCulled = false;
+    holder.add(string);
+    const arrow = picnicMesh('bow', 'arrow');
+    const length = picnicBounds('bow', 'arrow').max.z - picnicBounds('bow', 'arrow').min.z;
+    arrow.children.forEach((c) => { c.position.z = -picnicBounds('bow', 'arrow').min.z; }); // its nock at its origin
+    holder.add(arrow);
+    // the sight's pin glows red
+    bow.traverse((o) => {
+      if (o.isMesh && /FluorecentRed/.test(o.material.name)) {
+        o.material = new THREE.MeshBasicMaterial({ color: 0xff2a1a });
+      }
+    });
+    holder.visible = false;
+    scene.add(holder);
+    inHand.bow = { holder, string, arrow, length };
+    for (const [name, model, part] of [['axe', 'axe', 'axe'], ['knife', 'knife', 'knife'], ['hammer', 'hammer', null], ['torch', 'torch', null]]) {
+      const tool = picnicMesh(model, part);
+      // the model lies however it was made: line its handle up with the pivot's +z (the
+      // head or blade or lens at the far end), its head out along +y, the grip at the origin
+      const frame = toolFrame(picnicPart(model, part));
+      tool.quaternion.copy(frame.turn);
+      tool.position.copy(frame.grip).applyQuaternion(frame.turn).negate();
+      const pivot = new THREE.Group();
+      pivot.add(tool);
+      pivot.visible = false;
+      scene.add(pivot);
+      inHand[name] = { pivot, tool };
+    }
+  }
+
+  // A tool's long axis (from its grip end to its head), which side its head sticks out to,
+  // and where the hand goes on it, from the spread of its points: { turn, grip }.
+  function toolFrame(parts) {
+    const points = [];
+    for (const { geometry } of parts) {
+      const p = geometry.attributes.position;
+      for (let i = 0; i < p.count; i += 2) points.push(new THREE.Vector3(p.getX(i), p.getY(i), p.getZ(i)));
+    }
+    const centre = points.reduce((sum, v) => sum.add(v), new THREE.Vector3()).multiplyScalar(1 / points.length);
+    // the main axis of the spread, by repeated multiplication with its covariance
+    const c = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+    for (const v of points) {
+      const d = [v.x - centre.x, v.y - centre.y, v.z - centre.z];
+      for (let r = 0; r < 3; r++) for (let k = 0; k < 3; k++) c[r * 3 + k] += d[r] * d[k];
+    }
+    let axis = new THREE.Vector3(1, 0.7, 0.4).normalize();
+    for (let n = 0; n < 40; n++) {
+      axis.set(c[0] * axis.x + c[1] * axis.y + c[2] * axis.z, c[3] * axis.x + c[4] * axis.y + c[5] * axis.z, c[6] * axis.x + c[7] * axis.y + c[8] * axis.z).normalize();
+    }
+    // the head is the end where the points spread out sideways the most
+    const along = (v) => v.clone().sub(centre).dot(axis);
+    const reach = Math.max(...points.map((v) => Math.abs(along(v))));
+    const ends = [1, -1].map((sign) => {
+      const near = points.filter((v) => along(v) * sign > reach * 0.55);
+      const middle = near.reduce((sum, v) => sum.add(v), new THREE.Vector3()).multiplyScalar(1 / Math.max(1, near.length));
+      const sideways = near.reduce((sum, v) => sum + v.clone().sub(centre).addScaledVector(axis, -along(v)).length(), 0) / Math.max(1, near.length);
+      return { sign, middle, sideways };
+    });
+    const head = ends[0].sideways >= ends[1].sideways ? ends[0] : ends[1];
+    if (head.sign < 0) axis.negate();
+    // which way the head sticks out from the handle
+    const out = head.middle.clone().sub(centre);
+    out.addScaledVector(axis, -out.dot(axis));
+    if (out.lengthSq() < 1e-6) out.set(axis.y, -axis.x, 0);
+    out.normalize();
+    const side = new THREE.Vector3().crossVectors(out, axis);
+    const turn = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(side, out, axis)).invert();
+    // held a hand's width from the grip end
+    const grip = centre.clone().addScaledVector(axis, -reach + Math.min(0.08, reach * 0.35));
+    return { turn, grip };
+  }
+  const realBow = () => !!inHand.bow && hero.weapon === 'bow';
+
+  // --- drawing and loosing ---
+
+  function startDraw() {
+    if (mode !== 'foot' || hero.dead || hero.down || act || picnic.carry || picnic.task || picnic.inside) return;
+    if (picnic.on && picnic.inv.arrow <= 0) {
+      showToast('No arrows left: pick up the ones you shot (E)', true);
+      return;
+    }
+    if (hero.draw && hero.draw.loosed < 0.3) return;
+    hero.draw = { t: 0, power: 0, raise: hero.draw ? hero.draw.raise : 0, holding: true, loosed: -1 };
+    if (picnic.crawling) setCrawl(false);
+  }
+
+  function releaseDraw() {
+    const d = hero.draw;
+    if (!d || !d.holding) return;
+    d.holding = false;
+    if (d.power < 0.18) {
+      d.loosed = 0.3; // let down without shooting
+      return;
+    }
+    d.loosed = 0;
+    looseArrow(d.power);
+    d.shot = d.power;
+    d.power = 0;
+  }
+
+  const looseFrom = new THREE.Vector3();
+  function looseArrow(power) {
+    const bow = inHand.bow;
+    camera.getWorldDirection(aimDir);
+    const origin = camera.position;
+    // from the arrow's tip, at whatever the red dot is on
+    bow.arrow.getWorldPosition(looseFrom);
+    looseFrom.addScaledVector(aimDir, bow.length);
+    const aimAt = origin.clone().addScaledVector(aimDir, rayToWorld(origin, aimDir, 160));
+    const speed = ARROW_SPEED * (0.4 + 0.75 * power);
+    const velocity = aimAt.sub(looseFrom).normalize().multiplyScalar(speed);
+    const mesh = picnicMesh('bow', 'arrow');
+    mesh.children.forEach((c) => { c.position.z = -picnicBounds('bow', 'arrow').max.z; }); // its tip at its origin
+    mesh.position.copy(looseFrom);
+    scene.add(mesh);
+    arrows.push({ mesh, velocity, life: picnic.on ? 90 : 8, stuck: false, picnic: true, power });
+    if (picnic.on) picnic.inv.arrow -= 1;
+    useEnergy(0.4);
+    playBowString(power);
+    hero.cooldown = 0.35;
+  }
+
+  function updateDraw(dt) {
+    const d = hero.draw;
+    if (!d) return;
+    if (hero.weapon !== 'bow' || mode !== 'foot' || hero.dead || hero.down || picnic.carry || picnic.inside) {
+      hero.draw = null;
+      return;
+    }
+    d.t += dt;
+    if (d.holding) {
+      d.raise = Math.min(1, d.raise + dt / 0.28);
+      // the draw: after the bow is up and an arrow nocked, back to the jaw over about 0.7 s,
+      // slower when tired
+      const pull = picnic.energy < 15 ? 0.55 : 1;
+      if (d.raise >= 1) d.power = Math.min(1, d.power + (dt / 0.7) * pull);
+      if (picnic.on && d.power >= 1) useEnergy(0.08 * dt);
+    } else {
+      d.loosed += dt;
+      d.power = Math.max(0, d.power - dt * 6);
+      if (d.loosed > 0.55) d.raise = Math.max(0, d.raise - dt / 0.35);
+      if (d.raise <= 0) hero.draw = null;
+    }
+  }
+
+  // Where the bow and the hands go for a shot, and the string. Called after the pose has
+  // been set from the clips, with the hero's bones.
+  const aimVec = new THREE.Vector3();
+  const aimSide = new THREE.Vector3();
+  const anchorAt = new THREE.Vector3();
+  const gripAt = new THREE.Vector3();
+  const nockAt = new THREE.Vector3();
+  const restGrip = new THREE.Vector3();
+  const poleAt = new THREE.Vector3();
+  const holderQ = new THREE.Quaternion();
+  const lowQ = new THREE.Quaternion();
+  const holderM = new THREE.Matrix4();
+  const UP = new THREE.Vector3(0, 1, 0);
+  function poseBow(m, b) {
+    const bow = inHand.bow;
+    const out = realBow() && mode === 'foot' && !picnic.inside && !hero.dead;
+    bow.holder.visible = out;
+    redDot = false;
+    if (!out) return;
+    const d = hero.draw;
+    const raise = d ? smooth(d.raise) : 0;
+    const power = d ? d.power : 0;
+    camera.getWorldDirection(aimVec);
+    aimSide.crossVectors(aimVec, UP).normalize(); // to the right of the aim
+    m.group.updateMatrixWorld(true);
+    if (raise > 0.001) {
+      // the anchor under the right cheek; the bow at arm's length along the arrow's line
+      b.neck.bone.getWorldPosition(anchorAt);
+      anchorAt.y += 0.03;
+      anchorAt.addScaledVector(aimSide, 0.06).addScaledVector(aimVec, 0.06);
+      gripAt.copy(anchorAt).addScaledVector(aimVec, 0.7);
+      b.handL.bone.getWorldPosition(restGrip);
+      gripAt.lerp(restGrip, 1 - raise);
+      poleAt.copy(aimSide).multiplyScalar(-0.3).addScaledVector(UP, -1); // bow elbow turned down and out
+      reachFor(b.armL.bone, b.foreL.bone, b.handL.bone, gripAt, poleAt, raise);
+      // the string hand: on the string at the bow's brace, drawn back to the anchor, and
+      // after the shot flung back past the ear
+      const after = d && d.loosed >= 0 ? Math.sin(Math.min(1, d.loosed / 0.25) * Math.PI / 2) * (1 - smooth((d.loosed - 0.3) / 0.3)) : 0;
+      nockAt.copy(gripAt).addScaledVector(aimVec, -(0.22 + 0.5 * Math.max(power, d && d.shot ? d.shot * (d.loosed < 0.06 ? 1 : 0) : 0)));
+      if (after > 0) nockAt.copy(anchorAt).addScaledVector(aimVec, -0.12 * after).addScaledVector(aimSide, 0.1 * after);
+      poleAt.copy(aimVec).multiplyScalar(-1).addScaledVector(aimSide, 0.6).addScaledVector(UP, 0.35); // elbow up and back
+      reachFor(b.armR.bone, b.foreR.bone, b.handR.bone, nockAt, poleAt, raise);
+    }
+    // the bow in the left hand: limbs up, arrow along the aim; lowered, it hangs down along
+    // the leg, pointing ahead
+    b.handL.bone.getWorldPosition(gripAt);
+    holderM.lookAt(new THREE.Vector3(), aimVec.clone().negate(), UP);
+    holderQ.setFromRotationMatrix(holderM);
+    holderQ.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -0.12)); // canted a touch
+    const f = hero.facing;
+    holderM.lookAt(new THREE.Vector3(), new THREE.Vector3(-Math.sin(f) * 0.85, 0.5, -Math.cos(f) * 0.85), UP);
+    lowQ.setFromRotationMatrix(holderM);
+    bow.holder.quaternion.copy(lowQ).slerp(holderQ, raise);
+    bow.holder.position.copy(gripAt).addScaledVector(aimVec, 0.03 * raise);
+    bow.holder.updateMatrixWorld(true);
+    // the string: from tip to tip, through the nock when drawn
+    const pos = bow.string.geometry.attributes.position;
+    const mid = new THREE.Vector3(0, 0.02, STRING_TOP.z);
+    const drawn = d && d.holding && d.raise >= 1;
+    if (drawn || (d && d.loosed >= 0 && d.loosed < 0.05)) {
+      b.handR.bone.getWorldPosition(mid);
+      bow.holder.worldToLocal(mid);
+      mid.x = 0;
+      mid.z = Math.min(mid.z, STRING_TOP.z);
+    } else if (d && d.loosed >= 0 && d.loosed < 0.3) {
+      mid.z = STRING_TOP.z + Math.sin(d.loosed * 70) * 0.03 * (1 - d.loosed / 0.3); // the string shivers after the shot
+    }
+    pos.setXYZ(1, mid.x, mid.y, mid.z);
+    pos.needsUpdate = true;
+    // the arrow sits on the string while the bow is up
+    const nocked = d && (d.holding || d.loosed < 0) && d.raise > 0.6 && (!picnic.on || picnic.inv.arrow > 0);
+    bow.arrow.visible = !!nocked;
+    if (nocked) {
+      bow.arrow.position.copy(mid);
+      bow.arrow.lookAt(bow.holder.localToWorld(new THREE.Vector3(0, 0.035, 0.3)));
+      bow.arrow.quaternion.premultiply(bow.holder.getWorldQuaternion(new THREE.Quaternion()).invert());
+    }
+    redDot = raise > 0.85;
+  }
+  let redDot = false;
+
+  function hideHeld() {
+    inHand.bow.holder.visible = false;
+    for (const name of ['axe', 'knife', 'hammer', 'torch']) inHand[name].pivot.visible = false;
+    redDot = false;
+  }
+
+  // Tools ride in the right fist: the handle on in the line of the forearm, the head (or
+  // blade, or lens) out past the hand, turned to face the way he faces.
+  const toolBasis = new THREE.Matrix4();
+  const toolLine = new THREE.Vector3();
+  const toolOut = new THREE.Vector3();
+  const toolSide = new THREE.Vector3();
+  const elbowAt = new THREE.Vector3();
+  function poseTools(m, b) {
+    for (const name of ['axe', 'knife', 'hammer', 'torch']) {
+      const tool = inHand[name];
+      const busyWith = picnic.task && (picnic.task.pose === 'butcher' ? 'knife' : picnic.task.pose === 'build' ? 'hammer' : null);
+      const on = mode === 'foot' && !picnic.inside && !picnic.carry && (busyWith ? busyWith === name : hero.weapon === name);
+      tool.pivot.visible = on;
+      if (!on) continue;
+      b.foreR.bone.getWorldPosition(elbowAt);
+      b.handR.bone.getWorldPosition(tool.pivot.position);
+      toolLine.copy(tool.pivot.position).sub(elbowAt).normalize();
+      tool.pivot.position.addScaledVector(toolLine, 0.07); // in the fist, not at the wrist
+      // the head out toward where he faces (the blade leading the swing), square to the handle
+      toolOut.set(Math.sin(hero.facing), 0, Math.cos(hero.facing));
+      if (name === 'torch') toolOut.set(0, 1, 0);
+      toolOut.addScaledVector(toolLine, -toolOut.dot(toolLine));
+      if (toolOut.lengthSq() < 1e-4) toolOut.set(0, 1, 0).addScaledVector(toolLine, -toolLine.y);
+      toolOut.normalize();
+      toolSide.crossVectors(toolOut, toolLine);
+      toolBasis.makeBasis(toolSide, toolOut, toolLine);
+      tool.pivot.quaternion.setFromRotationMatrix(toolBasis);
+    }
+  }
+
+  // The torch lights the way after dark: the one spotlight the game has (the player's
+  // headlamps) is lent to it while you walk.
+  function updateTorch() {
+    if (!headBeam || !inHand.torch) return;
+    const on = picnic.on && hero.weapon === 'torch' && mode === 'foot' && !picnic.inside;
+    if (!on) {
+      if (headBeam.userData.torch) {
+        headBeam.userData.torch = false;
+        headBeam.intensity = 0;
+      }
+      return;
+    }
+    headBeam.userData.torch = true;
+    camera.getWorldDirection(aimDir);
+    inHand.torch.pivot.getWorldPosition(headBeam.position);
+    headBeam.target.position.copy(headBeam.position).addScaledVector(aimDir, 30);
+    headBeam.intensity = 0.4 + 1.8 * lampsOnNow;
+    headBeam.angle = 0.42;
+    headBeam.distance = 60;
+    inHand.torch.tool.children.forEach((c) => { if (c.material && c.material.emissive) c.material.emissive.setScalar(lampsOnNow * 0.6); });
+  }
+
+  // --- the hero's picnic poses ---
+
+  // Crawling: flat on the ground, pulled along on the elbows, one knee then the other.
+  function setCrawl(on) {
+    if (on && (mode !== 'foot' || picnic.carry || hero.climb || hero.jetpack || car.y > groundAt(car.x, car.z, car.y) + 0.1)) return;
+    picnic.crawling = on;
+    if (on) {
+      hero.draw = null;
+      setGuide(heroCovered() ? 'Hidden in the undergrowth' : 'Crawling: animals hear you far less. C to stand', 'tip', 3);
+    }
+  }
+
+  // Adds the picnic poses to `want` (see updateHeroSkin): crawling, carrying, the axe
+  // swing and the moments of work.
+  function picnicPose(want, dt) {
+    picnic.crawl += ((picnic.crawling ? 1 : 0) - picnic.crawl) * Math.min(1, 5 * dt);
+    const c = picnic.crawl;
+    if (c > 0.01) {
+      const speed = Math.hypot(car.vx, car.vz);
+      hero.crawlPhase = (hero.crawlPhase || 0) + speed * 3.4 * dt;
+      const s = Math.sin(hero.crawlPhase);
+      // elbows down under the shoulders, forearms flat ahead, the head up to see; each
+      // elbow reaches forward in turn as the opposite knee draws up
+      const crawl = {
+        neck: -0.9, spine: 0, legSplay: 0.4,
+        legR: -0.15 - 0.55 * (0.5 + 0.5 * s), kneeR: 0.35 + 1.2 * (0.5 + 0.5 * s),
+        legL: -0.15 - 0.55 * (0.5 - 0.5 * s), kneeL: 0.35 + 1.2 * (0.5 - 0.5 * s),
+        armR: -1.9 - 0.35 * s, foreR: -1.4 + 0.3 * s, armL: -1.9 + 0.35 * s, foreL: -1.4 - 0.3 * s,
+        armSplay: 0.25, lean: 0.08 * s,
+      };
+      for (const [key, v] of Object.entries(crawl)) want[key] = want[key] * (1 - c) + v * c;
+    }
+    if (picnic.carry) {
+      // hands up at his shoulders, holding the legs that hang over them
+      Object.assign(want, { armR: -2.2, armL: -2.2, foreR: -2.1, foreL: -2.1, armSplay: 0.55, spine: want.spine + 0.16, neck: 0.15 });
+    }
+    const chop = hero.chop;
+    if (chop) {
+      // wound up over the right shoulder, a fast diagonal blow down, then back
+      const t = chop.t;
+      const wind = smooth(t / 0.38);
+      const strike = smooth((t - 0.38) / 0.1);
+      const back = 1 - smooth((t - 0.5) / 0.3);
+      const k = (up, down) => (t < 0.38 ? up * wind : up + (down - up) * strike) * back;
+      Object.assign(want, {
+        armR: k(-2.75, -1.15), armL: k(-2.5, -1.0), foreR: k(-0.7, -0.1), foreL: k(-0.9, -0.25),
+        twist: k(-0.6, 0.38), spine: k(-0.14, 0.42), lean: k(0.08, -0.05), legR: k(0.1, -0.25), kneeR: k(0.15, 0.35), kneeL: k(0.1, 0.2),
+      });
+    }
+    const task = picnic.task;
+    if (task) {
+      const t = task.t;
+      const kneel = { crouch: 0.42, legR: -1.45, kneeR: 1.55, legL: 0.15, kneeL: 1.95, spine: 0.35 };
+      if (task.pose === 'build') Object.assign(want, kneel, { armR: -1.25 + 0.55 * Math.sin(t * 16), foreR: -0.7 + 0.3 * Math.sin(t * 16 + 1), armL: -0.9, foreL: -0.4 });
+      else if (task.pose === 'butcher') Object.assign(want, kneel, { spine: 0.6, armR: -0.95 + 0.35 * Math.sin(t * 11), foreR: -0.5, armL: -0.8, foreL: -0.6 });
+      else if (task.pose === 'light') Object.assign(want, kneel, { spine: 0.55, armR: -1.0, armL: -0.9, foreR: -0.3, foreL: -0.4 });
+      else if (task.pose === 'cook') Object.assign(want, { armR: -1.15, armL: -1.1, foreR: -0.35, foreL: -0.35, spine: 0.2 });
+      else if (task.pose === 'eat') Object.assign(want, { armR: -0.75, foreR: -2.35 + 0.15 * Math.sin(t * 9), neck: 0.1 });
+      else if (task.pose === 'pick') {
+        const bend = Math.sin(Math.min(1, t / task.time) * Math.PI);
+        Object.assign(want, { spine: 1.05 * bend, crouch: 0.25 * bend, kneeR: 0.7 * bend, kneeL: 0.7 * bend, legR: -0.5 * bend, legL: -0.5 * bend, armR: -1.1 * bend });
+      }
+    }
+    // the torch held out along the aim
+    if (hero.weapon === 'torch' && !task && !chop && !picnic.carry) {
+      want.armR = -Math.PI / 2 - hero.pitch + 0.25;
+      want.foreR = -0.15;
+    }
+  }
+
+  // The body pitched over while crawling, its hips where the hero is.
+  function crawlPlacement(m) {
+    const c = picnic.crawl;
+    if (c < 0.01) return;
+    const pitch = 1.5 * c;
+    m.group.rotation.set(pitch, hero.facing, 0, 'YXZ');
+    m.group.position.set(car.x - Math.sin(hero.facing) * 0.95 * c, car.y + 0.03 * c, car.z - Math.cos(hero.facing) * 0.95 * c);
+  }
+
+  // --- the fire ---
+
+  // A lit fire burns its wood down (a branch adds a minute and a half, a log four); it
+  // throws light about after dark through the one light picnic mode adds, crackles, and
+  // cooks whatever is in the pot hanging over it.
+  let fireLight = null;
+  function updateFires(dt) {
+    let nearest = null;
+    let nearestD = Infinity;
+    for (const s of picnic.structures) {
+      if (s.kind !== 'bonfire') continue;
+      if (s.lit) {
+        s.fuel -= dt;
+        if (s.fuel <= 0) {
+          s.lit = false;
+          s.fuel = 0;
+          if (Math.hypot(s.x - car.x, s.z - car.z) < 60) setGuide('The fire has burnt out: E to add wood and light it again', 'warn', 6);
+          picnicChanged();
+        }
+      }
+      s.embers.visible = s.lit || s.fuel > 0;
+      s.wood.visible = s.fuel > 30 || !s.lit;
+      if (s.lit) {
+        const d = Math.hypot(s.x - camera.position.x, s.z - camera.position.z);
+        if (d < nearestD) {
+          nearest = s;
+          nearestD = d;
+        }
+        if (d < 160) {
+          s.puff = (s.puff || 0) - dt;
+          if (s.puff <= 0) {
+            s.puff = 0.035;
+            const big = Math.min(1, s.fuel / 240);
+            for (let n = 0; n < 2; n++) {
+              flame(s.x + rand(-0.28, 0.28), s.y + 0.2, s.z + rand(-0.28, 0.28), { vy: rand(0.9, 1.8), life: rand(0.45, 0.85), size: 0.7 + 0.45 * big, grow: 0.2, shade: rand(0.55, 1), rise: 1.4, alpha: 1 });
+            }
+            if (Math.random() < 0.15) flame(s.x + rand(-0.2, 0.2), s.y + 0.6, s.z + rand(-0.2, 0.2), { vx: rand(-0.3, 0.3), vy: rand(2, 3.5), vz: rand(-0.3, 0.3), life: rand(1, 1.8), size: 0.06, grow: 0.02, shade: 1, rise: 0.5, alpha: 1 }); // a spark
+            if (Math.random() < 0.3) smoke(s.x, s.y + 1.2, s.z, { vy: 0.8, life: rand(3, 5), size: 0.6, grow: 2.6, alpha: 0.25, shade: 0.35, rise: 0.25 });
+          }
+        }
+      }
+      // the pot, and what is cooking in it
+      s.pot.visible = !!s.cooking;
+      if (s.cooking) {
+        s.cooking.t += s.lit ? dt : 0;
+        if (s.lit && Math.random() < 0.3) smoke(s.x, s.y + 0.6, s.z, { vy: 0.6, life: 1.6, size: 0.15, grow: 0.7, alpha: 0.35, shade: 0.92, rise: 0.4 });
+        if (!s.cooking.ready && s.cooking.t >= 24) {
+          s.cooking.ready = true;
+          setGuide('The meat is cooked: E at the fire to take it', 'tip', 6);
+          playChime();
+        }
+      }
+    }
+    if (fireLight) {
+      fireLight.visible = !!nearest && nearestD < 140;
+      if (nearest) {
+        fireLight.position.set(nearest.x, nearest.y + 1.1, nearest.z);
+        fireLight.intensity = (0.4 + 1.5 * Math.max(lampsOnNow, 0.15)) * (0.85 + 0.15 * Math.sin(clock * 23) * Math.sin(clock * 7.3)) * Math.min(1, nearest.fuel / 30);
+      }
+    }
+    if (audio && !picnic.crackle && nearest) picnic.crackle = crackleVoice();
+    if (audio && picnic.crackle) glide(picnic.crackle.gain.gain, nearest ? Math.max(0, 1 - nearestD / 25) ** 2 * 0.09 : 0);
+  }
+
+  // The fire's crackle: noise through a band-pass, silent until it is turned up.
+  function crackleVoice() {
+    const source = audio.context.createBufferSource();
+    source.buffer = audio.noise;
+    source.loop = true;
+    const filter = audio.context.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = 1800;
+    filter.Q.value = 0.4;
+    const gain = audio.context.createGain();
+    gain.gain.value = 0;
+    source.connect(filter).connect(gain).connect(audio.master);
+    source.start();
+    return { gain };
+  }
+
+  // --- E: whatever is at hand ---
+
+  // Everything you could do from where you stand, the best first: { text, act } for the
+  // prompt and the key.
+  function choices() {
+    const list = [];
+    const fx = Math.sin(hero.facing);
+    const fz = Math.cos(hero.facing);
+    const near = (x, z, reach) => {
+      const dx = x - car.x;
+      const dz = z - car.z;
+      const d = Math.hypot(dx, dz);
+      return d < reach && (d < 0.9 || (dx * fx + dz * fz) / d > -0.2);
+    };
+    if (picnic.inside) {
+      const { lx, lz } = picnic.inside;
+      const look = hero.yaw - picnic.inside.spot.h;
+      const at = (x, z, reach) => Math.hypot(x - lx, z - lz) < reach && Math.cos(Math.atan2(x - lx, z - lz) - look) > 0.2;
+      if (picnic.storage && at(0.85, -1.2, 1.5)) list.push({ text: 'Take your kit from the storage', act: takeKit });
+      if (at(-0.8, -1.3, 1.4)) {
+        if (picnic.inv.meat > 0 && picnic.tools.has('pot') && picnic.inv.gas > 0) list.push({ text: 'Cook the meat on the gas stove', act: () => startTask('Cooking on the stove', 14, 'cook', () => cookMeat(true)) });
+        else list.push({ text: picnic.inv.meat > 0 ? 'The stove needs gas and the pot' : 'Gas stove (nothing to cook)', act: () => {} });
+      }
+      if (at(0, -2.4, 1.6)) list.push({ text: env.night > 0.5 || env.hour < 6 ? 'Sleep until morning' : 'Rest until evening', act: () => startSleep('camper') });
+      if (at(CAMPER_DOOR.x - 0.3, CAMPER_DOOR.z, 1.0)) list.push({ text: 'Step outside', act: leaveCamper });
+      return list;
+    }
+    if (mode !== 'foot') return list;
+    // the camper's side door
+    const rv = camperAt();
+    if (rv && rv.parked) {
+      const [dx, dz] = camperWorld(rv, CAMPER_DOOR.x + 0.5, CAMPER_DOOR.z);
+      if (near(dx, dz, 1.6)) list.push({ text: 'Go inside the camper', act: enterCamper });
+    }
+    // a carcass
+    for (const b of picnic.beasts) {
+      if (!b.dead || b.butchered || b.carried || !near(b.x, b.z, 2.4)) continue;
+      if (picnic.tools.has('knife')) list.push({ text: `Butcher the ${b.species}`, act: () => butcher(b) });
+      else list.push({ text: 'You need the knife to butcher it', act: () => {} });
+    }
+    // what is built
+    for (const s of picnic.structures) {
+      if (s.kind === 'bonfire' && near(s.x, s.z, 2.6)) {
+        if (s.cooking && s.cooking.ready) list.push({ text: `Take the cooked meat (${s.cooking.n})`, act: () => takeCooked(s) });
+        else if (s.lit && !s.cooking && picnic.inv.meat > 0) {
+          list.push(picnic.tools.has('pot') ? { text: `Cook ${Math.min(4, picnic.inv.meat)} raw meat in the pot`, act: () => startTask('Putting the pot on', 1.5, 'cook', () => startCooking(s)) } : { text: 'You need the cooking pots', act: () => {} });
+        }
+        if (!s.lit) {
+          if (s.fuel < 60 && picnic.inv.branch + picnic.inv.log === 0) list.push({ text: 'The fire needs wood: branches or logs', act: () => {} });
+          else if (picnic.inv.petrol >= 1) list.push({ text: 'Light the fire (a splash of petrol)', act: () => startTask('Lighting the fire', 1.6, 'light', () => lightFire(s, true)) });
+          else if (picnic.tools.has('tent')) list.push({ text: 'Light the fire (matches)', act: () => startTask('Lighting the fire', 4, 'light', () => lightFire(s, false)) });
+        } else if (s.fuel < 500 && (picnic.inv.log > 0 || picnic.inv.branch > 0)) {
+          list.push({ text: `Add a ${picnic.inv.log > 0 ? 'log' : 'branch'} to the fire`, act: () => feedFire(s) });
+        }
+        if (s.lit) list.push({ text: env.night > 0.5 ? 'Sit by the fire (rest)' : 'Warm up by the fire', act: () => startTask('Resting by the fire', 8, 'sit', () => {}) });
+      }
+      if (s.kind === 'tent' && near(s.x, s.z, 2.8)) list.push({ text: env.night > 0.5 || env.hour < 6 ? 'Sleep in the tent until morning' : 'Rest in the tent until evening', act: () => startSleep('tent') });
+      if (s.kind === 'palisade') {
+        s.parts.forEach((part, i) => {
+          if (!near(part.mid[0], part.mid[1], 2.4)) return;
+          if (!s.sections[i]) {
+            const cost = i === s.gate ? BUILDS.palisade.gate : BUILDS.palisade.section;
+            const short = Object.entries(cost).filter(([k, n]) => picnic.inv[k] < n);
+            if (!picnic.tools.has('hammer')) list.push({ text: 'You need the hammer to build the fence', act: () => {} });
+            else if (short.length) list.push({ text: `This ${i === s.gate ? 'gate' : 'section'} needs ${short.map(([k, n]) => `${n} ${ITEMS[k].name.toLowerCase()}`).join(' and ')}`, act: () => {} });
+            else list.push({ text: `Build this ${i === s.gate ? 'gate' : 'fence section'} (${Object.entries(cost).map(([k, n]) => `${n} ${ITEMS[k].name.toLowerCase()}`).join(', ')})`, act: () => startTask(i === s.gate ? 'Building the gate' : 'Building the fence', i === s.gate ? 2.6 : 1.6, 'build', () => buildSection(s, i)) });
+          } else if (i === s.gate) {
+            list.push({ text: s.gateOpen ? 'Shut the gate' : 'Open the gate', act: () => { s.gateOpen = !s.gateOpen; refreshPalisade(s); playDoor(); picnicChanged(); } });
+          }
+        });
+      }
+      if (s.kind === 'platform' && s.stage < 3 && near(s.x, s.z, 3.6)) {
+        const stage = BUILDS.platform.stages[s.stage];
+        const short = Object.entries(stage.cost).filter(([k, n]) => picnic.inv[k] < n);
+        const tool = stage.need && !picnic.tools.has(stage.need) ? stage.need : !picnic.tools.has('hammer') ? 'hammer' : null;
+        if (tool) list.push({ text: `You need the ${TOOLS[tool].name.toLowerCase()} for the ${stage.name}`, act: () => {} });
+        else if (short.length) list.push({ text: `The ${stage.name} need ${short.map(([k, n]) => `${n} ${ITEMS[k].name.toLowerCase()}`).join(' and ')}`, act: () => {} });
+        else list.push({ text: `Build the platform's ${stage.name}`, act: () => startTask(`Building the ${stage.name}`, stage.time, 'build', () => buildStage(s)) });
+      }
+      if ((s.kind === 'bench') && near(s.x, s.z, 1.6)) list.push({ text: 'Sit and rest', act: () => startTask('Resting', 10, 'sit', () => {}) });
+    }
+    // things on the ground, and arrows to take back
+    for (const p of pickupsNear(car.x, car.z, 2.4)) {
+      if (!near(p.x, p.z, p.kind === 'log' ? 2.4 : 1.8)) continue;
+      const [item, n] = PICKUPS[p.kind].gives;
+      list.push({ text: `Pick up ${p.kind === 'bunch' ? 'the bananas' : `${n} ${ITEMS[item].name.toLowerCase()}`}`, act: () => startTask('Picking up', 0.6, 'pick', () => takePickup(p)) });
+    }
+    for (const a of arrows) {
+      if (!a.picnic || !a.stuck || !near(a.mesh.position.x, a.mesh.position.z, 2.2)) continue;
+      list.push({ text: 'Pick up the arrow', act: () => { a.life = 0; picnic.inv.arrow += 1; playPickup(); picnicChanged(); } });
+      break;
+    }
+    // leaves to cut
+    for (const kind of ['banana', 'monstera']) {
+      const plant = plantsNear(kind, car.x, car.z, 2.6).find((p) => near(p.x, p.z, 2.2 + p.s * 0.5) && !pickupGone(p));
+      if (plant) list.push(picnic.tools.has('knife') ? { text: 'Cut big leaves (knife)', act: () => startTask('Cutting leaves', 1.2, 'pick', () => takeLeaves(plant)) } : { text: 'Cutting leaves needs the knife', act: () => {} });
+    }
+    // a tree, with the axe in hand
+    if (hero.weapon === 'axe' && treeInFront()) list.push({ text: 'Click to chop the tree', act: chopSwing, click: true });
+    else if (picnic.tools.has('axe') && treeInFront(1.8) && hero.weapon !== 'axe') list.push({ text: 'Take the axe (3) to cut this tree', act: () => setWeapon('axe') });
+    // a dead deer to shoulder
+    if (picnic.beasts.some((b) => b.dead && !b.butchered && !b.carried && b.species === 'deer' && near(b.x, b.z, 2.4))) list.push({ text: 'Carry it on your shoulders', key: '=', act: toggleCarry });
+    return list;
+  }
+
+  let choiceList = [];
+  let choicesDue = 0;
+  function updateChoices(dt) {
+    choicesDue -= dt;
+    if (picnic.build) return;
+    if (choicesDue > 0) return;
+    choicesDue = 0.1;
+    if (picnic.task || picnic.sleep || picnic.tipsOpen) {
+      choiceList = [];
+      setActPrompt('');
+      return;
+    }
+    choiceList = choices();
+    const first = choiceList.find((c) => !c.click && !c.key) || choiceList[0];
+    const carry = picnic.carry ? '<kbd>=</kbd> Put the deer down' : '';
+    if (!first) {
+      setActPrompt(carry);
+      return;
+    }
+    const key = first.click ? 'Click' : first.key || 'E';
+    const extra = choiceList.find((c) => c.key === '=' && c !== first);
+    setActPrompt(`<kbd>${key}</kbd> ${first.text}${extra ? ` &nbsp; <kbd>=</kbd> ${extra.text}` : ''}${carry ? ` &nbsp; ${carry}` : ''}`);
+  }
+
+  function useChoice() {
+    if (picnic.build) {
+      placeBuild();
+      return;
+    }
+    const first = choiceList.find((c) => !c.click && !c.key);
+    if (first) first.act();
+  }
+
+  // --- what each choice does ---
+
+  function takeKit() {
+    if (!picnic.storage) return;
+    for (const tool of picnic.storage.tools) picnic.tools.add(tool);
+    for (const [k, n] of Object.entries(picnic.storage.items)) picnic.inv[k] += n;
+    picnic.storage = null;
+    picnic.rvModel.living.kit.visible = false;
+    playPickup();
+    showToast('Took the axe, hammer, screwdriver, torch, knife, bow and arrows, pots, petrol, gas and the camp kit');
+    setGuide('Your tools are on the bar below: 2 bow, 3 axe, 4 torch, 5 knife, 6 hammer', 'tip', 8);
+    picnicChanged();
+  }
+
+  function lightFire(s, petrol) {
+    if (s.fuel < 60) {
+      // the first wood goes on as it is lit
+      if (picnic.inv.log > 0) {
+        picnic.inv.log -= 1;
+        s.fuel += 240;
+      } else if (picnic.inv.branch > 0) {
+        picnic.inv.branch -= 1;
+        s.fuel += 90;
+      }
+    }
+    if (!petrol && Math.random() < (env.rain > 0.3 ? 0.6 : 0.2)) {
+      showToast('The match went out: try again', true);
+      return;
+    }
+    if (petrol) picnic.inv.petrol -= 1;
+    s.fuel = Math.max(s.fuel, 200); // the kindling it was built with
+    s.lit = true;
+    for (let n = 0; n < 16; n++) flame(s.x + rand(-0.4, 0.4), s.y + 0.3, s.z + rand(-0.4, 0.4), { vy: rand(1.5, 3), life: rand(0.4, 0.8), size: 0.7, grow: 0.3, shade: 1, rise: 1, alpha: 1 });
+    playIgnite(petrol);
+    picnicChanged();
+  }
+
+  function feedFire(s) {
+    if (picnic.inv.log > 0) {
+      picnic.inv.log -= 1;
+      s.fuel += 240;
+    } else {
+      picnic.inv.branch -= 1;
+      s.fuel += 90;
+    }
+    playThud(0.25);
+    picnicChanged();
+  }
+
+  function startCooking(s) {
+    const n = Math.min(4, picnic.inv.meat);
+    picnic.inv.meat -= n;
+    s.cooking = { n, t: 0, ready: false };
+    playSizzle();
+    setGuide('The meat is cooking: about 25 seconds', 'tip', 5);
+    picnicChanged();
+  }
+
+  function takeCooked(s) {
+    picnic.inv.cooked += s.cooking.n;
+    showToast(`+${s.cooking.n} cooked meat: Q to eat`);
+    s.cooking = null;
+    playPickup();
+    picnicChanged();
+  }
+
+  function cookMeat(onStove) {
+    const n = Math.min(4, picnic.inv.meat);
+    picnic.inv.meat -= n;
+    picnic.inv.cooked += n;
+    if (onStove) picnic.inv.gas -= 1;
+    showToast(`+${n} cooked meat: Q to eat`);
+    playChime();
+    picnicChanged();
+  }
+
+  function butcher(b) {
+    startTask(`Butchering the ${b.species}`, 3.5, 'butcher', () => {
+      b.butchered = true;
+      jungle.group.remove(b.group);
+      picnic.inv.meat += b.sp.meat;
+      picnic.inv.hide += 1;
+      showToast(b.sp.meat ? `+${b.sp.meat} raw meat, +1 hide` : '+1 tiger hide');
+      if (b.sp.meat) setGuide('Cook the meat in the pot over a burning fire (E)', 'tip', 6);
+      picnicChanged();
+    });
+  }
+
+  function buildSection(s, i) {
+    const cost = i === s.gate ? BUILDS.palisade.gate : BUILDS.palisade.section;
+    for (const [k, n] of Object.entries(cost)) picnic.inv[k] -= n;
+    s.sections[i] = true;
+    if (i === s.gate) s.gateOpen = true;
+    refreshPalisade(s);
+    useEnergy(0.8);
+    playKnock();
+    const left = s.sections.filter((x) => !x).length;
+    setGuide(left ? `${left} more ${left === 1 ? 'section' : 'sections'} to close the fence` : 'The palisade is finished: shut the gate at night (E)', left ? 'tip' : 'good', 4);
+    picnicChanged();
+  }
+
+  function buildStage(s) {
+    const stage = BUILDS.platform.stages[s.stage];
+    for (const [k, n] of Object.entries(stage.cost)) picnic.inv[k] -= n;
+    s.stage += 1;
+    refreshPlatform(s);
+    useEnergy(1.5);
+    playKnock();
+    setGuide(s.stage < 3 ? `Platform: the ${BUILDS.platform.stages[s.stage].name} next` : 'The platform is finished: climb the stairs to be out of reach', s.stage < 3 ? 'tip' : 'good', 5);
+    picnicChanged();
+  }
+
+  // --- sleep ---
+
+  // Sleeping (or resting until evening) passes the hours quickly. A night spent where an
+  // animal can reach you may not stay quiet: if one comes, you wake to it.
+  function startSleep(where) {
+    const night = env.night > 0.5 || env.hour < 6;
+    const until = night ? 6.5 : 18.2;
+    const safe = where === 'camper' || palisadeClosed() || onPlatform();
+    picnic.sleep = { until, where, safe, checked: Math.floor(env.hour), woke: null };
+    $('sleep').hidden = false;
+    hero.model.group.visible = where !== 'tent' && !picnic.inside;
+    keys.clear();
+  }
+
+  function updateSleep(dt) {
+    const s = picnic.sleep;
+    env.hour = (env.hour + dt * 0.75) % 24; // about 20 seconds for a night
+    picnic.energy = Math.min(100, picnic.energy + 8 * dt);
+    hero.health = Math.min(100, hero.health + 3 * dt);
+    $('sleep-clock').textContent = `${String(Math.floor(env.hour)).padStart(2, '0')}:${String(Math.floor((env.hour % 1) * 60)).padStart(2, '0')}`;
+    // each hour of the night, a chance something comes for you where you lie
+    const hour = Math.floor(env.hour);
+    if (hour !== s.checked) {
+      s.checked = hour;
+      if ((hour >= 20 || hour < 5) && !s.safe) {
+        const fire = nearFire(car.x, car.z, 12);
+        const chance = (fire ? 0.05 : 0.12) * (insidePalisade(car.x, car.z) ? 0.5 : 1);
+        if (Math.random() < chance) {
+          const species = Math.random() < (fire ? 0.75 : 0.45) ? 'tiger' : 'bear';
+          const prowler = picnic.beasts.find((b) => b.species === species && !b.dead);
+          if (prowler) {
+            const a = Math.random() * Math.PI * 2;
+            Object.assign(prowler, { x: car.x + Math.sin(a) * 34, z: car.z + Math.cos(a) * 34, hunting: true, state: species === 'tiger' ? 'stalk' : 'hunt' });
+            s.woke = species;
+          }
+        }
+      }
+    }
+    const done = env.hour >= s.until && env.hour < s.until + 1;
+    if (done || s.woke) endSleep(s.woke);
+  }
+
+  function endSleep(woke) {
+    picnic.sleep = null;
+    $('sleep').hidden = true;
+    hero.model.group.visible = !picnic.inside;
+    if (woke) {
+      playRoar(woke, 30);
+      setGuide(`You woke to a ${woke} prowling close by!`, 'danger', 6);
+      showToast(`Something is out there: a ${woke}!`, true);
+    } else {
+      showToast(env.hour < 12 ? 'Morning: you slept through the night' : 'Evening: you are rested');
+    }
+    picnicChanged();
+  }
+
+  // --- each frame ---
+
+  function updatePicnic(dt) {
+    if (!picnic.on) return;
+    if (picnic.sleep) updateSleep(dt);
+    updateJungle(dt);
+    updatePickups(dt);
+    updateBeasts(dt);
+    updateFallingTrees(dt);
+    updateFires(dt);
+    updateDraw(dt);
+    updateChop(dt);
+    updateTask(dt);
+    updateEnergy(dt);
+    updatePlacing();
+    updateChoices(dt);
+    updateTorch();
+    updateGuide();
+    updateHotbar();
+    placeCarried();
+    // where you are: a banner for each new ring, and its tips the first time
+    const zone = picnic.inside ? 'camp' : zoneAt(car.x, car.z);
+    if (zone !== picnic.zone) {
+      picnic.zone = zone;
+      if (zone) {
+        if (!picnic.seen[zone]) {
+          picnic.seen[zone] = true;
+          showTips(zone, zone === 'camp' ? 'Before you camp: the jungle round this clearing gets wilder ring by ring, deer, then bears past 200 m, then tigers past 400 m.' : `You are entering ${ZONES[zone].name.toLowerCase()}.`);
+          picnicChanged();
+        } else if (clock - picnic.zoneShown > 8) {
+          zoneBanner(zone);
+        }
+        picnic.zoneShown = clock;
+      }
+    }
+    if (bannerTimer > 0) {
+      bannerTimer -= dt;
+      if (bannerTimer <= 0) $('zone-banner').hidden = true;
+    }
+    // a night survived: dark, then morning again, with you alive
+    const night = env.night > 0.5;
+    if (night && !picnic.wasNight) {
+      picnic.wasNight = true;
+      picnic.nightDeaths = 0;
+      setGuide('Night has fallen: bears and tigers are out hunting', 'danger', 7);
+      playRoar('tiger', 200, 0.4);
+      // and they come closer: one of each moves in to range of you
+      for (const species of ['bear', 'tiger']) {
+        const b = picnic.beasts.find((x) => x.species === species && !x.dead && Math.hypot(x.x - car.x, x.z - car.z) > 200);
+        if (b && zoneAt(car.x, car.z)) {
+          const a = Math.random() * Math.PI * 2;
+          const r = species === 'tiger' ? 210 : 160;
+          const x = car.x + Math.sin(a) * r;
+          const z = car.z + Math.cos(a) * r;
+          if (inJungle(x, z)) Object.assign(b, { x, z });
+        }
+      }
+    }
+    if (!night && picnic.wasNight && env.hour > 5 && env.hour < 9) {
+      picnic.wasNight = false;
+      if (!hero.dead) {
+        picnic.stats.nights += 1;
+        picnic.day += 1;
+        showToast(`Night ${picnic.stats.nights} survived!`);
+        playChime();
+        respawnBeasts();
+        picnicChanged();
+      }
+    }
+    // the red dot while the bow is up, instead of the crosshair
+    show('redDot', redDot && mode === 'foot', (v) => {
+      $('red-dot').hidden = !v;
+      $('crosshair').classList.toggle('dim', v);
+    });
+    // kept: every so often, and soon after anything changes
+    picnic.saveDue -= dt;
+    if (picnic.saveDue <= 0) {
+      picnic.saveDue = 20;
+      storePicnic();
+    }
+  }
+
+  // A new day: the fallen and the butchered are replaced, far from where you are.
+  function respawnBeasts() {
+    for (const b of [...picnic.beasts]) {
+      if (!b.dead || b.carried || (!b.butchered && Math.hypot(b.x - CAMP.x, b.z - CAMP.z) < 60)) continue;
+      jungle.group.remove(b.group);
+      picnic.beasts.splice(picnic.beasts.indexOf(b), 1);
+      const spot = beastSpot(b.species);
+      if (spot) {
+        const herd = b.herd && b.herd.members.some((m) => !m.dead) ? b.herd : null;
+        if (herd) herd.members.splice(herd.members.indexOf(b), 1);
+        makeBeast(b.species, herd ? herd.x + rand(-6, 6) : spot.x, herd ? herd.z + rand(-6, 6) : spot.z, herd);
+      }
+    }
+  }
+
+  // --- sounds ---
+
+  // All made from filtered noise and plain tones, like the game's other sounds.
+  function playPickup() { burst('bandpass', 1300, 0.12, 0.08); burst('lowpass', 500, 0.1, 0.1, 0.05); }
+  function playRustle() { for (let n = 0; n < 4; n++) burst('highpass', 3000, 0.06, 0.12, n * 0.05); }
+  function playChop(strength = 1) { burst('lowpass', 420, 0.5 * strength, 0.12); burst('bandpass', 1900, 0.22 * strength, 0.05, 0, 1.4); }
+  function playKnock() { burst('bandpass', 700, 0.35, 0.07, 0, 2); }
+  function playCreak() { playTone(140, 70, 2.2, 0.06, 'sawtooth'); burst('bandpass', 400, 0.05, 2.2, 0, 3); }
+  function playThud(strength) { burst('lowpass', 120, 0.7 * strength, 0.6); }
+  function playEat() { for (let n = 0; n < 3; n++) burst('bandpass', 1600, 0.06, 0.06, n * 0.22); }
+  function playDoor() { burst('lowpass', 300, 0.25, 0.15); burst('bandpass', 2600, 0.06, 0.05, 0.12); }
+  function playChime() { playTone(660, 661, 0.25, 0.05, 'sine'); playTone(990, 991, 0.35, 0.04, 'sine', 0.12); }
+  function playIgnite(petrol) { burst('lowpass', 260, petrol ? 0.8 : 0.3, petrol ? 0.9 : 0.4); burst('highpass', 2500, 0.12, 0.6, 0.05); }
+  function playSizzle() { burst('highpass', 4000, 0.08, 2.5); }
+  function playBowString(power) { burst('bandpass', 260, 0.2 + 0.25 * power, 0.12, 0, 4); burst('highpass', 2800, 0.08 * power, 0.2); }
+  function playSnort(distance) { burst('bandpass', 900, 0.15 * Math.max(0.1, 1 - distance / 80), 0.14, 0, 2); }
+  function playRoar(species, distance, volume = 1) {
+    const near = Math.max(0.05, 1 - distance / 260) * volume;
+    if (species === 'tiger') {
+      playTone(95, 70, 1.4, 0.22 * near, 'sawtooth');
+      burst('lowpass', 380, 0.45 * near, 1.4, 0, 1.5);
+    } else {
+      playTone(70, 55, 1.6, 0.25 * near, 'sawtooth');
+      burst('lowpass', 260, 0.5 * near, 1.7, 0, 1.2);
+    }
+  }
+  // A plain tone gliding from one pitch to another.
+  function playTone(from, to, length, volume, type, delay = 0) {
+    if (!audio) return;
+    const { context, master } = audio;
+    const osc = context.createOscillator();
+    osc.type = type;
+    const filter = context.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = type === 'sine' ? 6000 : from * 6;
+    const gain = context.createGain();
+    const at = context.currentTime + delay;
+    osc.frequency.setValueAtTime(from, at);
+    osc.frequency.exponentialRampToValueAtTime(to, at + length);
+    gain.gain.setValueAtTime(0.0001, at);
+    gain.gain.linearRampToValueAtTime(volume, at + 0.05);
+    gain.gain.exponentialRampToValueAtTime(0.0001, at + length);
+    osc.connect(filter).connect(gain).connect(master);
+    osc.start(at);
+    osc.stop(at + length + 0.05);
+  }
+
+  // --- the map ---
+
+  // The camp, the rings of the jungle, the camper and the fire.
+  function drawPicnicMap(g, at, size) {
+    if (!picnic.on) return;
+    const [cx, cy] = at(CAMP.x, CAMP.z, false);
+    const [rx] = at(CAMP.x + 100, CAMP.z, false);
+    const perMetre = Math.abs(rx - cx) / 100;
+    g.save();
+    // only over the jungle, not the city's corner
+    const b = HILL_BOUNDS;
+    g.beginPath();
+    [[b.minX, b.minZ], [-300, b.minZ], [-300, 300], [b.maxX, 300], [b.maxX, b.maxZ], [b.minX, b.maxZ]].forEach(([x, z], i) => {
+      const [px, py] = at(x, z, false);
+      g[i ? 'lineTo' : 'moveTo'](px, py);
+    });
+    g.closePath();
+    g.clip();
+    g.setLineDash([6 * size, 5 * size]);
+    g.lineWidth = 1.6 * size;
+    for (const [r, colour] of [[ZONE_RINGS.deer, 'rgba(255,214,102,0.8)'], [ZONE_RINGS.bear, 'rgba(255,120,60,0.85)']]) {
+      g.strokeStyle = colour;
+      g.beginPath();
+      g.arc(cx, cy, r * perMetre, 0, Math.PI * 2);
+      g.stroke();
+    }
+    g.restore();
+    const [tx, ty] = at(CAMP.x, CAMP.z, true);
+    g.fillStyle = '#7ddc6a';
+    g.strokeStyle = '#10141f';
+    g.lineWidth = 1.5;
+    g.beginPath();
+    g.moveTo(tx, ty - 7 * size);
+    g.lineTo(tx + 7 * size, ty + 5 * size);
+    g.lineTo(tx - 7 * size, ty + 5 * size);
+    g.closePath();
+    g.fill();
+    g.stroke();
+    const rv = camperAt();
+    if (rv && !(mode === 'car' && player === picnic.rvModel)) {
+      const [vx, vy] = at(rv.x, rv.z, true);
+      g.fillStyle = '#f2f2f2';
+      g.fillRect(vx - 3.5 * size, vy - 3.5 * size, 7 * size, 7 * size);
+      g.strokeRect(vx - 3.5 * size, vy - 3.5 * size, 7 * size, 7 * size);
+    }
+    for (const s of picnic.structures) {
+      if (s.kind !== 'bonfire' || !s.lit) continue;
+      const [fx, fy] = at(s.x, s.z, false);
+      g.fillStyle = '#ff8a2a';
+      g.beginPath();
+      g.arc(fx, fy, 3 * size, 0, Math.PI * 2);
+      g.fill();
+    }
+    if (size > 1.1) {
+      g.fillStyle = 'rgba(255,255,255,0.85)';
+      g.font = `bold ${Math.round(7 * size)}px system-ui, sans-serif`;
+      g.textAlign = 'center';
+      g.fillText('DEER WOODS', cx, cy - (ZONE_RINGS.camp + 70) * perMetre);
+      g.fillText('BEAR COUNTRY', cx, cy - (ZONE_RINGS.deer + 100) * perMetre);
+      g.fillText('TIGER TERRITORY', cx - 0 * perMetre, cy - (ZONE_RINGS.bear + 60) * perMetre);
+    }
+  }
+
+  // --- on and off ---
+
+  // The first time: the jungle is planted and drawn, the camper made, the animals let loose
+  // and the kit packed into the camper; after that, switching just shows or hides it all.
+  function buildPicnicWorld() {
+    plantJungle();
+    buildJungleMeshes();
+    growCanopy();
+    makeJungleFloor();
+    placePickups();
+    buildPickupMeshes();
+    furnishCamp();
+    makeHeldTools();
+    makeIcons();
+    picnic.rvModel = makeCamper();
+    picnic.rvModel.group.visible = false;
+    picnic.built = true;
+  }
+
+  // Someone camped here before: an old woodpile at the clearing's edge (a few logs to
+  // start with) and a stack of split firewood by the lookout.
+  function furnishCamp() {
+    const place = (thing, dx, dz, turn, r, top) => {
+      const x = CAMP.x + dx;
+      const z = CAMP.z + dz;
+      const y = terrain(x, z);
+      thing.position.set(x, y - 0.03, z);
+      thing.rotation.y = turn;
+      jungle.group.add(thing);
+      jungle.camp = jungle.camp || [];
+      const box = { minX: x - r, maxX: x + r, minZ: z - r, maxZ: z + r, minY: y - 1, maxY: y + top, top: y + top };
+      jungle.camp.push(box);
+      return { x, y, z };
+    };
+    const pile = place(picnicMesh('logpile'), 17, 15, 0.6, 0.85, 0.55);
+    place(picnicMesh('firewood'), 6.5, -5.5, 2.2, 0.6, 0.4);
+    for (let n = 0; n < 3; n++) {
+      const p = { id: 990000 + n, kind: 'log', x: pile.x + Math.cos(0.6) * (n - 1) * 0.5 + 1.3, y: pile.y, z: pile.z - Math.sin(0.6) * (n - 1) * 0.5 + 0.9, turn: 0.6 };
+      pickups.all.push(p);
+      const key = Math.floor(p.x / JUNGLE_CELL) * 8192 + Math.floor(p.z / JUNGLE_CELL);
+      if (!pickups.cells.has(key)) pickups.cells.set(key, []);
+      pickups.cells.get(key).push(p);
+    }
+  }
+
+  async function setPicnic(on, saved = null) {
+    if (on === picnic.on || picnic.busy) return;
+    if (!on) {
+      if (mode === 'car' && player === picnic.rvModel) {
+        showToast('Park and step out of the camper first', true);
+        return;
+      }
+      if (picnic.inside) leaveCamper();
+      if (picnic.carry) toggleCarry();
+      if (picnic.build) {
+        scene.remove(picnic.build.ghost);
+        picnic.build = null;
+      }
+      if (picnic.sleep) endSleep(null);
+      picnic.on = false;
+      picnic.crawling = false;
+      picnic.crawl = 0;
+      picnic.task = null;
+      await storePicnic(); // kept as off, so the next visit starts in the city
+      showJungle(false);
+      for (const s of picnic.structures) s.group.visible = false;
+      picnic.rvSpot = camperAt(); // parked again just there next time
+      placeCamper(null);
+      if (fireLight) {
+        scene.remove(fireLight);
+        fireLight = null;
+      }
+      if (['axe', 'torch', 'knife', 'hammer'].includes(hero.weapon)) setWeapon('fist');
+      showPicnicHud(false);
+      showToast('Picnic mode off');
+      return;
+    }
+    picnic.busy = true;
+    showPicnicHud(true);
+    $('picnic-toggle').classList.add('loading');
+    showToast('Packing the camper…');
+    await loadPicnicModels();
+    if (!picnicModels.camper || !picnicModels.jungletree) {
+      picnic.busy = false;
+      $('picnic-toggle').classList.remove('loading');
+      showPicnicHud(false);
+      showToast('The picnic kit could not be loaded', true);
+      return;
+    }
+    await new Promise((next) => setTimeout(next, 30));
+    if (!picnic.built) buildPicnicWorld();
+    saved = saved || await readPicnicSave();
+    const first = !picnic.loadedSave;
+    if (first) restorePicnic(saved);
+    picnic.on = true;
+    showJungle(true);
+    for (const s of picnic.structures) s.group.visible = true;
+    // the camper where it was left, or beside you
+    const rv = picnic.rvSpot || (saved && saved.rv && first ? saved.rv : null);
+    picnic.rvSpot = null;
+    placeCamper(rv || camperSpotNear(car.x, car.z, mode === 'foot' ? hero.facing : car.heading));
+    if (!fireLight) {
+      fireLight = new THREE.PointLight(0xff8a3c, 0, 30, 2);
+      scene.add(fireLight);
+    }
+    picnic.busy = false;
+    $('picnic-toggle').classList.remove('loading');
+    picnic.zone = undefined;
+    picnicChanged();
+    if (picnic.step === 0) {
+      setWaypoint({ x: CAMP.x + 24, z: CAMP.z - 10 });
+      showToast('Picnic mode: your camper is here. Drive it up to the LOOKOUT');
+    } else {
+      showToast(`Picnic mode: welcome back (day ${picnic.day + 1})`);
+    }
+  }
+
+  // Back to how it was left: what you carry, what you built, the camper and the time.
+  function restorePicnic(saved) {
+    picnic.loadedSave = true;
+    if (!saved || saved.version !== 1) {
+      picnic.storage = { tools: [...RV_KIT.tools], items: { ...RV_KIT.items } };
+      spawnBeasts();
+      return;
+    }
+    Object.assign(picnic.inv, saved.inv || {});
+    picnic.tools = new Set(saved.tools || []);
+    picnic.storage = saved.storage || null;
+    picnic.energy = saved.energy ?? 100;
+    picnic.day = saved.day || 0;
+    picnic.stats = { ...picnic.stats, ...(saved.stats || {}) };
+    picnic.step = saved.step || 0;
+    picnic.seen = saved.seen || {};
+    picnic.picked = new Map(saved.picked || []);
+    if (typeof saved.hour === 'number') env.hour = saved.hour;
+    if (saved.health) hero.health = Math.max(30, saved.health);
+    for (const id of saved.felled || []) {
+      for (const k of Object.values(jungle.kinds)) {
+        const tree = k.list.find((p) => p.id === id);
+        if (tree) fellTree(tree, 0, 'restore');
+      }
+    }
+    for (const s of saved.structures || []) picnic.structures.push(makeStructure({ ...s }));
+    spawnBeasts();
+    for (const c of saved.carcasses || []) {
+      const b = makeBeast(c.species, c.x, c.z);
+      b.h = c.h;
+      b.dead = { t: 9, side: 1, base: b.twitch.map((bone) => bone.quaternion.clone()), seeds: b.twitch.map(() => [1, 0, 0]) };
+      updateDeadBeast(b, 0);
+    }
+    // where you were
+    if (saved.hero && mode === 'foot') {
+      Object.assign(car, { x: saved.hero.x, y: saved.hero.y, z: saved.hero.z, vx: 0, vz: 0 });
+      hero.facing = hero.yaw = saved.hero.facing || 0;
+      updateCamera(0, 0, true);
+    }
+    if (saved.rv) picnic.rvSpot = saved.rv;
+  }
+
+  function showPicnicHud(on) {
+    document.body.classList.toggle('picnic', on);
+    $('picnic-toggle').classList.toggle('on', on);
+    $('picnic-toggle').setAttribute('aria-pressed', on ? 'true' : 'false');
+    $('guide').hidden = !on;
+    $('hotbar').hidden = !on;
+    $('energy-bar').parentElement.hidden = !on;
+    document.querySelector('.objective').hidden = on;
+    if (!on) {
+      $('act-prompt').hidden = true;
+      $('task-bar').hidden = true;
+      $('red-dot').hidden = true;
+      $('zone-banner').hidden = true;
+      toggleInventory(false);
+      toggleBuildMenu(false);
+      shown.actPrompt = shown.hotbar = shown.redDot = undefined;
+    }
+  }
+
+  $('picnic-toggle').addEventListener('click', () => {
+    startAudio();
+    setPicnic(!picnic.on);
+  });
+
+  // Picks up where the last visit left off: if picnic mode was on, it comes back on.
+  function resumePicnic() {
+    readPicnicSave().then((saved) => {
+      if (saved && saved.on) setPicnic(true, saved);
+    });
+  }
+
   // ---------- Cheat console ----------
 
   let cheatOpen = false;
@@ -13660,18 +18145,30 @@
     const fz = Math.cos(car.heading);
     let fov = 60;
 
-    if (mode === 'foot') {
-      // over the right shoulder, looking exactly along the aim so the crosshair is true
+    if (mode === 'foot' && picnic.inside) {
+      // inside the camper: through his own eyes
+      const flat = Math.cos(hero.pitch);
+      camera.position.set(car.x, car.y + 1.6, car.z);
+      camLook.set(car.x + fx * flat, car.y + 1.6 + Math.sin(hero.pitch), car.z + fz * flat);
+      fov = 70;
+    } else if (mode === 'foot') {
+      // over the right shoulder, looking exactly along the aim so the crosshair is true;
+      // low behind him when he crawls, in close when he draws the bow
       const flat = Math.cos(hero.pitch);
       const dx = fx * flat;
       const dy = Math.sin(hero.pitch);
       const dz = fz * flat;
+      const draw = realBow() && hero.draw ? smooth(hero.draw.raise) : 0;
+      const back = 4.2 - 1.0 * draw - 0.9 * picnic.crawl;
+      const side = 0.7 + 0.15 * draw;
+      const up = 1.9 - 1.0 * picnic.crawl;
       camera.position.set(
-        car.x - dx * 4.2 - fz * 0.7,
-        Math.max(car.y + 0.4, car.y + 1.9 - dy * 4.2),
-        car.z - dz * 4.2 + fx * 0.7
+        car.x - dx * back - fz * side,
+        Math.max(car.y + 0.4, car.y + up - dy * back),
+        car.z - dz * back + fx * side
       );
       camLook.set(camera.position.x + dx, camera.position.y + dy, camera.position.z + dz);
+      fov = 60 - 14 * (hero.draw ? hero.draw.power : 0) * draw;
     } else if (insideView) {
       // driver's eye: left seat, looking down the bonnet and slightly into the turn
       const lx = fz;
@@ -13707,24 +18204,47 @@
 
     skyDome.position.copy(camera.position);
     skyDome.material.uniforms.time.value = clock;
-    sun.position.set(car.x + SUN_DIR.x * 150, SUN_DIR.y * 150, car.z + SUN_DIR.z * 150);
-    sun.target.position.set(car.x, 0, car.z);
+    // The sun's shadow map covers a square of ground. Most of what is behind the camera is
+    // never seen, so the square is pushed ahead along the way it looks: the same map then
+    // shows more of the shadows on screen, and fewer things off screen are drawn into it.
+    camera.getWorldDirection(shadowAhead);
+    shadowAhead.y = 0;
+    if (shadowAhead.lengthSq() < 1e-4) shadowAhead.set(Math.sin(car.heading), 0, Math.cos(car.heading));
+    shadowAhead.normalize().multiplyScalar(gq.shadowHalf * 0.4);
+    const sx = car.x + shadowAhead.x;
+    const sz = car.z + shadowAhead.z;
+    sun.position.set(sx + SUN_DIR.x * 150, SUN_DIR.y * 150, sz + SUN_DIR.z * 150);
+    sun.target.position.set(sx, 0, sz);
   }
+  const shadowAhead = new THREE.Vector3();
 
   // The dial shows only when there is something to drive: its ring fills with the speed
   // (to about 220 km/h) and turns orange on nitro.
   const dash = $('dash');
   const gauge = $('gauge');
+  const speedText = $('speed');
+  const gearText = $('gear');
+  const nitroBar = $('nitro');
+  // The page is only written when what it shows has changed: a write every frame makes the
+  // browser restyle the HUD sixty times a second for nothing.
+  const shown = {};
+  const show = (key, value, write) => {
+    if (shown[key] === value) return;
+    shown[key] = value;
+    write(value);
+  };
   function updateHud(vf, speed) {
-    dash.hidden = mode === 'foot';
-    if (dash.hidden) return;
+    show('dash', mode === 'foot', (v) => { dash.hidden = v; });
+    if (mode === 'foot') return;
     const kmh = Math.round(speed * 3.6);
-    $('speed').textContent = kmh;
-    $('gear').textContent = speed < 0.3 ? 'N' : vf < 0 ? 'R' : 'D';
-    gauge.style.setProperty('--v', Math.min(1, kmh / 220).toFixed(3));
-    gauge.classList.toggle('boost', !!car.boosting);
-    $('nitro').style.width = `${car.nitro * 100}%`;
-    $('nitro').classList.toggle('active', car.boosting);
+    show('speed', kmh, (v) => { speedText.textContent = v; });
+    show('gear', speed < 0.3 ? 'N' : vf < 0 ? 'R' : 'D', (v) => { gearText.textContent = v; });
+    show('ring', Math.min(1, kmh / 220).toFixed(2), (v) => gauge.style.setProperty('--v', v));
+    show('boost', !!car.boosting, (v) => {
+      gauge.classList.toggle('boost', v);
+      nitroBar.classList.toggle('active', v);
+    });
+    show('nitro', Math.round(car.nitro * 100), (v) => { nitroBar.style.width = `${v}%`; });
   }
 
   // ---------- Loop & input ----------
@@ -13765,14 +18285,149 @@
     }
   });
 
+  let pausedDrawn = false;
+  let frames = 0;
   function frame(now) {
-    const dt = Math.min(0.05, (now - last) / 1000);
-    last = now;
-    if (!settingsOpen) tick(dt); // the settings page pauses the game
-    if (!reflection && clock > 0.6) captureReflections(); // once the textures have decoded
-    renderer.render(scene, camera);
     requestAnimationFrame(frame);
+    // held to the frame-rate limit: on a faster screen the refreshes in between are skipped
+    const interval = now - last;
+    if (graphics.fps && interval < (1000 / graphics.fps) * 0.8) return; // (a 144 Hz screen then gets 72)
+    const dt = Math.min(0.05, interval / 1000);
+    last = now;
+    if (settingsOpen || picnic.tipsOpen) {
+      // the settings page (and picnic mode's tips) pause the game: its picture is drawn
+      // once and left alone
+      if (!pausedDrawn) renderer.render(scene, camera);
+      pausedDrawn = true;
+      return;
+    }
+    pausedDrawn = false;
+    tick(dt);
+    if (!reflection && clock > 0.6) captureReflections(); // once the textures have decoded
+    frames += 1;
+    sun.shadow.needsUpdate = frames % gq.shadowEvery === 0;
+    renderer.render(scene, camera);
+    adaptResolution(interval);
+    if (monitor) monitor(now, interval);
   }
+
+  // Frames coming late for over a second: a little less resolution. Comfortably on time for
+  // several seconds: a little more, up to what the preset allows. After a drop it holds a
+  // while before trying again, so it does not see-saw.
+  let lateFor = 0;
+  let easyFor = 0;
+  let holdFor = 0;
+  function adaptResolution(interval) {
+    if (!graphics.adaptive || interval > 250 || clock < 6) return; // not while loading, nor after a pause
+    const budget = 1000 / (graphics.fps || 60);
+    holdFor = Math.max(0, holdFor - interval);
+    if (interval > budget * 1.25) {
+      lateFor += interval;
+      easyFor = 0;
+    } else {
+      lateFor = Math.max(0, lateFor - interval * 0.5);
+      easyFor += interval;
+    }
+    const top = Math.min(deviceRatio, gq.ratio);
+    if (lateFor > 1200 && pixelRatio > gq.minRatio + 0.01) {
+      setPixelRatio(Math.max(gq.minRatio, pixelRatio - 0.15));
+      lateFor = 0;
+      holdFor = 12000;
+    } else if (easyFor > 8000 && holdFor === 0 && pixelRatio < top - 0.01) {
+      setPixelRatio(Math.min(top, pixelRatio + 0.1));
+      easyFor = 0;
+    }
+  }
+  function setPixelRatio(ratio) {
+    pixelRatio = ratio;
+    renderer.setPixelRatio(ratio);
+    resize();
+  }
+
+  // Applies the chosen preset (from the controls page) and remembers it.
+  function applyGraphics() {
+    gq = QUALITY[graphics.quality];
+    lateFor = easyFor = holdFor = 0;
+    setPixelRatio(Math.min(deviceRatio, gq.ratio));
+    // the sun's shadow: a new map at the new size, over the new stretch of ground
+    if (sun.shadow.mapSize.x !== gq.shadow) {
+      sun.shadow.mapSize.set(gq.shadow, gq.shadow);
+      if (sun.shadow.map) {
+        sun.shadow.map.dispose();
+        sun.shadow.map = null;
+      }
+    }
+    const shadowCam = sun.shadow.camera;
+    shadowCam.left = shadowCam.bottom = -gq.shadowHalf;
+    shadowCam.right = shadowCam.top = gq.shadowHalf;
+    shadowCam.updateProjectionMatrix();
+    const type = gq.softShadows ? THREE.PCFSoftShadowMap : THREE.PCFShadowMap;
+    if (renderer.shadowMap.type !== type) {
+      renderer.shadowMap.type = type;
+      scene.traverse((o) => {
+        if (o.material) [].concat(o.material).forEach((m) => { m.needsUpdate = true; });
+      });
+    }
+    const filtering = anisotropy();
+    for (const tex of madeTextures) {
+      if (tex.anisotropy === filtering) continue;
+      tex.anisotropy = filtering;
+      if (tex.image) tex.needsUpdate = true;
+    }
+    for (const w of walkers) w.shadowed = undefined; // people re-decide whether to cast a shadow
+    sun.shadow.needsUpdate = true;
+    try {
+      localStorage.setItem('car-drive-graphics', JSON.stringify(graphics));
+    } catch (error) {
+      // storage unavailable: the change lasts for this visit only
+    }
+  }
+
+  // the graphics choices on the settings page
+  for (const control of document.querySelectorAll('[data-graphics]')) {
+    const name = control.dataset.graphics;
+    if (control.type === 'checkbox') control.checked = !!graphics[name];
+    else control.value = String(graphics[name]);
+    control.addEventListener('change', () => {
+      graphics[name] = control.type === 'checkbox' ? control.checked : name === 'fps' ? Number(control.value) : control.value;
+      applyGraphics();
+    });
+  }
+
+  // A small read-out for development, only when the address ends in ?perf: frame rate and
+  // time, what the last frame drew, and what is alive in the world.
+  let monitor = null;
+  if (/[?&]perf\b/.test(location.search)) {
+    const box = document.createElement('div');
+    box.className = 'perf';
+    document.body.appendChild(box);
+    let count = 0;
+    let sum = 0;
+    let worst = 0;
+    let since = 0;
+    monitor = (now, interval) => {
+      count += 1;
+      sum += interval;
+      worst = Math.max(worst, interval);
+      if (now - since < 500) return;
+      const { render, memory, programs } = renderer.info;
+      const nearby = (list) => list.filter((c) => c.model.group.visible && Math.abs(c.x - car.x) < 300 && Math.abs(c.z - car.z) < 300).length;
+      const alive = (cloud) => (cloud ? cloud.list.reduce((n, p) => n + (p.life > 0 ? 1 : 0), 0) : 0);
+      const weather = (snowFlakes && snowFlakes.visible ? snowFlakes.geometry.drawRange.count : 0) + (rainLines && rainLines.visible ? rainLines.geometry.drawRange.count / 2 : 0);
+      box.textContent = [
+        `${(1000 * count / sum).toFixed(0)} fps  ${(sum / count).toFixed(1)} ms (worst ${worst.toFixed(0)})`,
+        `${graphics.quality} · ${pixelRatio.toFixed(2)}x · cap ${graphics.fps || 'off'}`,
+        `draw calls ${render.calls}  triangles ${(render.triangles / 1000).toFixed(0)}k`,
+        `programs ${programs.length}  geometries ${memory.geometries}  textures ${memory.textures}`,
+        `vehicles near ${nearby(traffic) + nearby(highwayTraffic)}/${traffic.length + highwayTraffic.length}  people drawn ${walkers.filter((w) => w.group.visible).length}`,
+        `particles ${alive(smokeCloud) + alive(flameCloud)}  rain/snow ${Math.round(weather)}`,
+      ].join('\n');
+      since = now;
+      count = sum = worst = 0;
+    };
+  }
+
+  let mapDue = 0;
 
   // One simulation step.
   function tick(dt) {
@@ -13784,6 +18439,7 @@
     updateWalkers(dt);
     updateBirds(dt);
     updateAnimals(dt);
+    updatePicnic(dt);
     updateLights();
 
     let vf = 0;
@@ -13796,6 +18452,7 @@
     else if (mode === 'heli') updateHeli(dt);
     else if (mode === 'bike') updateBiking(dt);
     else if (act) updateAct(dt);
+    else if (picnic.inside) updateInsideCamper(dt);
     else updateHero(dt);
     updateDoors(dt);
     if (horse) animateHorse(dt);
@@ -13821,7 +18478,11 @@
     updateCamera(dt, speed, false);
     updateHud(vf, speed);
     updateRoute(dt);
-    drawMap();
+    mapDue -= dt;
+    if (mapDue <= 0 || mapOpen) {
+      drawMap();
+      mapDue = 0.05;
+    }
 
     if (toastTimer > 0) {
       toastTimer -= dt;
@@ -13857,9 +18518,21 @@
     }
     if (BLOCKED.has(e.code)) e.preventDefault();
     startAudio();
+    if (picnic.tipsOpen) {
+      // the tips card waits for Enter, Space or Escape
+      if (['Enter', 'Space', 'Escape', 'NumpadEnter'].includes(e.code)) closeTips();
+      return;
+    }
     if (hero.dead) return;
+    if (e.code === 'KeyJ' && !e.repeat) {
+      setPicnic(!picnic.on);
+      return;
+    }
+    if (picnic.on && !e.repeat && picnicKey(e)) return;
     keys.add(e.code);
     if (e.repeat) return;
+    if (picnic.sleep) return;
+    if (e.code === 'KeyF' && picnic.inside) return;
     if (e.code === 'KeyF') {
       if (mode === 'car') exitVehicle();
       else if (mode === 'horse') dismountHorse();
@@ -13871,7 +18544,7 @@
       else if (nearestRide() === 'bike') mountBike();
       else enterVehicle();
     }
-    if (e.code === 'KeyC' && mode === 'car' && !player.moto) setInsideView(!insideView);
+    if (e.code === 'KeyC' && mode === 'car' && !player.moto && !player.noInside) setInsideView(!insideView);
     if (e.code === 'Digit0') setWeapon('fist');
     if (e.code === 'Digit1') setWeapon('gun');
     if (e.code === 'Digit2') setWeapon('bow');
@@ -13896,19 +18569,98 @@
   });
   window.addEventListener('keyup', (e) => keys.delete(e.code));
 
+  // Picnic mode's keys, before the rest: E does what is at hand, C crawls, = shoulders a
+  // kill, B builds, I shows what you carry, Q eats, 3 to 6 take a tool, R turns what you
+  // are placing. Returns true when the key was used up here.
+  function picnicKey(e) {
+    const code = e.code;
+    if (picnic.menu === 'build') {
+      const n = Number(code.replace('Digit', '').replace('Numpad', ''));
+      if (n >= 1 && n <= BUILD_ORDER.length && /^(Digit|Numpad)/.test(code)) {
+        startPlacing(BUILD_ORDER[n - 1]);
+        return true;
+      }
+      if (code === 'KeyB' || code === 'Escape') {
+        toggleBuildMenu(false);
+        return true;
+      }
+    }
+    if (picnic.menu === 'inventory' && (code === 'KeyI' || code === 'Escape' || code === 'Tab')) {
+      toggleInventory(false);
+      return true;
+    }
+    if (picnic.sleep) return true;
+    if (picnic.build && (code === 'KeyB' || code === 'Escape')) {
+      scene.remove(picnic.build.ghost);
+      picnic.build = null;
+      setActPrompt('');
+      return true;
+    }
+    if (picnic.build && code === 'KeyR') {
+      picnic.build.h += Math.PI / 8;
+      return true;
+    }
+    if (code === 'KeyE') {
+      useChoice();
+      return true;
+    }
+    if (picnic.inside) {
+      if (code === 'KeyI') toggleInventory(true);
+      else if (code === 'KeyQ') eatSomething();
+      else return ['Backspace', 'KeyC', 'Equal', 'KeyB'].includes(code); // none of these indoors
+      return true;
+    }
+    if (mode !== 'foot') return false;
+    if (code === 'KeyC') {
+      setCrawl(!picnic.crawling);
+      return true;
+    }
+    if (code === 'Equal' || code === 'NumpadAdd') {
+      toggleCarry();
+      return true;
+    }
+    if (code === 'KeyB') {
+      toggleBuildMenu(picnic.menu !== 'build');
+      return true;
+    }
+    if (code === 'KeyI') {
+      toggleInventory(true);
+      return true;
+    }
+    if (code === 'KeyQ') {
+      eatSomething();
+      return true;
+    }
+    const tool = { Digit3: 'axe', Digit4: 'torch', Digit5: 'knife', Digit6: 'hammer' }[code];
+    if (tool) {
+      if (!picnic.carry) setWeapon(hero.weapon === tool ? 'fist' : tool);
+      return true;
+    }
+    if ((code === 'Digit1' || code === 'Digit2') && picnic.carry) return true;
+    return false;
+  }
+
   // mouse look and shooting work once the pointer is captured by clicking the game
   const canvas = renderer.domElement;
   canvas.addEventListener('mousedown', (e) => {
     startAudio();
+    if (picnic.tipsOpen) return;
     if (document.pointerLockElement !== canvas) canvas.requestPointerLock();
+    else if (e.button === 0 && realBow() && !picnic.build) startDraw();
     else if (e.button === 0) fire();
   });
+  window.addEventListener('mouseup', (e) => {
+    if (e.button === 0) releaseDraw();
+  });
   window.addEventListener('mousemove', (e) => {
-    if (document.pointerLockElement !== canvas || mode !== 'foot') return;
+    if (document.pointerLockElement !== canvas || mode !== 'foot' || picnic.sleep) return;
     hero.yaw -= e.movementX * 0.0025;
     hero.pitch = Math.max(-0.7, Math.min(1.1, hero.pitch - e.movementY * 0.002));
   });
-  window.addEventListener('blur', () => keys.clear());
+  window.addEventListener('blur', () => {
+    keys.clear();
+    releaseDraw();
+  });
   window.addEventListener('resize', resize);
 
   // ---------- Start ----------
@@ -13965,8 +18717,11 @@
     scene.add(targetBeacon);
 
     // An instanced mesh is culled as if all its copies sat at the origin, so never cull them.
+    // And what gives off its own light (bulbs, lenses, beacons, glows) casts no shadow: each
+    // would only be one more thing drawn into the shadow map for nothing.
     scene.traverse((o) => {
       if (o.isInstancedMesh) o.frustumCulled = false;
+      if (o.isMesh && o.material && o.material.type === 'MeshBasicMaterial') o.castShadow = false;
     });
 
     resetCar();
@@ -13977,6 +18732,7 @@
       last = now;
       frame(now);
     });
+    resumePicnic(); // back to picnic mode if that is where the last visit ended
   }
 
   Promise.all([

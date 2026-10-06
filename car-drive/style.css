@@ -8,7 +8,7 @@
    accent for driving and amber for the job at hand. Everything keeps to the corners and
    stays small, so the city has the screen. */
 :root {
-  --glass: rgba(10, 14, 24, 0.56);
+  --glass: rgba(10, 14, 24, 0.68); /* a little denser than before, in place of a blur */
   --glass-deep: rgba(8, 11, 19, 0.82);
   --edge: rgba(255, 255, 255, 0.14);
   --text: #eef3fb;
@@ -43,12 +43,12 @@ body {
 /* ---------- HUD ---------- */
 
 .hud {
+  /* No backdrop blur on anything shown while playing: the game behind changes every frame,
+     so a blur there is redone every frame, and that is a real cost to the GPU. */
   position: fixed;
   border: 1px solid var(--edge);
   border-radius: 12px;
   background: var(--glass);
-  backdrop-filter: blur(6px) saturate(1.2);
-  -webkit-backdrop-filter: blur(6px) saturate(1.2);
   box-shadow: 0 6px 22px rgba(0, 0, 0, 0.28);
   font-family: var(--hud-font);
   font-variant-numeric: tabular-nums;
@@ -151,9 +151,75 @@ kbd {
   fill: var(--text);
 }
 
-/* top right: the weapon in hand */
-.chip {
+/* top right: picnic mode's switch, with the weapon in hand under it */
+.picnic-toggle {
   top: 14px;
+  right: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 7px 5px 10px;
+  border-radius: 999px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.picnic-toggle svg {
+  width: 16px;
+  height: 16px;
+  fill: var(--muted);
+}
+
+.picnic-toggle .switch {
+  position: relative;
+  width: 30px;
+  height: 16px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.16);
+  transition: background 0.2s;
+}
+
+.picnic-toggle .switch i {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #cfd6e2;
+  transition: transform 0.2s, background 0.2s;
+}
+
+.picnic-toggle.on {
+  border-color: rgba(125, 220, 106, 0.6);
+  box-shadow: 0 0 14px rgba(125, 220, 106, 0.25), 0 6px 22px rgba(0, 0, 0, 0.28);
+}
+
+.picnic-toggle.on svg {
+  fill: #7ddc6a;
+}
+
+.picnic-toggle.on .switch {
+  background: rgba(125, 220, 106, 0.45);
+}
+
+.picnic-toggle.on .switch i {
+  transform: translateX(14px);
+  background: #7ddc6a;
+}
+
+.picnic-toggle.loading .switch i {
+  animation: blink 0.6s steps(2) infinite;
+}
+
+/* the weapon in hand */
+.chip {
+  top: 54px;
   right: 14px;
   display: flex;
   align-items: center;
@@ -291,6 +357,19 @@ kbd {
 
 .vital.stamina.low i {
   background: #8a6a1e;
+}
+
+.vital.energy {
+  flex: 2;
+}
+
+.vital.energy i {
+  background: linear-gradient(90deg, #6fae2f, #b5e655);
+}
+
+.vital.energy.low i {
+  background: #c0582a;
+  animation: blink 0.8s steps(2) infinite;
 }
 
 .keys {
@@ -702,4 +781,535 @@ kbd {
     transform: scale(0.85);
     transform-origin: bottom right;
   }
+}
+
+/* ---------- Performance read-out (only with ?perf in the address) ---------- */
+
+.perf {
+  position: fixed;
+  top: 110px;
+  left: 14px;
+  z-index: 30;
+  padding: 6px 9px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.72);
+  color: #9dff9d;
+  font: 11px/1.45 ui-monospace, Menlo, Consolas, monospace;
+  white-space: pre;
+  pointer-events: none;
+}
+
+.setup select {
+  padding: 3px 6px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  font: inherit;
+}
+
+.setup select option {
+  color: #111;
+}
+
+.setup input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
+.setup .hint {
+  grid-column: 1 / -1;
+  font-size: 12px;
+  line-height: 1.5;
+  opacity: 0.65;
+}
+
+/* ---------- Picnic mode ---------- */
+
+/* top left, in place of the parking job: where you are and what to do next */
+.guide {
+  top: 14px;
+  left: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 330px;
+  padding: 9px 13px 9px 12px;
+  line-height: 1.2;
+}
+
+body.picnic .gear-button {
+  top: 14px;
+  left: 354px;
+}
+
+.guide-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.guide .zone::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: #8b93a1;
+  vertical-align: 1px;
+}
+
+.guide .zone[data-level="0"]::before { background: #7ddc6a; }
+.guide .zone[data-level="1"]::before { background: #ffd666; }
+.guide .zone[data-level="2"]::before { background: #ff8a3c; }
+.guide .zone[data-level="3"]::before { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+
+.guide b {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--amber);
+}
+
+.guide small {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.guide small[data-tone="warn"] { color: #ffb15c; }
+.guide small[data-tone="danger"] { color: #ff7a85; animation: blink 0.9s steps(2) 3; }
+.guide small[data-tone="good"] { color: #8fe07c; }
+
+.guide-progress {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: #9fe38c;
+}
+
+.guide-keys {
+  margin-top: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.guide-keys kbd {
+  min-width: 15px;
+  padding: 0 3px;
+  margin-left: 4px;
+  font-size: 9px;
+  color: var(--text);
+}
+
+.zone-banner {
+  position: fixed;
+  top: 58px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 18px;
+  border-radius: 6px;
+  background: var(--glass-deep);
+  border-bottom: 2px solid #ffd666;
+  font-family: var(--hud-font);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+.zone-banner[data-level="0"] { border-color: #7ddc6a; }
+.zone-banner[data-level="2"] { border-color: #ff8a3c; }
+.zone-banner[data-level="3"] { border-color: var(--danger); color: #ffd0d4; }
+
+/* bottom centre: the tools to hand */
+.hotbar {
+  position: fixed;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 6px;
+  font-family: var(--hud-font);
+}
+
+.hotbar .slot {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  border: 1px solid var(--edge);
+  border-radius: 10px;
+  background: var(--glass);
+}
+
+.hotbar .slot.on {
+  border-color: var(--amber);
+  box-shadow: 0 0 10px rgba(255, 194, 61, 0.35);
+}
+
+.hotbar img {
+  width: 38px;
+  height: 38px;
+  object-fit: contain;
+}
+
+.hotbar kbd {
+  position: absolute;
+  top: -7px;
+  left: -6px;
+  min-width: 16px;
+  padding: 0 3px;
+  border-color: rgba(255, 255, 255, 0.35);
+  background: var(--glass-deep);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.hotbar em {
+  position: absolute;
+  right: 3px;
+  bottom: 1px;
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 700;
+  text-shadow: 0 1px 2px #000;
+}
+
+.glyph {
+  display: block;
+  width: 26px;
+  height: 26px;
+  background: center / 18px no-repeat;
+}
+
+.glyph.fist {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23eef3fb'%3E%3Cpath d='M7 6.5a1.5 1.5 0 0 1 3 0V5a1.5 1.5 0 0 1 3 0v.5a1.5 1.5 0 0 1 3 0V7a1.5 1.5 0 0 1 3 0v6.2c0 4-2.6 6.8-6.4 6.8H11c-3 0-5.5-2.2-5.9-5.2L4.6 11A1.6 1.6 0 0 1 7 9.6Z'/%3E%3C/svg%3E");
+}
+
+.act-prompt {
+  bottom: 86px;
+}
+
+.task-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 128px;
+  transform: translateX(-50%);
+  width: 220px;
+  font-family: var(--hud-font);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-align: center;
+  text-transform: uppercase;
+  text-shadow: 0 1px 2px #000;
+}
+
+.task-bar div {
+  height: 5px;
+  margin-top: 4px;
+  border-radius: 3px;
+  background: rgba(8, 11, 19, 0.7);
+  overflow: hidden;
+}
+
+.task-bar i {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--amber);
+}
+
+/* the bow's sight: a red dot where the arrow will go */
+.red-dot {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  width: 7px;
+  height: 7px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: #ff2a1a;
+  box-shadow: 0 0 6px 2px rgba(255, 42, 26, 0.65);
+  pointer-events: none;
+}
+
+.crosshair.dim {
+  opacity: 0;
+}
+
+/* the kit (I): what you carry and your tools */
+.panel-wrap {
+  z-index: 12;
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(6, 9, 15, 0.55);
+}
+
+.panel {
+  width: min(620px, 92vw);
+  max-height: 84vh;
+  overflow: auto;
+  padding: 16px 20px;
+  border: 1px solid var(--edge);
+  border-radius: 14px;
+  background: rgba(14, 18, 28, 0.95);
+  font-family: var(--hud-font);
+}
+
+.panel h2,
+.build-menu h2 {
+  font-size: 22px;
+  letter-spacing: 0.06em;
+}
+
+.panel h2 span,
+.build-menu h2 span {
+  margin-left: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.panel h3 {
+  margin: 10px 0 6px;
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.items {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  gap: 8px;
+}
+
+.item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 6px 4px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  text-align: center;
+}
+
+.item img {
+  width: 54px;
+  height: 54px;
+  object-fit: contain;
+}
+
+.item b {
+  font-size: 18px;
+  line-height: 1;
+}
+
+.item span {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.item kbd {
+  position: absolute;
+  top: 4px;
+  right: 5px;
+  font-size: 10px;
+}
+
+.item button {
+  margin-top: 4px;
+  padding: 1px 12px;
+  border: 1px solid #7ddc6a;
+  border-radius: 999px;
+  background: rgba(125, 220, 106, 0.12);
+  color: #b9f0ad;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.panel .empty {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.panel .stats {
+  margin-top: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+/* the build menu (B) */
+.build-menu {
+  left: 50%;
+  bottom: 78px;
+  transform: translateX(-50%);
+  width: min(560px, 94vw);
+  padding: 10px 14px 12px;
+}
+
+.recipe {
+  display: grid;
+  grid-template-columns: 26px 150px 1fr;
+  align-items: center;
+  gap: 2px 10px;
+  padding: 4px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.recipe b {
+  font-size: 15px;
+}
+
+.recipe small {
+  grid-column: 2 / -1;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.recipe.off {
+  opacity: 0.45;
+}
+
+.recipe .cost {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.recipe .cost span {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.recipe .cost img {
+  width: 22px;
+  height: 22px;
+  object-fit: contain;
+}
+
+.recipe .cost .short {
+  color: #ff8a8f;
+}
+
+/* survival tips for each ring of the jungle, the game paused under them */
+.tips {
+  z-index: 14;
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(6, 9, 15, 0.5);
+}
+
+.tips-card {
+  width: min(470px, 92vw);
+  padding: 18px 22px 16px;
+  border: 1px solid var(--edge);
+  border-top: 4px solid #7ddc6a;
+  border-radius: 14px;
+  background: rgba(14, 18, 28, 0.96);
+  font-family: var(--hud-font);
+}
+
+.tips[data-level="1"] .tips-card { border-top-color: #ffd666; }
+.tips[data-level="2"] .tips-card { border-top-color: #ff8a3c; }
+.tips[data-level="3"] .tips-card { border-top-color: var(--danger); }
+
+.tips-card small {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.tips-card h2 {
+  margin: 2px 0 6px;
+  font-size: 26px;
+  letter-spacing: 0.04em;
+}
+
+.tips-card p {
+  margin-bottom: 8px;
+  font-family: system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.tips-card ul {
+  margin: 0 0 12px 18px;
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.tips-card li + li {
+  margin-top: 4px;
+}
+
+.tips-card button {
+  padding: 6px 16px;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 999px;
+  background: transparent;
+  color: #fff;
+  font: inherit;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+/* asleep: the screen goes dark while the hours pass */
+.sleep {
+  z-index: 8;
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: rgba(2, 4, 10, 0.86);
+  font-family: var(--hud-font);
+  pointer-events: none;
+}
+
+.sleep b {
+  font-size: 40px;
+  letter-spacing: 0.3em;
+  color: #9fb4d9;
+}
+
+.sleep span {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--muted);
 }

@@ -21,8 +21,50 @@
     <svg viewBox="0 0 24 24"><path d="M19.4 13a7.6 7.6 0 0 0 0-2l2.1-1.6-2-3.4-2.5 1a7.5 7.5 0 0 0-1.7-1L15 3.3h-4l-.3 2.7a7.5 7.5 0 0 0-1.7 1l-2.5-1-2 3.4L6.6 11a7.6 7.6 0 0 0 0 2l-2.1 1.6 2 3.4 2.5-1a7.5 7.5 0 0 0 1.7 1l.3 2.7h4l.3-2.7a7.5 7.5 0 0 0 1.7-1l2.5 1 2-3.4ZM13 15.2A3.2 3.2 0 1 1 13 8.8a3.2 3.2 0 0 1 0 6.4Z" transform="translate(-1 0)" /></svg>
   </button>
 
-  <!-- top right: what is in hand (on foot) -->
+  <!-- top right: picnic mode, and what is in hand (on foot) -->
+  <button class="hud picnic-toggle" id="picnic-toggle" title="Picnic mode: camping in the jungle (J)" aria-pressed="false">
+    <svg viewBox="0 0 24 24"><path d="M12 3 2.5 20h19Zm0 4.2L17.4 18h-3.1L12 13.4 9.7 18H6.6Z" /></svg>
+    <span>Picnic</span><b class="switch"><i></i></b>
+  </button>
   <div class="hud chip weapon-chip" data-kind="fist"><i class="icon"></i><b id="weapon">Fist</b></div>
+
+  <!-- picnic mode: where you are, what to do next -->
+  <div class="hud guide" id="guide" hidden>
+    <div class="guide-head"><span class="zone" id="guide-zone" data-level="0">Camp clearing</span><span id="guide-time"></span></div>
+    <b id="guide-text"></b>
+    <small id="guide-hint"></small>
+    <div class="guide-progress" id="guide-progress" hidden></div>
+    <div class="guide-keys"><kbd>E</kbd> use <kbd>C</kbd> crawl <kbd>=</kbd> carry <kbd>B</kbd> build <kbd>I</kbd> kit <kbd>Q</kbd> eat</div>
+  </div>
+  <div class="zone-banner" id="zone-banner" hidden></div>
+  <div class="hotbar" id="hotbar" hidden></div>
+  <div class="prompt act-prompt" id="act-prompt" hidden></div>
+  <div class="task-bar" id="task-bar" hidden><span id="task-name"></span><div><i id="task-fill"></i></div></div>
+  <div class="red-dot" id="red-dot" hidden></div>
+  <div class="panel-wrap" id="inventory" hidden>
+    <div class="panel">
+      <h2>Kit <span><kbd>I</kbd> or <kbd>Esc</kbd> closes</span></h2>
+      <h3>Carrying</h3>
+      <div class="items" id="inventory-items"></div>
+      <h3>Tools</h3>
+      <div class="items" id="inventory-tools"></div>
+      <p class="stats" id="inventory-stats"></p>
+    </div>
+  </div>
+  <div class="hud build-menu" id="build-menu" hidden>
+    <h2>Build <span>number to choose · <kbd>B</kbd> closes</span></h2>
+    <div id="build-list"></div>
+  </div>
+  <div class="tips" id="tips" hidden>
+    <div class="tips-card">
+      <small>Survival tips</small>
+      <h2 id="tips-title"></h2>
+      <p id="tips-lead"></p>
+      <ul id="tips-list"></ul>
+      <button id="tips-ok">Got it <kbd>Enter</kbd></button>
+    </div>
+  </div>
+  <div class="sleep" id="sleep" hidden><b>Zzz</b><span id="sleep-clock"></span></div>
 
   <!-- top centre: wanted level -->
   <div class="stars" id="stars" hidden></div>
@@ -37,6 +79,7 @@
     <div class="vitals">
       <div class="vital health" title="Health"><i id="health-bar"></i></div>
       <div class="vital stamina" title="Stamina"><i id="stamina-bar"></i></div>
+      <div class="vital energy" title="Energy" hidden><i id="energy-bar"></i></div>
     </div>
     <div class="keys"><kbd>M</kbd> map <kbd>P</kbd> controls</div>
   </div>
@@ -73,6 +116,23 @@
         <label>Sound volume <input type="range" min="0" max="1" step="0.05" data-setting="volume" /><output></output></label>
         <button id="settings-reset">Reset to defaults</button>
       </div>
+      <div class="setup">
+        <h3>Graphics</h3>
+        <label>Quality
+          <select data-graphics="quality">
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+            <option value="low">Low</option>
+          </select><output></output></label>
+        <label>Frame-rate limit
+          <select data-graphics="fps">
+            <option value="30">30 fps</option>
+            <option value="60">60 fps</option>
+            <option value="0">No limit</option>
+          </select><output></output></label>
+        <label>Lower resolution when frames run late <input type="checkbox" data-graphics="adaptive" /><output></output></label>
+        <p class="hint">High is the full picture. Medium and Low lower the resolution, shadow detail, view distance and rain or snow for less heat and longer battery. Add <i>?perf</i> to the address to see the frame rate.</p>
+      </div>
       <div class="settings-grid">
         <section>
           <h3>On foot</h3>
@@ -82,6 +142,7 @@
           <p>Fists: look at someone and keep clicking for jab, cross, hook, uppercut (he steps in to reach); someone on the ground gets a kick; <kbd>Shift</kbd> breaks off and runs</p>
           <p>Running uses stamina (the yellow bar); falls from high up hurt (the green bar is health)</p>
           <p><kbd>0</kbd> fist &middot; <kbd>1</kbd> gun &middot; <kbd>2</kbd> bow</p>
+          <p>Bow: hold the mouse to draw, let go to shoot (the longer the draw, the further it flies)</p>
           <p><kbd>F</kbd> get into the vehicle, horse or bike beside you</p>
           <p><kbd>Esc</kbd> free the mouse pointer</p>
         </section>
@@ -105,6 +166,15 @@
           <p><kbd>W</kbd><kbd>S</kbd> forward and back &middot; <kbd>A</kbd><kbd>D</kbd> turn</p>
         </section>
         <section>
+          <h3>Picnic mode</h3>
+          <p><kbd>J</kbd> or the button at the top right: camping in the jungle on the hill</p>
+          <p><kbd>E</kbd> pick up, use, build, go into the camper &middot; <kbd>C</kbd> crawl</p>
+          <p><kbd>=</kbd> carry a kill on your shoulders &middot; <kbd>Q</kbd> eat</p>
+          <p><kbd>B</kbd> build menu (<kbd>R</kbd> turns, click places) &middot; <kbd>I</kbd> your kit</p>
+          <p><kbd>3</kbd> axe &middot; <kbd>4</kbd> torch &middot; <kbd>5</kbd> knife &middot; <kbd>6</kbd> hammer</p>
+          <p>Deer within 200 m of camp, bears beyond, tigers past 400 m; bears and tigers hunt at night</p>
+        </section>
+        <section>
           <h3>Anywhere</h3>
           <p><kbd>M</kbd> map: click it to set a waypoint</p>
           <p><kbd>`</kbd> cheat console &middot; <kbd>Backspace</kbd> back to the start</p>
@@ -117,6 +187,7 @@
         <section>
           <h3>Credits</h3>
           <p>Bus: <i>Generic Town Bus</i> by own.guest &middot; Truck: <i>Truck DAF CF 75.310</i> by Max (Max-7215), both from Sketchfab under CC BY 4.0</p>
+          <p>Picnic mode, all from Sketchfab under CC BY 4.0: <i>RV Photo Scan</i> by Eydeet &middot; <i>Running Tiger</i> by Amil (francescolima74) &middot; <i>Bear</i> by Nyilonelycompany &middot; <i>Deer</i> by TyDrawsAlot &middot; <i>Recurve Bow</i> by MrEliptik &middot; <i>Hammer Game Ready</i> by re1monsen &middot; <i>Ax with a Stump</i> by Ruslan Malovsky &middot; <i>Game Asset Tool</i> by Martijn &middot; <i>Flashlight</i> by MAR.COS. &middot; <i>Jerry Can</i> by Billy Jackman &middot; <i>Portable Gas Camping Stove</i> by Coozy &middot; <i>Camping Cooking Pots</i> by Guy in a Poncho &middot; <i>BUCK 120 General Knife</i> by Kirilllucas &middot; <i>Tent</i> by VENIKAMEN &middot; <i>Old Lantern</i> by Cobernicus &middot; <i>Campfire</i> by Mandrake &middot; <i>Log Pile</i>, <i>Mango</i> and <i>Banana</i> by Meerschaum Digital &middot; <i>Stone Pack</i> by ashkan.fancy &middot; <i>Realistic Beech Fern Plant</i> by 3D Environment Artist Shop &middot; <i>Some Foliage</i> by soidev &middot; <i>Banana Plant</i> and <i>Coconut Palm</i> by evolveduk &middot; <i>Jungle Tree</i> by kobaltsecond &middot; <i>Tropical Plant</i> by alint &middot; <i>Bolts and nuts</i> by SAIRUS_creative &middot; <i>Firewood_HP</i> by ta.holovan</p>
         </section>
       </div>
     </div>
