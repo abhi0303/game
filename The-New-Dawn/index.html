@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>The New Dawn</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@500;700&family=Cinzel:wght@500;700&family=Rajdhani:wght@500;600;700&family=Cormorant+Garamond:ital,wght@0,500;1,500&display=swap" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <canvas id="scene"></canvas>
+
+  <!-- what the hero sees: the edges dark, eyelids, the red of a blow, a fade to black -->
+  <div class="fx">
+    <div class="vignette" id="vignette"></div>
+    <div class="lid top" id="lid-top"></div>
+    <div class="lid bottom" id="lid-bottom"></div>
+    <div class="night-grade" id="night-grade"></div>
+    <div class="hurt" id="hurt"></div>
+    <div class="fade" id="fade"></div>
+  </div>
+
+  <!-- ===== HUD ===== -->
+  <div class="hud" id="hud" hidden>
+    <!-- top left: the chapter and what to do now -->
+    <section class="card objective" id="objective">
+      <small class="chapter">Chapter 1 &middot; <span>The Long Night</span></small>
+      <h2 id="objective-title"></h2>
+      <ul id="objective-list"></ul>
+      <p class="hint" id="objective-hint"></p>
+      <p class="obj-book" id="objective-book" hidden><kbd>B</kbd> Read in your field notes: <span id="objective-book-text"></span></p>
+      <div class="tracker" id="tracker" hidden><span id="tracker-text"></span><i><b id="tracker-bar"></b></i></div>
+    </section>
+
+    <!-- top right: time of day, and what was found -->
+    <div class="card compass" id="compass" hidden><span id="compass-strip"></span><i></i></div>
+    <div class="card clock" id="clock-card">
+      <i class="sun-icon" id="sun-icon"></i>
+      <b id="clock">07:30</b>
+      <span class="sep"></span>
+      <span class="found" title="Petrified people found"><i class="statue-icon"></i><b id="found">0</b><em>/26</em></span>
+    </div>
+
+    <!-- bottom left: the map and the body -->
+    <div class="survival">
+      <div class="minimap-frame">
+        <canvas id="minimap" width="200" height="200"></canvas>
+        <span class="north">N</span>
+      </div>
+      <div class="vitals">
+        <div class="vital health" title="Health"><i class="v-icon"></i><div><b id="health-bar"></b></div></div>
+        <div class="vital stamina" title="Stamina"><i class="v-icon"></i><div><b id="stamina-bar"></b></div></div>
+        <div class="vital hunger" title="Hunger"><i class="v-icon"></i><div><b id="hunger-bar"></b></div></div>
+        <div class="vital thirst" title="Thirst"><i class="v-icon"></i><div><b id="thirst-bar"></b></div></div>
+      </div>
+    </div>
+
+    <!-- bottom centre: in hand, and what can be done here -->
+    <div class="hotbar" id="hotbar"></div>
+    <div class="prompt" id="prompt" hidden><kbd id="prompt-key">E</kbd><span id="prompt-text"></span></div>
+    <div class="action-bar" id="action-bar" hidden><span id="action-name"></span><div><i id="action-fill"></i></div></div>
+    <div class="drill" id="drill" hidden><span class="drill-keys"><kbd id="drill-a">A</kbd><kbd id="drill-d">D</kbd><kbd id="drill-e">E</kbd></span><span id="drill-note"></span><small>W or S gives up</small></div>
+
+    <!-- bottom right: keys -->
+    <div class="keys" id="keys">
+      <span><kbd>E</kbd> use</span><span><kbd>Q</kbd> eat</span><span><kbd>Tab</kbd> kit &amp; craft</span><span class="book-key"><kbd>B</kbd> field notes<em id="book-new" hidden>0</em></span><span><kbd>M</kbd> map</span><span><kbd>Esc</kbd> pause</span>
+    </div>
+
+    <div class="crosshair" id="crosshair" hidden><i></i><b id="draw-ring"></b></div>
+    <div class="toasts" id="toasts"></div>
+    <div class="saved" id="saved" hidden><i></i>Checkpoint saved</div>
+    <div class="resume-hint" id="resume-hint" hidden>Click to look around</div>
+    <div class="waypoint" id="waypoint" hidden><i class="wp-mark"></i><span class="wp-text"><b id="wp-label"></b><em id="wp-dist"></em></span></div>
+    <div class="zone-banner" id="zone-banner" hidden><small id="zone-tag"></small><b id="zone-name"></b></div>
+    <div class="tutorial" id="tutorial" hidden></div>
+  </div>
+
+  <!-- the hero's thoughts, and lines in the story -->
+  <div class="subtitle" id="subtitle" hidden></div>
+  <div class="letterbox" id="letterbox" hidden><span class="skip" id="skip-hint">Hold <kbd>Space</kbd> to skip</span><i class="skip-fill" id="skip-fill"></i></div>
+  <div class="caption" id="caption" hidden></div>
+  <div class="prologue" id="prologue" hidden></div>
+  <div class="dawn-title" id="dawn-title" hidden><small>Chapter 1 &middot; The Long Night</small><b>The New Dawn</b></div>
+
+  <!-- ===== Title ===== -->
+  <div class="title-screen" id="title">
+    <div class="title-art"></div>
+    <div class="title-block">
+      <small class="eyebrow">A survival story</small>
+      <h1>The New Dawn</h1>
+      <p class="tagline">One thousand years after the world turned to stone, one man wakes.</p>
+      <div class="loading" id="loading">
+        <div class="load-bar"><i id="load-fill"></i></div>
+        <span id="load-text">Preparing the world&hellip;</span>
+      </div>
+      <nav class="menu" id="menu" hidden>
+        <button id="btn-continue" hidden>Continue <small id="continue-detail"></small></button>
+        <button id="btn-new">New game <small>Chapter 1: The Long Night</small></button>
+        <button id="btn-settings">Settings</button>
+        <button id="btn-credits">Credits</button>
+      </nav>
+      <p class="menu-note" id="menu-note" hidden></p>
+      <div class="menu-confirm" id="new-confirm" hidden>
+        <p>Start a new game? Your saved game (<b id="new-confirm-save"></b>) will be replaced.</p>
+        <nav class="menu small"><button id="btn-new-no" class="primary">Keep my save</button><button id="btn-new-yes">Start over</button></nav>
+      </div>
+    </div>
+    <p class="title-foot">Best with headphones &middot; Keyboard and mouse</p>
+  </div>
+
+  <!-- ===== Kit and crafting ===== -->
+  <div class="panel-wrap" id="kit" hidden>
+    <div class="panel kit-panel">
+      <header><h2>Kit</h2><span><kbd>Tab</kbd> or <kbd>Esc</kbd> closes</span></header>
+      <div class="kit-columns">
+        <section>
+          <h3>Carrying</h3>
+          <div class="items" id="kit-items"></div>
+          <p class="kit-note" id="kit-note">Click food to eat it.</p>
+          <div class="where-list" id="kit-where" hidden></div>
+        </section>
+        <section>
+          <h3 id="kit-make-title">Make</h3>
+          <div class="kit-tabs" id="kit-tabs" hidden></div>
+          <div class="recipes" id="kit-recipes"></div>
+          <div class="recipes" id="kit-build" hidden></div>
+          <div class="recipes" id="kit-fire" hidden></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Field notes ===== -->
+  <div class="panel-wrap book" id="book" hidden>
+    <div class="book-frame">
+      <nav class="book-contents" id="book-contents"></nav>
+      <div class="book-spread" id="book-spread">
+        <section class="leaf left" id="book-left"></section>
+        <section class="leaf right" id="book-right"></section>
+      </div>
+      <footer class="book-foot">
+        <button id="book-prev" aria-label="Previous page">&larr;</button>
+        <span id="book-pageno"></span>
+        <button id="book-next" aria-label="Next page">&rarr;</button>
+        <span class="book-keys"><kbd>&larr;</kbd><kbd>&rarr;</kbd> turn &middot; <kbd>B</kbd> or <kbd>Esc</kbd> closes</span>
+      </footer>
+    </div>
+  </div>
+
+  <!-- ===== Map ===== -->
+  <div class="panel-wrap" id="map-screen" hidden>
+    <div class="panel map-panel">
+      <header><h2>The Valley</h2><span><kbd>M</kbd> or <kbd>Esc</kbd> closes</span></header>
+      <canvas id="bigmap" width="720" height="720"></canvas>
+      <p class="map-note">Only what you have seen is drawn. The marker shows where you are headed.</p>
+    </div>
+  </div>
+
+  <!-- ===== Pause and settings ===== -->
+  <div class="panel-wrap" id="pause" hidden>
+    <div class="panel pause-panel">
+      <header><h2 id="pause-title">Paused</h2><span><kbd>Esc</kbd> resumes</span></header>
+      <div class="pause-columns">
+        <nav class="menu small" id="pause-menu">
+          <button id="btn-resume">Resume</button>
+          <button id="btn-checkpoint">Back to last checkpoint</button>
+          <button id="btn-title">Quit to title</button>
+        </nav>
+        <div class="settings" id="settings">
+          <h3>Settings</h3>
+          <label>Graphics
+            <select data-setting="quality"><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select>
+          </label>
+          <label>Frame rate
+            <select data-setting="fps"><option value="60">60 (smooth)</option><option value="30">30 (battery saver)</option><option value="0">No limit</option></select>
+          </label>
+          <label>Keep the computer cool <input type="checkbox" data-setting="adaptive" /><output></output></label>
+          <p class="setting-note">Keeping cool eases the resolution down a little only when the graphics card is working hard, and back up when it is not. Add <i>?perf</i> to the address to see the frame rate.</p>
+          <label>Mouse sensitivity <input type="range" min="0.3" max="2.5" step="0.05" data-setting="sensitivity" /><output></output></label>
+          <label>Invert mouse <input type="checkbox" data-setting="invertY" /></label>
+          <label>Show the way to the next goal <input type="checkbox" data-setting="waypoint" /></label>
+          <label>Field of view <input type="range" min="50" max="80" step="1" data-setting="fov" /><output></output></label>
+          <label>Sound <input type="range" min="0" max="1" step="0.05" data-setting="volume" /><output></output></label>
+          <label>Music <input type="range" min="0" max="1" step="0.05" data-setting="music" /><output></output></label>
+          <h3>Controls</h3>
+          <div class="controls">
+            <p><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> walk &middot; <kbd>Shift</kbd> run &middot; <kbd>Space</kbd> jump</p>
+            <p>Mouse to look &middot; <kbd>E</kbd> pick up, use, examine, drink, build</p>
+            <p><kbd>Q</kbd> eat &middot; <kbd>Tab</kbd> kit and crafting &middot; <kbd>B</kbd> field notes &middot; <kbd>M</kbd> map</p>
+            <p><kbd>1</kbd> hands &middot; <kbd>2</kbd> flint blade &middot; <kbd>3</kbd> bow</p>
+            <p>Bow: hold the right button to aim, hold the left to draw, let go to loose</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Credits ===== -->
+  <div class="panel-wrap" id="credits" hidden>
+    <div class="panel credits-panel">
+      <header><h2>Credits</h2><span><kbd>Esc</kbd> closes</span></header>
+      <p>3D models from Sketchfab, all CC BY 4.0: <i>Running Tiger</i> by Amil (francescolima74) &middot; <i>Bear</i> by Nyilonelycompany &middot; <i>Stone Pack</i> by ashkan.fancy &middot; <i>Realistic Beech Fern Plant</i> by 3D Environment Artist Shop &middot; <i>Some Foliage</i> by soidev &middot; <i>Banana Plant</i> and <i>Coconut Palm</i> by evolveduk &middot; <i>Jungle Tree</i> by kobaltsecond &middot; <i>Tropical Plant</i> by alint &middot; <i>Mango</i> and <i>Banana</i> by Meerschaum Digital &middot; <i>Firewood_HP</i> by ta.holovan.</p>
+      <p>The wolf: <i>Wolf</i> by Quaternius (CC0, public domain), via poly.pizza.</p>
+      <p>People: the Microsoft Rocketbox avatar library (MIT). The hero: the Ready Player Me sample avatar from the three.js examples, moving with Mixamo motion capture.</p>
+      <p>Surfaces: photo textures from Poly Haven (CC0): <i>forrest_ground_01, forest_leaves_02, dirt_floor, rock_face_03, rock_wall_02, river_small_rocks, brown_mud_02, rock_surface, mossy_rock, bark_brown_02</i>.</p>
+      <p>Revonite does not exist. Bat guano, nitre and the cave minerals it forms (brushite, taranakite) do.</p>
+    </div>
+  </div>
+
+  <!-- ===== Endings ===== -->
+  <div class="death" id="death" hidden>
+    <b>You did not survive</b>
+    <span id="death-cause"></span>
+    <button id="btn-retry">Return to the last checkpoint <kbd>Enter</kbd></button>
+  </div>
+  <div class="complete" id="complete" hidden>
+    <small id="complete-small">Chapter 1 complete</small>
+    <h1 id="complete-title">The Long Night</h1>
+    <p class="complete-line" id="complete-line">He survived his first night in a world of stone. The sun rises on a new dawn.</p>
+    <dl class="stats" id="stats"></dl>
+    <p class="next" id="complete-next">Next: Chapter 2 &middot; <i>The Second Waking</i></p>
+    <p class="complete-saved" id="complete-saved" hidden>Your game is saved. When Chapter 3 arrives, <b>Continue</b> on the title screen picks up from here.</p>
+    <nav class="menu small"><button id="btn-ch2" class="primary">Continue to Chapter 2</button><button id="btn-again">Back to title</button></nav>
+  </div>
+
+  <script>
+    // Loads the game's scripts one after another (they are large, with the models and photos
+    // inside them), showing how far it has got. Run straight from disk: no server needed.
+    (function () {
+      var scripts = [
+        ['lib/three.min.js', 'Starting the engine'],
+        ['lib/GLTFLoader.js', 'Starting the engine'],
+        ['lib/SkeletonUtils.js', 'Starting the engine'],
+        ['assets/dawn-textures.js', 'Unpacking stone, earth and bark'],
+        ['assets/dawn-models.js', 'Unpacking the jungle'],
+        ['assets/wolf-model.js', 'Unpacking the jungle'],
+        ['assets/hero-model.js', 'Unpacking the survivor'],
+        ['assets/hero-animations.js', 'Unpacking the survivor'],
+        ['assets/npc-models.js', 'Unpacking the people of stone'],
+        ['js/util.js'], ['js/shaders.js'], ['js/engine.js'], ['js/audio.js'], ['js/terrain.js'], ['js/cave.js'],
+        ['js/models.js'], ['js/flora.js'], ['js/statues.js'], ['js/hero.js'], ['js/items.js'], ['js/combat.js'],
+        ['js/shelter.js'], ['js/camp.js'], ['js/lab.js'], ['js/guide.js'], ['js/people.js'], ['js/east.js'], ['js/chapter2.js'], ['js/chapter3.js'], ['js/ui.js'], ['js/book.js'], ['js/story.js'], ['js/main.js'],
+      ];
+      var fill = document.getElementById('load-fill');
+      var text = document.getElementById('load-text');
+      var i = 0;
+      function next() {
+        if (i >= scripts.length) return;
+        var entry = scripts[i];
+        if (entry[1]) text.textContent = entry[1] + '…';
+        fill.style.width = (i / scripts.length) * 45 + '%';
+        var tag = document.createElement('script');
+        tag.src = entry[0];
+        tag.onload = function () { i++; next(); };
+        tag.onerror = function () {
+          text.textContent = 'Could not load ' + entry[0];
+          console.error('Could not load ' + entry[0]);
+        };
+        document.body.appendChild(tag);
+      }
+      next();
+    })();
+  </script>
+</body>
+</html>
